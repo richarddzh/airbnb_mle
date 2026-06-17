@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airbnb 指定技术文章深读报告</title>
+  <style>
+    body { margin: 0; background: #f6f8fb; color: #172033; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.72; }
+    main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
+    article { background: #fff; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17,24,39,.06); }
+    h1 { margin-top: 0; line-height: 1.25; font-size: 2rem; }
+    h2 { margin-top: 2.2rem; padding-bottom: .35rem; border-bottom: 1px solid #e6ebf2; }
+    h3 { margin-top: 1.4rem; }
+    a { color: #0969da; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    .box { border-left: 4px solid #2f6feb; background: #f1f6ff; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { border-left: 4px solid #2da44e; background: #f6fff1; padding: 14px 18px; border-radius: 8px; }
+    code { background: #f3f4f6; border-radius: 4px; padding: 0.1rem 0.3rem; }
+    .small { color: #57606a; font-size: .92rem; }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>Airbnb 指定技术文章深读报告：搜索、推荐、客服 AI、LLM 工程与研究版图</h1>
+
+  <section class="box">
+    <strong>阅读范围：</strong>用户给出的链接中 <em>Recommending Travel Destinations</em> 出现两次，已去重；共深读 6 篇文章。<br>
+    <strong>输出目标：</strong>逐篇总结业务问题、核心技术、关键工程取舍、指标结果，并给出跨文章的技术主线。
+  </section>
+
+  <h2>一、总览：这 6 篇文章覆盖的 Airbnb 技术主线</h2>
+  <p class="takeaway">这组文章展示了 Airbnb 如何把 ML/AI 从“单点模型”落到核心业务链路：用 Transformer 建模旅行目的地意图，用 embedding two-tower 做搜索召回，用注意力模型重构地图排序，用 ASR/意图识别/LLM reranker 改造语音客服，用 LLM + 自动验证做大规模代码迁移，并通过年度研究回顾展示搜索、NLP、实验、优化和数据系统的研究版图。</p>
+
+  <table>
+    <thead><tr><th>文章</th><th>领域</th><th>核心技术</th><th>业务价值</th></tr></thead>
+    <tbody>
+      <tr><td>Recommending Travel Destinations</td><td>个性化推荐</td><td>Transformer 序列建模、多任务学习、地理层级建模</td><td>帮助探索型用户决定目的地，提升 autosuggest 和 abandoned search email 效果。</td></tr>
+      <tr><td>Improving Search Ranking for Maps</td><td>搜索排序</td><td>地图用户注意力建模、booking probability、A/B 实验</td><td>提升地图搜索发现效率、uncancelled bookings，减少 map moves。</td></tr>
+      <tr><td>Academic Publications & Airbnb Tech: 2025 Year in Review</td><td>研究战略</td><td>KDD/CIKM/EMNLP/COLING/CODE/LION/VLDB 研究体系</td><td>展示 Airbnb 在搜索推荐、客服 LLM、实验科学、优化、数据系统上的技术投资。</td></tr>
+      <tr><td>Listening, Learning, and Helping at Scale</td><td>客服 AI / 语音支持</td><td>ASR、Contact Reason Detection、向量检索、LLM reranking、paraphrasing</td><td>把传统 IVR 变成自然语言入口，提高自助解决和人工转接效率。</td></tr>
+      <tr><td>Accelerating Large-Scale Test Migration with LLMs</td><td>开发者效率</td><td>LLM 代码迁移、state machine、retry loop、long-context prompting、自动验证</td><td>6 周迁移近 3,500 个测试文件，替代约 1.5 年手工工作量。</td></tr>
+      <tr><td>Embedding-Based Retrieval for Airbnb Search</td><td>搜索召回</td><td>Two-tower embedding、contrastive learning、hard negatives、ANN/IVF</td><td>在大候选集搜索中更好召回相关房源，带来显著 bookings gain。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>二、Recommending Travel Destinations to Help Users Explore</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/recommending-travel-destinations-to-help-users-explore/">https://airbnb.tech/ai-ml/recommending-travel-destinations-to-help-users-explore/</a></p>
+
+  <h3>业务问题</h3>
+  <p>Airbnb 的一类用户处于旅行规划早期，并不清楚目的地、日期和偏好。他们可能只搜索“France”这类大范围地点，访问频率低、短期预订概率低，但如果能给出合适目的地推荐，就可能减少决策摩擦、提高 engagement 和 conversion。</p>
+
+  <h3>核心技术</h3>
+  <table>
+    <thead><tr><th>技术点</th><th>具体做法</th><th>为什么重要</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>行为序列 Transformer</td>
+        <td>把用户动作当作 token，输入 booking history、view history、search history。</td>
+        <td>同时捕捉短期兴趣（浏览/搜索）和长期偏好（历史预订）。</td>
+      </tr>
+      <tr>
+        <td>Action embedding 组合</td>
+        <td>每个 action 由 city、region、days-to-today embeddings 相加表示。</td>
+        <td>把地点与时间新鲜度编码进模型。</td>
+      </tr>
+      <tr>
+        <td>上下文特征</td>
+        <td>加入 current time 等信息。</td>
+        <td>捕捉季节性，例如夏季偏好、假期周期。</td>
+      </tr>
+      <tr>
+        <td>Active / dormant 双训练样本</td>
+        <td>每个 booking 构造 14 个样本：预订前 1-7 天模拟活跃用户；预订前 8-365 天随机采样且只用 booking data 模拟沉睡用户。</td>
+        <td>同时服务临近预订用户和早期探索/重新唤醒用户。</td>
+      </tr>
+      <tr>
+        <td>地理多任务学习</td>
+        <td>多预测头同时预测 region-level 和 city-level destination。</td>
+        <td>学习城市和区域之间的层级/邻近关系，例如 San Francisco 与 Bay Area。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>上线场景与结果</h3>
+  <p>模型用于两个产品：一是搜索框 autosuggest，在用户点击搜索框时推荐城市；二是 abandoned search email notification，用户放弃搜索后邮件推荐预测目的地区域的房源。文章提到在线 A/B 测试在非英语主导区域带来显著 booking gains，并且推荐不仅帮助未确定目的地的用户，也帮助愿意考虑邻近城市、更实惠房源的用户。</p>
+
+  <h3>我的解读</h3>
+  <p>这篇文章的亮点是将“语言模型的序列预测思想”迁移到旅行意图预测，但没有机械照搬 NLP。它针对 Airbnb 场景做了三处关键适配：训练样本同时覆盖 active/dormant 用户；动作 embedding 包含地理层级和时间距离；loss/architecture 引入城市与区域多任务一致性。这说明推荐系统的关键不是模型名，而是训练样本如何模拟真实决策阶段。</p>
+
+  <h2>三、Improving Search Ranking for Maps</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/">https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/</a></p>
+
+  <h3>业务问题</h3>
+  <p>Airbnb 搜索结果有 list-results 和 map-results 两种界面。传统排序假设用户注意力沿列表 rank 递减，因此按 booking probability 排序有效。但地图没有明确 rank，房源以 pin 散布在空间中，因此 list ranking 的注意力假设失效。</p>
+
+  <h3>三阶段技术路线</h3>
+  <table>
+    <thead><tr><th>阶段</th><th>核心假设</th><th>方法</th><th>结果/观察</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Uniform User Attention</td>
+        <td>地图 pin 获得近似均匀注意力。</td>
+        <td>限制展示 pin 中最高 booking probability 与最低 booking probability 的比值，避免太多低概率 pin 分散点击。</td>
+        <td>上线 restricted version 后获得 Airbnb ranking 历史中较大的 bookings improvement，并提升 5-star trip。</td>
+      </tr>
+      <tr>
+        <td>Tiered User Attention</td>
+        <td>不同视觉形态带来不同注意力。</td>
+        <td>高 booking probability 房源显示普通带价格 oval pins；较低概率房源显示 mini-pins。</td>
+        <td>mini-pins CTR 约为普通 pins 的 1/8，有助于桌面固定 pin 数量场景下分配注意力。</td>
+      </tr>
+      <tr>
+        <td>Discounted User Attention</td>
+        <td>地图中心/坐标位置影响注意力。</td>
+        <td>根据不同坐标的 CTR 热力，重新选择地图中心，使高 booking probability 房源更靠近注意力中心。</td>
+        <td>A/B 测试提升 uncancelled bookings 0.27%，map moves 减少 1.5%。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>我的解读</h3>
+  <p>这篇文章本质上是“界面形态改变排序目标”的案例。排序不是抽象地对 item 打分，而是要建模用户如何在当前 UI 中分配注意力。列表排序优化 rank；地图排序优化空间曝光、视觉层级和地图中心。这对推荐/搜索系统很重要：同一批候选，在不同呈现界面下需要不同 objective 和不同 evaluation metric。</p>
+
+  <h2>四、Academic Publications & Airbnb Tech: 2025 Year in Review</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/infrastructure/academic-publications-airbnb-tech-2025-year-in-review/">https://airbnb.tech/infrastructure/academic-publications-airbnb-tech-2025-year-in-review/</a></p>
+
+  <h3>文章定位</h3>
+  <p>这不是单一系统文章，而是 Airbnb 2025 年研究版图的总结。它说明 Airbnb 已经把研究投入扩展到搜索/排序/推荐、NLP 与生产 LLM、实验与因果推断、优化、数据系统等方向。</p>
+
+  <h3>研究方向分类</h3>
+  <table>
+    <thead><tr><th>会议/方向</th><th>代表工作</th><th>技术含义</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>KDD：搜索排序与评估</td>
+        <td>Interleaving + Counterfactual Evaluation；High Precision Audience Expansion</td>
+        <td>减少长周期住宿预订 A/B 测试等待时间，用更快的 pre-A/B 在线评估筛选候选排序实验。</td>
+      </tr>
+      <tr>
+        <td>CIKM：搜索、推荐、排序</td>
+        <td>Augmenting Guest Search Results；Maps Ranking；BiListing；Beyond Pairwise LTR；Learning to Comparison-Shop</td>
+        <td>覆盖搜索结果补充推荐、地图排名、多模态 listing embedding、超越 pairwise 的排序学习、比较购物行为建模。</td>
+      </tr>
+      <tr>
+        <td>EMNLP：客服 LLM</td>
+        <td>Agent-in-the-Loop；Incremental Summarization</td>
+        <td>把客服坐席反馈转化为 LLM/RAG 数据飞轮，并用增量摘要减少坐席上下文切换。</td>
+      </tr>
+      <tr>
+        <td>COLING：知识表示</td>
+        <td>LLM-Friendly Knowledge Representation</td>
+        <td>提出 Intent, Context, Action (ICA) 格式，让客服知识更适合 LLM QA 和工作流。</td>
+      </tr>
+      <tr>
+        <td>MIT CODE / INFORMS：实验与因果</td>
+        <td>Long-term ranking dynamics；Bayesian batch-adaptive experimentation；Bandit + A/B 混合</td>
+        <td>解决 ranking 改动的长期影响、batch-adaptive 实验可信推断和 bandit 运营化问题。</td>
+      </tr>
+      <tr>
+        <td>LION / VLDB：优化与数据系统</td>
+        <td>Matched block design；SQL:Trek automated index design</td>
+        <td>用 MIP 改善多臂实验分组，用数据库 cost model 自动索引设计。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>我的解读</h3>
+  <p>这篇年度回顾反映 Airbnb 技术组织的一个特点：研究问题直接来自产品系统，而不是纯学术 toy problem。搜索、地图、客服、实验、索引、图谱、知识表示都与 Airbnb 的双边市场和运营复杂度强相关。对 Airbnb 来说，AI-native 不只等于 LLM；它还包括更快评估 ranking、长期市场健康建模、数据系统自动化和生产 LLM 安全评估。</p>
+
+  <h2>五、Listening, Learning, and Helping at Scale</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/">https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/</a></p>
+
+  <h3>业务问题</h3>
+  <p>传统 IVR 依赖按键菜单，用户体验生硬，且难以表达复杂问题。Airbnb 将 IVR 改为自然语言入口：用户说出问题，系统理解、检索帮助资源、发送解决方案或转人工。</p>
+
+  <h3>端到端链路</h3>
+  <ol>
+    <li>IVR 询问用户为何来电。</li>
+    <li>Airbnb-specific ASR 将语音转文本。</li>
+    <li>Contact Reason Detection 将问题分类到 refund、cancellation、account issue 等 taxonomy。</li>
+    <li>系统判断是否可 self-service；可解决则发送 Help Center article 或 workflow，不可解决或用户要求人工则转接坐席。</li>
+    <li>Paraphrasing model 在发送文章前给用户解释系统理解到的问题。</li>
+  </ol>
+
+  <h3>关键技术与指标</h3>
+  <table>
+    <thead><tr><th>模块</th><th>技术关键点</th><th>指标/效果</th></tr></thead>
+    <tbody>
+      <tr><td>ASR</td><td>从通用模型转向 noisy phone audio 适配，并用 Airbnb 领域短语优化。</td><td>WER 从 33% 降至约 10%。</td></tr>
+      <tr><td>Intent Detection</td><td>Contact Reason taxonomy + Issue Detection Service 并行部署。</td><td>平均延迟低于 50ms。</td></tr>
+      <tr><td>Help Article Retrieval</td><td>Help article embedding 入向量库，cosine similarity 召回最多 30 篇。</td><td>通常约 60ms。</td></tr>
+      <tr><td>LLM Ranking</td><td>LLM-based ranking model 对召回文章重排。</td><td>以 Precision@N 持续评估。</td></tr>
+      <tr><td>Paraphrasing</td><td>UX writers 预写标准 summary，embedding nearest-neighbor 匹配。</td><td>人工评估 precision 超过 90%。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>我的解读</h3>
+  <p>这篇文章展示了一个务实的 AI 客服架构：并没有让 LLM 直接接管所有语音问题，而是将链路拆成 ASR、意图识别、检索、重排、解释、路由。尤其 paraphrasing 使用 curated summaries 而非完全自由生成，说明 Airbnb 在客服场景优先选择可控、可评估、低幻觉风险的方案。</p>
+
+  <h2>六、Accelerating Large-Scale Test Migration with LLMs</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/infrastructure/accelerating-large-scale-test-migration-with-llms/">https://airbnb.tech/infrastructure/accelerating-large-scale-test-migration-with-llms/</a></p>
+
+  <h3>业务问题</h3>
+  <p>Airbnb 需要将近 3,500 个 React component test files 从 Enzyme 迁移到 React Testing Library。手工估计需要 1.5 年工程时间；直接删除会造成 coverage gaps；框架差异又不适合简单 find/replace。</p>
+
+  <h3>LLM 迁移流水线</h3>
+  <table>
+    <thead><tr><th>环节</th><th>做法</th><th>关键点</th></tr></thead>
+    <tbody>
+      <tr><td>State machine</td><td>每个文件经过 Enzyme refactor、fix Jest、fix lint、fix tsc、complete 等步骤。</td><td>只有当前步骤验证通过才进入下一状态。</td></tr>
+      <tr><td>Retry loop</td><td>验证失败时，把错误和最新文件版本回填给 LLM，多次重试直到通过或达到上限。</td><td>对简单/中等复杂度文件非常有效，多数 10 次内完成。</td></tr>
+      <tr><td>Long context</td><td>复杂文件 prompt 扩展到 40k-100k tokens，包含最多 50 个相关文件。</td><td>主要收益来自选对相关文件，而不只是 prompt wording。</td></tr>
+      <tr><td>Progress stamping</td><td>在文件中记录 MIGRATION STATUS JSON 注释。</td><td>方便统计失败步骤、批量重跑和定位长尾问题。</td></tr>
+      <tr><td>Sample, tune, sweep</td><td>抽样 5-10 个代表性失败文件，改 prompt/脚本，验证后扫全量。</td><td>4 天从 75% 成功率提升到 97%。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>结果</h3>
+  <p>第一次 bulk run 4 小时自动迁移 75%；经过 4 天系统调优达到 97%；剩余 3% 由人工基于 LLM 生成 baseline 修复，一周完成。总计 6 周完成原本估计 1.5 年的迁移，并保持测试意图和 coverage。</p>
+
+  <h3>我的解读</h3>
+  <p>这篇文章的核心不是“LLM 会写代码”，而是“LLM 应该被放在验证驱动的自动化系统里”。Airbnb 把 LLM 当作可重试的 refactor worker，把 Jest/lint/tsc 当作判定器，把失败分布当作可优化对象。这比单次 prompt 更接近工业级 LLM coding workflow。</p>
+
+  <h2>七、Embedding-Based Retrieval for Airbnb Search</h2>
+  <p><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/">https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/</a></p>
+
+  <h3>业务问题</h3>
+  <p>Airbnb 搜索需要从数百万房源中找出与 query 最相关的候选。大范围搜索如 California、France，或热门目的地如 Paris、London，会产生巨大候选集；Flexible date search 又进一步扩大了检索难度。EBR 的目标是在重排序模型之前，先高效缩小候选池。</p>
+
+  <h3>核心技术</h3>
+  <table>
+    <thead><tr><th>模块</th><th>做法</th><th>关键工程取舍</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>训练数据</td>
+        <td>按 trip 聚合用户历史 query；最终预订房源为 positive；曝光/互动但未预订房源为 hard negatives。</td>
+        <td>随机 negative 太容易，会导致模型效果差；hard negative 更贴近真实选择。</td>
+      </tr>
+      <tr>
+        <td>模型结构</td>
+        <td>Two-tower：listing tower 处理房源特征，query tower 处理地理、人数、住宿时长等 query 特征。</td>
+        <td>listing embeddings 可每日离线预计算，线上只算 query tower，降低延迟。</td>
+      </tr>
+      <tr>
+        <td>ANN 方案</td>
+        <td>比较 HNSW 与 IVF，最终选择 IVF。</td>
+        <td>HNSW recall 略好但面对价格/可订状态高频更新和地理 filter 延迟差；IVF 更好接入现有 search filter。</td>
+      </tr>
+      <tr>
+        <td>相似度函数</td>
+        <td>比较 dot product 与 Euclidean distance。</td>
+        <td>Euclidean distance 使 IVF cluster size 更均衡，避免大 cluster 降低判别力。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>结果</h3>
+  <p>EBR 完整上线到 Search 和 Email Marketing，在 A/B 测试中带来 statistically significant overall bookings gain，且提升幅度可与过去两年 Airbnb 搜索排序中最大级别的 ML 改进相当。核心收益来自更好地纳入 query context，在初始召回阶段就提升候选相关性。</p>
+
+  <h3>我的解读</h3>
+  <p>这篇文章体现了成熟搜索系统的典型分层：召回阶段追求规模和延迟，排序阶段再用更重模型。Airbnb 的关键工程判断是没有选择指标略优但线上代价高的 HNSW，而选择更适合高频更新、强过滤、易集成的 IVF。这说明生产系统中的“最佳算法”必须同时满足数据更新频率、过滤条件、内存、延迟和现有架构约束。</p>
+
+  <h2>八、跨文章综合：Airbnb 的 AI/ML 工程模式</h2>
+  <table>
+    <thead><tr><th>模式</th><th>对应文章</th><th>解释</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>把业务过程拆成可建模子任务</td>
+        <td>Voice Support、EBR、Test Migration</td>
+        <td>客服拆成 ASR/intent/retrieval/ranking；搜索拆成 retrieval/ranking；迁移拆成 state-machine steps。</td>
+      </tr>
+      <tr>
+        <td>训练数据要模拟真实决策</td>
+        <td>Destination Recommendation、EBR</td>
+        <td>目的地推荐区分 active/dormant；EBR 使用用户看过但没订的 hard negatives。</td>
+      </tr>
+      <tr>
+        <td>UI 改变目标函数</td>
+        <td>Map Ranking</td>
+        <td>地图没有列表 rank decay，因此要建模空间注意力和 pin 视觉层级。</td>
+      </tr>
+      <tr>
+        <td>LLM 进入系统后必须有验证闭环</td>
+        <td>Test Migration、Voice Support、Academic Review 中客服 LLM 论文</td>
+        <td>代码迁移用测试/lint/tsc；客服用 retrieval grounding、LLM verifier、人工反馈。</td>
+      </tr>
+      <tr>
+        <td>评估指标贴近业务结果</td>
+        <td>Map Ranking、EBR、Voice Support、Academic Review</td>
+        <td>使用 bookings、uncancelled bookings、map moves、self-resolution、Precision@N、agent working time 等指标。</td>
+      </tr>
+      <tr>
+        <td>研究与生产互相强化</td>
+        <td>Academic Publications Year in Review</td>
+        <td>Airbnb 的论文主题来自真实产品系统，又反过来沉淀搜索、客服、实验、数据系统方法。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>九、按技术栈归类</h2>
+  <table>
+    <thead><tr><th>技术栈</th><th>使用位置</th><th>关键点</th></tr></thead>
+    <tbody>
+      <tr><td>Transformer / 序列建模</td><td>目的地推荐</td><td>把用户行为当 token，融合短期/长期兴趣和季节性。</td></tr>
+      <tr><td>Embedding / Two-tower</td><td>搜索召回、Help Article retrieval</td><td>把 query、listing、help article 映射到向量空间，支持快速召回。</td></tr>
+      <tr><td>ANN / IVF</td><td>EBR 搜索召回</td><td>在高频更新、强过滤场景下平衡 recall、延迟和集成成本。</td></tr>
+      <tr><td>LLM reranking</td><td>Help Article Ranking</td><td>对语义召回出的帮助文章重新排序，提升答案相关性。</td></tr>
+      <tr><td>ASR / Intent Classification</td><td>语音客服</td><td>从语音到可路由 intent，要求领域词准确和低延迟。</td></tr>
+      <tr><td>LLM Code Transformation</td><td>测试迁移</td><td>结合验证器、重试、长上下文和批量状态跟踪。</td></tr>
+      <tr><td>Causal / Experimentation / Counterfactual Evaluation</td><td>年度研究回顾</td><td>用于长周期 ranking 系统评估和 adaptive experiments。</td></tr>
+      <tr><td>Multimodal / LLM-friendly Knowledge</td><td>年度研究回顾</td><td>BiListing、客服 ICA 知识表示，说明 Airbnb 在文本/图像/知识结构化上持续投入。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>十、最终结论</h2>
+  <p>这几篇文章共同说明，Airbnb 的 ML/AI 能力不是孤立的模型能力，而是围绕旅游双边市场构建的系统能力。对用户端，它用推荐和搜索降低探索成本；对客服端，它用语音 AI、检索和 LLM 改善自助支持与坐席效率；对工程端，它用 LLM 自动化迁移大规模遗留代码；对研究端，它把生产问题沉淀为 ranking、NLP、实验、优化和数据系统论文。</p>
+  <p>最值得借鉴的是 Airbnb 的工程范式：先用业务和界面定义正确问题，再构造贴近真实行为的数据，选择能满足线上约束的模型/索引/LLM 方案，最后用 A/B、验证器、人工反馈和业务指标闭环。</p>
+
+  <p class="small">本报告保存于 <code>blogs\airbnb_selected_tech_articles_deep_read_zh.html</code>。</p>
+</article>
+</main>
+</body>
+</html>

@@ -1,0 +1,1339 @@
+
+
+===== PAGE 1 =====
+
+Agent-in-the-Loop: A Data Flywheel for Continuous Improvement in
+LLM-based Customer Support
+Cen (Mia) Zhao Tiantian Zhang Hanchen Su Yufeng (Wayne) Zhang
+Shaowei Su Mingzhi Xu Yu (Elaine) Liu Wei Han
+Jeremy Werner Claire Na Cheng Yashar Mehdad
+Airbnb, Inc., USA
+{mia.zhao, tiantian.zhang, hanchen.su, wayne.zhang, shaowei.su, mingzhi.xu,
+elaine.liu, wei.han, jeremy.werner, claire.cheng, yashar.mehdad}@airbnb.com
+Abstract
+We introduce anAgent-in-the-Loop(AITL)
+framework that implements a continuousdata
+flywheelfor iteratively improving an LLM-
+based customer support system. Unlike stan-
+dard offline approaches that rely on batch anno-
+tations, AITL integrates four key types of anno-
+tations directly into live customer operations:
+(1) pairwise response preferences, (2) agent
+adoption decisions and rationales, (3) knowl-
+edge relevance checks, and (4) identification
+of missing knowledge. These feedback signals
+seamlessly feed back into model updates, re-
+ducing retraining cycles from months to weeks.
+Our production pilot involving US-based cus-
+tomer support agents demonstrated significant
+improvements in retrieval accuracy (+11.7%
+recall@75, +14.8% precision@8), generation
+quality (+8.4% helpfulness), and agent adop-
+tion rates (+4.5%). These results underscore
+the effectiveness of embedding human feed-
+back loops directly into operational workflows
+to continuously refine LLM-based customer
+support systems.
+1 Introduction
+Retrieval-augmented generation (RAG) improves
+large language models (LLMs) by grounding re-
+sponses to external knowledge, overcoming static
+limitations, and improving transparency through
+evidence-based outputs (Lewis et al., 2020). How-
+ever, traditional LLMs, typically trained in a fixed
+dataset with static knowledge cut-off points, in-
+herently struggle to adapt to evolving real-world
+interactions without interventions such as continu-
+ous learning or retrieval enhancement (Shah et al.,
+2023).
+Recent research emphasizes the importance of a
+data flywheel, an iterative feedback loop that con-
+tinuously leverages new interaction data to enhance
+model performance (Luo et al., 2024). In customer
+support scenarios, such a data flywheel is partic-
+ularly valuable due to evolving product features,
+shifting user preferences, and continuously updated
+policies and procedures. Dai et al. (2025)’s daily
+oracle benchmark demonstrates that static models,
+even when paired with retrieval, lose more than
+20 percentage points of accuracy on news ques-
+tions within a few years, indicating that continuous
+feedback loops are crucial for preventing drift and
+maintaining relevance in real-world systems.
+Our Contributions.To maintain a continuous
+human-driven data flywheel for accurate and rele-
+vant customer support, we (1) develop anannota-
+tion interfacecapturing response preferences, adop-
+tion rationales, knowledge relevance, and missing
+knowledge during live conversations, and (2) imple-
+ment acontinuous learning pipelinethat integrates
+these annotations into training datasets, reducing
+model update cycles from months to weeks. A US-
+based pilot confirms significant improvements in
+retrieval accuracy, response helpfulness, citation
+correctness, and agent adoption rates. To further
+optimize annotation efficiency at scale, we recom-
+mend delaying annotations for preference, adop-
+tion, and knowledge relevance, while immediately
+annotating missing knowledge when SLAs permit.
+2 Related Work
+To address critical issues such as preference drift
+and knowledge decay, recent research has inte-
+grated human or AI-simulated feedback within re-
+inforcement learning frameworks.
+Human-in-the-Loop and Preference Optimiza-
+tion.Human-in-the-loop (HITL) approaches en-
+hance LLM alignment by directly optimizing out-
+puts toward explicit human preferences, moving
+beyond traditional supervised learning metrics (Sti-
+ennon et al., 2020). Reinforcement Learning
+arXiv:2510.06674v2  [cs.AI]  9 Oct 2025
+
+
+===== PAGE 2 =====
+
+with Human Feedback (RLHF), pioneered by Ope-
+nAI (Ouyang et al., 2022a), aligns models with
+human preferences through pairwise comparisons
+obtained via offline annotations. Anthropic sub-
+sequently introduced iterative online human feed-
+back loops, continuously incorporating real-time
+human annotations to significantly enhance conver-
+sational agent helpfulness and harmlessness (Bai
+et al., 2022a). Further advancing alignment at scale,
+Anthropic proposed Constitutional AI, a method
+employing Reinforcement Learning from AI Feed-
+back (RLAIF) guided by explicit human-defined
+principles (Bai et al., 2022b).
+Data Flywheel and Continuous Learning
+Pipelines.Recently, Luo et al. (2024) introduced
+Arena Learning, an automated data flywheel using
+simulated self-play between LLMs and AI judges
+to generate offline preference labels. While highly
+scalable, Arena Learning predominantly addresses
+open-domain dialogues and lacks mechanisms for
+domain-specific knowledge retrieval or incorporat-
+ing human feedback. Consequently, it does not
+directly tackle real-world preference drift issues
+inherent in dynamic environments.
+Our approach integrates and extends these
+methodologies not only by collecting online hu-
+man preference feedback, but also explicitly gather-
+ing feedback on knowledge relevance and missing
+knowledge. Similarly to Arena Learning, we in-
+corporate an LLM-based virtual judge (VJ) to filter
+data quality. By carefully aligning annotation meth-
+ods with our training pipeline, we achieve update
+cycles comparable to Arena Learning’s automated
+data flywheel, with key differences summarized in
+Table 1.
+3 Method
+Figure 1 illustrates the interactive workflow in the
+following key steps: (1)Customer Input: A cus-
+tomer sends a query or message. (2)LLM-Based
+Interactive System: The system retrieves relevant
+knowledge (Sect. 3.1) and uses an LLM to generate
+response candidates. (3)Suggested Responses: The
+system presents two alternative responses, poten-
+tially originating from different models. (4)Agent
+Annotation: A support agent evaluates these sug-
+gestions while serving customers, indicating their
+preferred response, adoption decision, critical feed-
+back, assessment of the relevance of the knowledge
+used by LLM, and adding any necessary missing in-
+formation (Sect. 3.2). (5)Review Annotation: Both
+Figure 1: Overview of the agent-in-the-loop architec-
+ture.
+Select
+Selected 
+and 
+value 
+filled 
+in
+Context 
+Variable: 
+Reservation 
+Status
+Help 
+Article 
+Sni
+ppets: 
+How 
+to 
+find 
+your 
+reservation
+ 
+The 
+status 
+of 
+a 
+reservatin 
+could 
+be
+-
+Accepted
+-
+Pending: 
+waiting 
+for 
+host 
+confirmatoin
+-
+Denied
+-
+Canceled
+-
+Failed
+Pending
+Selected
+Internal 
+Knowledege: 
+Reservation 
+Status
+Fill 
+in 
+value:
+If 
+a 
+guest 
+contact 
+about 
+reservation 
+not 
+accepted:
+   
+If 
+the 
+reservation 
+status 
+is 
+still 
+pending:
+Educate 
+the 
+guest 
+that 
+the 
+Host 
+has 
+24 
+hours 
+to 
+accept 
+or 
+decline 
+it. 
+If 
+the 
+reservation 
+request 
+is 
+not 
+accepted 
+or 
+declined 
+within 
+this 
+time 
+frame, 
+the 
+status 
+of 
+the 
+request 
+will 
+change 
+to 
+No 
+Longer 
+Possible.
+Similar 
+case
+: 
+Why 
+my 
+reservation 
+is 
+not 
+accpeted?
+   
+Guest: 
+Why 
+my 
+reservation 
+is 
+not 
+accepted
+Agent: 
+I'm 
+sorry 
+that 
+your 
+reservation 
+is 
+failed 
+due 
+to 
+a 
+paymen  
+error, 
+please 
+contact 
+your 
+bank 
+for 
+more 
+details
+Select
+Select the Knowledge Object(s) that help you make the response  
+  
+Guest: 
+My 
+reservation 
+is 
+not 
+accpted 
+yet 
+but 
+I'm 
+already 
+charged.
+Agent: 
+When 
+you 
+enter 
+your 
+payment 
+information 
+for 
+a 
+reservation 
+request,  
+we 
+send 
+a 
+pending 
+request 
+to 
+the 
+Host. 
+Hosts 
+have 
+24 
+hours 
+to 
+officially 
+accept 
+or 
+decline 
+your 
+reservation 
+request, 
+but 
+most 
+Hosts 
+respond 
+within 
+four 
+hours. 
+If 
+a 
+Host 
+accepts 
+your 
+request, 
+your 
+payment 
+is 
+collected 
+in 
+full. 
+If 
+a 
+Host 
+declines 
+your 
+request 
+or 
+it 
+expires, 
+we 
+release 
+the 
+authorization 
+on 
+your 
+card 
+immediately. 
+While 
+this 
+happens 
+instantly 
+on 
+our 
+end, 
+it 
+may 
+take 
+some 
+time 
+for 
+your 
+bank 
+to 
+reflect 
+the 
+authorization 
+void. 
+annotate 
+this 
+response
+ 
+ 
+Text
+Figure 2: Example of selecting knowledge references
+a human expert and the LLM-based verifier review
+the annotation and the agent–customer interaction
+to flag any conflicts.(Sect. 3.3). (6)Continuous
+Learning: The annotations and feedback collected
+are reintegrated into the training pipeline for con-
+tinuous model improvements (Sect. 3.4).
+3.1 Unified Knowledge Base
+We consolidate diverse domain resources, customer
+guides, FAQs, internal policies, workflows, dy-
+namic context (e.g. reservation status) and histori-
+cal cases into aUnified Knowledge Base(Figure 2).
+The resources are enriched with detailed metadata
+in a centralized content management system, which
+facilitates the annotation and retrieval of agents in
+real time.
+3.2 Agent Annotation
+Figure 3 illustrates our online annotation workflow,
+which comprises four main steps:
+Step 1: Pairwise Response PreferenceAgents
+compare randomly ordered candidate responses
+and annotate degrees of preference assignificantly
+better,better, orslightly better. These signals in-
+form preference learning and help to improve gen-
+eration models.
+Step 2: Rationale for Response Selection
+Agents provide the adoption decision and ratio-
+
+
+===== PAGE 3 =====
+
+Aspect Arena Learning AITL (ours)
+Feedback Source AI-generated annotations (simulated self-play) Human-generated annotations (real-world interaction)
+Annotation Mode Offline annotation Real-time (or near-real-time) annotation
+Update Frequency Weekly Weekly
+Target Modules Generation module only Retrieval, Ranking, and Generation modules
+Handling of Human Preference Drift Indirect (no real-time human feedback) Direct (real-time human feedback integration)
+Verification Process LLM-based virtual judge LLM-based virtual judge combined with sampled human verification
+Table 1: Comparison between Arena Learning and AITL on feedback mechanisms and training pipelines.
+Figure 3: Online annotation interface.
+nales in free text (critiques), which supports the im-
+provement of the generation model and a broader
+evaluation.
+Step 3: Relevance of knowledge resources
+Agents assess and score the relevance of the knowl-
+edge resource used in the prompt, performing an
+additional verification in real time. These annota-
+tions directly enhance the retrieval process across
+diverse support topics.
+Step 4: Missing Knowledge IdentificationDur-
+ing this stage, agents use a dedicated Knowledge
+Resources Selection Interface to flag missing infor-
+mation, such as policies or unrecorded best prac-
+tices, that they rely on to help customers. By
+integrating these newly identified gaps and refer-
+ences back into the training pipeline, the system
+can improve existing retrieval recall and continu-
+ously adapt to the evolving knowledge landscape
+of live customer support.
+3.3 Review Annotation
+Human and LLM-based verifiers assess the consis-
+tency between agent annotations and actual interac-
+tions, identifying common errors: preference mis-
+matches, incorrect knowledge relevance, adoption
+discrepancies, and omitted knowledge (examples
+in Appendix A). The human and LLM verifier eval-
+uations show a strong correlation (Appendix G).
+Figure 4: Data flow in continuous learning pipeline
+3.4 Continuous Learning Pipeline
+Figure 4 outlines our automated pipeline for peri-
+odic model retraining and evaluation using agent
+feedback. It utilizes generalized LLM offline work-
+flow (GLOW) modules, optimizing resource usage
+with parameter-efficient fine-tuning (PEFT) and
+model partitioning (Appendix F).
+(1) Data Aggregation and FilteringAnnota-
+tions collected from the four-step evaluation pro-
+cess are filtered using both rules-based and model-
+driven approaches. The rule-based method ap-
+plies thresholds based on review scores and se-
+lects annotations that meet significant preference
+criteria. The model-driven approach employs an
+LLM-based virtual judge to filter annotations that
+exhibit low prompt adherence scores (Zheng et al.,
+2023). These filtering strategies mitigate data in-
+consistencies and hallucinations, which are critical
+to improving model performance (Section 4.3).
+(2) Automated Model RetrainingRetrieval,
+ranking, and generation models are periodically
+retrained using GLOW-managedRayclusters,
+with automated resource handling and synchro-
+nization. Parameter-efficient fine-tuning (e.g.,
+LoRA/QLoRA) optimizes GPU usage, and built-in
+monitoring ensures stable progress.
+(3) EvaluationRetrained models go with batch
+inference runs on curated evaluation datasets, eval-
+uated using both ground-truth-based evaluation and
+virtual judges (Appendix B) that simulate human
+evaluations. Performance improvements act as a
+
+
+===== PAGE 4 =====
+
+Figure 5: RAG example on knowledge document
+Figure 6: Offline Annotation Workflow
+proxy for annotation quality, strengthening the cy-
+cle of enhancement.
+(4) Feedback LoopRetrained models are de-
+ployed back into the RAG system, completing the
+feedback loop (Figure 5).
+4 Experiments
+Our baseline offline workflow (Figure 6) pre-
+processes production logs and simulation data into
+preference and adoption annotations using spread-
+sheets, and knowledge relevance annotations via
+Labelbox, both validated through human review.
+These annotations produce rejection-accept pairs
+for generation tasks and positive-negative pairs for
+retrieval and ranking models, establishing the base-
+line performance prior to AITL deployment. Up-
+dating models with this offline annotation pipeline
+took three months.
+Subsequently, we deployed the AITL annota-
+tion system into a production environment with 40
+agents supporting US-based customers via an asyn-
+chronous messaging channel, where SLA requires
+responses within hours. Over the course of the
+experiment, we collected annotations from more
+than 5,000 customer support cases. Each agent
+annotated approximately 11 cases daily alongside
+their regular customer assistance tasks, maintain-
+ing productivity levels comparable to agents not
+participating in annotation tasks. The primary goal
+of our experiment was to compare the new AITL
+framework with the existing setup, evaluating its
+impact on annotation quality, model development
+cycle efficiency, and overall performance of our
+LLM-based customer support system.
+4.1 Evaluation Metrics
+We evaluated the effectiveness of our AITL
+pipeline based on annotation quality and model
+performance.
+Annotation Quality.The quality of the annota-
+tions was evaluated by averaging human experts
+and LLM verifiers on detecting inconsistencies be-
+tween the annotations of the agents and their re-
+sponses to the customers (Section 3.3). Reliability
+was measured by agreement scores, where a higher
+agreement indicates fewer annotation-response con-
+flicts. The reviewers were blinded to the agent
+labels to reduce bias.
+Model Performance.We measure retrieval with
+recall @ 75(proportion of relevant documents
+among the top 75 given a total of ten thousand
+documents) andprecision @ 8(relevance of the
+top eight ranked documents) as empirically optimal.
+(Appendix C). For generation, we evaluate:
+•Helpfulness:
+1. Point-wise Helpfulness (Model-based):
+Combines scores from a trained prefer-
+ence model and an LLM-based evalua-
+tion aligned with business criteria (Ap-
+pendix B).
+2. Pair-wise Helpfulness (Human-based):
+Human annotators perform pairwise
+comparisons between responses, validat-
+ing model-based assessments.(outlined
+in online annotation step 1)
+• Citation Correctness: Measured as Jaccard
+overlap between model (M) and human (H)
+cited references: |M∩H|
+|M∪H| . E.g., if M={a, b} ,
+H={a, c, d}, score is |{a}|
+|{a,b,c,d}| = 0.25.
+• Response Correctness: Checks the factual
+accuracy and the adherence to the policies
+through the review of agents.
+4.2 Annotation Quality Comparison
+High-quality annotations drive a robust data fly-
+wheel, enhancing model performance and produc-
+ing richer data for future cycles. Table 2 shows
+higher annotation agreement rates in the online
+
+
+===== PAGE 5 =====
+
+workflow compared to offline across three steps:
+preference, adoption, and knowledge relevance.
+Step 4 (missing knowledge) was not evaluated of-
+fline due to the limitations of the annotation tool in
+annotating all the potential missing knowledge.
+Offline Online
+Step 1 (Preference Judgment)0.635 0.832
+Step 2 (Adoption Judgment)0.721 0.775
+Step 3 (Knowledge Relevancy)0.436 0.923
+Table 2: Agreement for offline vs. online setup
+4.3 Impact on Model Performance
+We evaluated how AITL annotations and opti-
+mized fine-tuning impact retrieval-augmented gen-
+eration (RAG) system performance against our
+baseline (Appendix D). Models were trained using
+a 90%/10% temporal split for training and evalua-
+tion, respectively, comparing AITL annotations to
+offline annotations (Steps 1-3).
+Retrieval Accuracy.AITL annotations signif-
+icantly outperform offline annotations (Table 3).
+Precision@8 improved from 0.357 to 0.410
+(+14.8%), exceeding offline by 4.1%. Recall@75
+increased from 0.634 to 0.708 (+11.7%), surpass-
+ing offline by 3.8%, highlighting the benefits of
+AITL system.
+Generation QualityApplying ORPO (Hong
+et al., 2024) with AITL fine-tuning further im-
+proved generation quality (Table 4): Helpfulness
+rose from 0.658 to 0.713 (+8.4%), exceeding of-
+fline fine-tuning (0.691); Citation accuracy im-
+proved significantly from 0.097 to 0.134 (+38.1%),
+surpassing offline (0.112); Response correctness
+increased from 0.851 to 0.882 (+3.6%), higher than
+offline results (0.868). These results highlight the
+clear advantages of the AITL system over offline
+annotation pipelines (Appendix E).
+Human Preferences and Adoption.Pairwise
+human evaluations (Fig. 7) showed that 60.12%
+of the fine-tuned model responses were preferred
+over baseline (33.32%), and 6.57% did not express
+preference. This improvement also increased the
+overall adoption rate by 4.5% compared to the base-
+line. These findings confirm that integrating AITL
+annotations with ORPO not only improves objec-
+tive metrics (e.g., Precision@8 and citation correct-
+ness), but also aligns with human judgments.
+6.57%
+33.32%
+60.12%
+No Difference
+Baseline
+AITL Fine-tuned Models
+Figure 7: Human preference for end-to-end perfor-
+mance: baseline vs. AITL fine-tuned models.
+Figure 8: Immediate vs. Delayed Annotation Workflow
+5 Learnings
+5.1 Annotation Timing Ablation Study
+A key concern is that our system design may not
+scale effectively to channels with stricter SLA re-
+quirements, such as live-chat. To enable annota-
+tion with higher SLA channel, we conducted a
+controlled experiment using the AITL tool, com-
+paring annotations performed immediately during
+customer interactions (Immediate Annotation) with
+those completed after interactions ended (Delayed
+Annotation). This experiment involved approxi-
+mately 2,000 cases under identical tooling condi-
+tions (Figure 8).
+Results (Figure 9) indicate that immediate anno-
+tation significantly improves annotator agreement
+only for theMissing-Knowledgestep (Step 4), in-
+creasing from 63.9% to 76.5% (+12 pp, p <0.05).
+Conversely, differences for Preference, Adoption,
+and Knowledge Feedback steps (Steps 1–3) are
+negligible (complete scores in Appendix G). We
+therefore recommend adopting a hybrid work-
+flow: perform immediate annotation for Missing-
+Knowledge when SLA allows brief delays, while
+delaying the remaining annotation steps after re-
+plying to customers to reliably meet stringent SLA
+requirements.
+
+
+===== PAGE 6 =====
+
+Retrieval Model Ranking Model Recall@75 Precision@8
+Baseline Baseline 0.634 0.357
+Offline Data Fine-tuned Offline Data Fine-tuned 0.670 0.394
+AITL Fine-tuned AITL Fine-tuned0.708 0.410
+Table 3: Performance comparisons on recall@75 and precision@8 on AITL test set. The bolded entries indicate the
+highest scores.
+Generation Model Retrieval Models Helpfulness Citation Response Correctness
+Baseline Baseline 0.658 0.097 0.851
+Offline Fine-tuned (ORPO) Offline Fine-tuned 0.691 0.112 0.868
+AITL Fine-tuned (ORPO) AITL Fine-tuned0.713 0.134 0.882
+Table 4: Performance of RAG models on the AITL test set. Bold entries indicate the highest scores.
+Step1 Step2 Step3 Step4
+0
+50
+100 **
+1.30 min 0.95 min
+1.87 min 1.63 min
+Annotation Step
+Agreement (%)
+Delayed Immediate Annotation Time
+0
+1
+2
+3
+Annotation Time (median, min)
+Figure 9: Hybrid agreement (LLM + human) for im-
+mediate vs. delayed annotation. Red dots show median
+labeling time (min). ** denotes a significant difference
+(p<0.05).
+5.2 Annotation Quality Ablation Study with
+LLM-based filter
+This subsection quantifies the contribution of LLM-
+based filter used in our data aggregation and filter-
+ing stage (Sect. 3.4). The functions as a quality
+gate that minimizes the lack of prompt adherence
+and flags potential inconsistencies between the an-
+notation of human agents and their responses to
+customers (Sect. 3.3). We do not use LLM to origi-
+nate missing-knowledge labels, which require op-
+erational nuance.
+Setup.We evaluated two otherwise identical
+pipelines on the same AITL annotation batches:
+(i) LLM-based prompt-adherence filtering and con-
+sistency checks during data aggregation and (ii) this
+gate disabled. Under LLM-based filtering, 14.3%
+of examples are removed prior to retriever/ranker
+Model Metric w/ Filtering w/o Filtering
+Retrieval Recall@750.7080.670
+Precision@80.402 0.394
+Generation
+Helpfulness0.703 0.696
+Citation0.1310.112
+Response Correct-
+ness
+0.880 0.880
+Table 5: VJ filter ablation on identical AITL batches.
+The only difference is the presence/absence of VJ gating
+during data filtering (Sect. 3.4). Gains concentrate in
+retrieval recall and citation accuracy.
+training and 34.5% prior to generator training.
+Findings.Table 5 shows that LLM-based filter-
+ing yields consistent gains in Recall@75 (+3.8 pp
+vs. no-filtering on the same batch) and Citation
+(+1.9 pp absolute), while Precision@8, Helpful-
+ness, and Response Correctness remain statistically
+unchanged. This pattern aligns with the LLM’s role
+as a noise gate: by down-weighting low–prompt-
+adherence or hallucination-prone supervision dur-
+ing data filtering, it primarily improves retrieval
+and citation grounding without perturbing other
+signals.
+Interpretation.As detailed in Appendix G, LLM
+and human evaluations are strongly correlated
+(r >0.90), enabling a cost-effective hybrid reli-
+ability score that combines both sources. A notable
+exception is Step 4 (Missing-Knowledge), which
+benefits uniquely from immediate human anno-
+tation (+12 pp agreement; Fig. 9). Accordingly,
+we position the LLM-based filtering as a validator
+rather than a generator for this channel, yielding
+a scalable quality filter while preserving human
+oversight where domain nuance is essential.
+
+
+===== PAGE 7 =====
+
+5.3 Pairwise Preference Data Effectiveness.
+Fine-tuning with plus-level preference data (better
+or significantly better) boosts helpfulness, but low-
+ers the correctness of the citation. Adding an agent
+adoption as a data filter restores the correctness of
+the citation to 11.4% and retains a gain of 3.5% in
+helpfulness, achieving a better balance.
+Fine-tune Strategy Helpfulness Citation
+Baseline 0.694 0.123
+Plus Pref0.7660.109
+Plus Pref + Adopted 0.7180.137
+Table 6: Performance comparison of generation models
+by different preference dataset
+5.4 Continuous Training Strategies.
+Retraining the models using a mix of historical
+and new annotations on the previous checkpoint
+improves adaptability and robustness, increasing
+precision @ 8 by 8% in historical data and 4%
+in recent data compared to training only on new
+data. (Appendix E) Periodically integrating fresh
+feedback with diverse historical datasets mitigates
+overfitting and improves retrieval, ranking, and gen-
+eration performance. Similar benefits are observed
+with offline annotation approaches.
+5.5 Cross-Model Generalization Study
+We replicate AITL on Qwen2.5-32B and the Llama-
+3 family (3B, 8B, 70B) using the same data split
+and evaluator as the main study. As shown in Ta-
+ble 7, AITL delivers consistent gains on smaller
+and medium models. At 70B, where SFT baselines
+are already strong, AITL shows mixed helpfulness
+effects but improved/stable citation across variants,
+suggesting interaction with prior objectives rather
+than a lack of transfer; overall, these results in-
+dicate the AITL data flywheel generalizes across
+architectures and scales.
+6 Conclusion and Future Work
+We introducedAgent-in-the-Loop(AITL), an real-
+time(near real-time) data flywheel that turns rou-
+tine customer support operations into continuously
+improving supervision for retrieval, ranking, and
+generation. By capturing four signal types includ-
+ing pairwise response preferences, agent adoption
+and rationales, knowledge relevance, and missing
+knowledge, AITL closes the gap between evalua-
+tion and production reality. Our pilot with U.S.-
+based agents shows consistent gains in retrieval
+Model AITL Helpfulness Citation
+Qwen2.5-32B-Instruct No 0.6718 0.1040
+Qwen2.5-32B-Instruct Yes0.68300.1040
+Llama-3.2-3B-Instruct No 0.3731 0.0569
+Llama-3.2-3B-Instruct Yes0.6362 0.0606
+Llama-3.1-8B-Instruct No 0.3787 0.0967
+Llama-3.1-8B-Instruct Yes0.6056 0.1136
+Llama-3.3-70B-Instruct No 0.6322 0.1048
+Llama-3.3-70B-Instruct Yes0.6438 0.1224
+Table 7: Cross-model results with the same AITL split
+and evaluator.
+(Recall@75, Precision@8), generation helpfulness,
+citation correctness, and agent adoption, while
+shrinking update cadence from months to weeks.
+Building on these results, we outline three direc-
+tions for future work:
+• Scaling optional agent feedback.Re-
+place heavy labels with lightweight micro-
+annotations (default “skip”), use active sam-
+pling for high-uncertainty or disagreement
+cases, and correct selection bias via inverse-
+propensity weighting and post-stratification.
+• Product-embedded AITL for efficiency.In-
+tegrate AITL into agent-facing tools; evalu-
+ate with a productivity bundle (e.g., CSAT,
+time-to-resolution, adoption rate, human-edit
+distance); and study cognitive load, trust cali-
+bration, and skill formation across novice and
+expert agents.
+• Toward fuller automation.Leverage sim-
+ulation and judge-based validation to auto-
+mate dataset curation and preference labeling
+where appropriate, while preserving human
+oversight for safety, policy adherence, and do-
+main nuance.
+Limitation
+Although AITL offers clear advantages, there are
+three key limitations.
+First, prolonged use of real-time annotations
+could lead to increased agent workload and po-
+tential annotation fatigue. To mitigate this risk,
+future implementations could consider strategies
+such as rotating annotation responsibilities among
+agents, adaptive workload management, and peri-
+odic breaks from annotation duties. In addition,
+targeted training and incentive programs can fur-
+ther support annotation quality over time.
+
+
+===== PAGE 8 =====
+
+Second, our study exclusively focused on
+English-language customer support. This leaves
+open questions regarding the effectiveness and ap-
+plicability of AITL in multilingual or culturally
+diverse support contexts, which should be investi-
+gated in future research.
+Finally, the relatively short duration of this study
+constrains our understanding of how annotation
+practices might evolve over extended periods and,
+crucially, how effectively they scale when applied
+to larger groups of agents.
+Acknowledgments
+We are deeply grateful to the many colleagues who
+contributed to the AITL project. This work was
+made possible by the GLOW platform, which en-
+abled reproducible workflows, streamlined model
+development, and rapid end-to-end iterations.
+We extend our sincere thanks to the leadership
+of Airbnb Customer Support for their sponsorship
+and guidance. We especially thank Hossein Shams,
+Chloe Zhao, Gen Wang, Chandraprakash Loonker,
+Mengchen Liang, Jeremy Wang, Jingwen Qiang
+and Ying Tan for their engineering contributions.
+We thank Tony Donisch and Chris Robinson for
+project ideation and support. We are also grateful
+to our colleagues in Design including Eric Fenster-
+heim, Stacey Kennelly Nester, whose creativity and
+insights helped shape the project. In Platform Man-
+agement, we thank Omar Siddiqui, Eliav Kahan,
+and Jorge Poblacion for their direction and support.
+Most importantly, this project could not have been
+completed without the partnership of our agent sup-
+port collaborators; we acknowledge Lindsey Oben,
+David Amador, Isabel Arboleda, Chris Enzaldo,
+and the CS Labs team for their indispensable sup-
+port. Finally, we thank the anonymous reviewers
+for their constructive feedback, which helped us
+substantially improve this paper.
+References
+Yuntao Bai, Andy Jones, Kamal Ndousse, Amanda
+Askell, Anna Chen, Nova DasSarma, Dawn Drain,
+Stanislav Fort, Deep Ganguli, Tom Henighan,
+Nicholas Joseph, Saurav Kadavath, Jackson Kernion,
+Tom Conerly, Sheer El-Showk, Nelson Elhage, Zac
+Hatfield-Dodds, Danny Hernandez, Tristan Hume,
+Scott Johnston, Shauna Kravec, Liane Lovitt, Neel
+Nanda, Catherine Olsson, Dario Amodei, Tom
+Brown, Jack Clark, Sam McCandlish, Chris Olah,
+Ben Mann, and Jared Kaplan. 2022a. Training
+a helpful and harmless assistant with reinforce-
+ment learning from human feedback.Preprint,
+arXiv:2204.05862.
+Yuntao Bai, Saurav Kadavath, Sandipan Kundu,
+Amanda Askell, Jackson Kernion, Andy Jones, Anna
+Chen, Anna Goldie, Azalia Mirhoseini, Cameron
+McKinnon, Carol Chen, Catherine Olsson, Christo-
+pher Olah, Danny Hernandez, Dawn Drain, Deep
+Ganguli, Dustin Li, Eli Tran-Johnson, Ethan Perez,
+Jamie Kerr, Jared Mueller, Jeffrey Ladish, Joshua
+Landau, Kamal Ndousse, Kamile Lukosuite, Liane
+Lovitt, Michael Sellitto, Nelson Elhage, Nicholas
+Schiefer, Noemi Mercado, Nova DasSarma, Robert
+Lasenby, Robin Larson, Sam Ringer, Scott John-
+ston, Shauna Kravec, Sheer El Showk, Stanislav Fort,
+Tamera Lanham, Timothy Telleen-Lawton, Tom Con-
+erly, Tom Henighan, Tristan Hume, Samuel R. Bow-
+man, Zac Hatfield-Dodds, Ben Mann, Dario Amodei,
+Nicholas Joseph, Sam McCandlish, Tom Brown, and
+Jared Kaplan. 2022b. Constitutional ai: Harmless-
+ness from ai feedback.Preprint, arXiv:2212.08073.
+Hyung Won Chung, Le Hou, Shayne Longpre, Barret
+Zoph, Yi Tay, William Fedus, Yunxuan Li, Xuezhi
+Wang, Mostafa Dehghani, Siddhartha Brahma, Al-
+bert Webson, Shixiang Shane Gu, Zhuyun Dai,
+Mirac Suzgun, Xinyun Chen, Aakanksha Chowdh-
+ery, Alex Castro-Ros, Marie Pellat, Kevin Robinson,
+Dasha Valter, Sharan Narang, Gaurav Mishra, Adams
+Yu, Vincent Zhao, Yanping Huang, Andrew Dai,
+Hongkun Yu, Slav Petrov, Ed H. Chi, Jeff Dean, Ja-
+cob Devlin, Adam Roberts, Denny Zhou, Quoc V . Le,
+and Jason Wei. 2022. Scaling instruction-finetuned
+language models.Preprint, arXiv:2210.11416.
+Arthur Câmara, Dinos Papakostas, Mathias Parisot,
+Fernando Rejon Barrera, and Jakub Zavrel. 2024.
+Zeta-alpha-e5-mistral. https://huggingface.co/
+zeta-alpha-ai/Zeta-Alpha-E5-Mistral.
+Hui Dai, Ryan Teehan, and Mengye Ren. 2025. Are
+LLMs prescient? a continuous evaluation using daily
+news as the oracle. InForty-second International
+Conference on Machine Learning.
+Jiwoo Hong, Noah Lee, and James Thorne. 2024. Orpo:
+Monolithic preference optimization without refer-
+ence model.Preprint, arXiv:2403.07691.
+Albert Q. Jiang, Alexandre Sablayrolles, Antoine
+Roux, Arthur Mensch, Blanche Savary, Chris
+Bamford, Devendra Singh Chaplot, Diego de las
+Casas, Emma Bou Hanna, Florian Bressand, Gi-
+anna Lengyel, Guillaume Bour, Guillaume Lam-
+ple, Lélio Renard Lavaud, Lucile Saulnier, Marie-
+Anne Lachaux, Pierre Stock, Sandeep Subramanian,
+Sophia Yang, Szymon Antoniak, Teven Le Scao,
+Théophile Gervet, Thibaut Lavril, Thomas Wang,
+Timothée Lacroix, and William El Sayed. 2024. Mix-
+tral of experts.Preprint, arXiv:2401.04088.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio
+Petroni, Vladimir Karpukhin, Naman Goyal, Hein-
+rich Küttler, Mike Lewis, Wen-tau Yih, Tim Rock-
+täschel, Sebastian Riedel, and Douwe Kiela. 2020.
+
+
+===== PAGE 9 =====
+
+Retrieval-augmented generation for knowledge-
+intensive NLP tasks.CoRR, abs/2005.11401.
+Haipeng Luo, Qingfeng Sun, Can Xu, Pu Zhao, Qingwei
+Lin, Jianguang Lou, Shifeng Chen, Yansong Tang,
+and Weizhu Chen. 2024. Arena learning: Build data
+flywheel for llms post-training via simulated chatbot
+arena.Preprint, arXiv:2407.10627.
+Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Car-
+roll L. Wainwright, Pamela Mishkin, Chong Zhang,
+Sandhini Agarwal, Katarina Slama, Alex Ray, John
+Schulman, Jacob Hilton, Fraser Kelton, Luke Miller,
+Maddie Simens, Amanda Askell, Peter Welinder,
+Paul Christiano, Jan Leike, and Ryan Lowe. 2022a.
+Training language models to follow instructions with
+human feedback.Preprint, arXiv:2203.02155.
+Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Car-
+roll L. Wainwright, Pamela Mishkin, Chong Zhang,
+Sandhini Agarwal, Katarina Slama, Alex Ray, John
+Schulman, Jacob Hilton, Fraser Kelton, Luke Miller,
+Maddie Simens, Amanda Askell, Peter Welinder,
+Paul Christiano, Jan Leike, and Ryan Lowe. 2022b.
+Training language models to follow instructions with
+human feedback.Preprint, arXiv:2203.02155.
+Shariq Shah, Hossein Ghomeshi, Edlira Vakaj, Emmett
+Cooper, and Shereen Fouad. 2023. A review of natu-
+ral language processing in contact centre automation.
+Pattern Analysis and Applications, 26(3):823–846.
+Nisan Stiennon, Long Ouyang, Jeff Wu, Daniel M.
+Ziegler, Ryan Lowe, Chelsea V oss, Alec Radford,
+Dario Amodei, and Paul F. Christiano. 2020. Learn-
+ing to summarize from human feedback.CoRR,
+abs/2009.01325.
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin,
+Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang,
+Joseph E. Gonzalez, and Ion Stoica. 2023. Judg-
+ing llm-as-a-judge with mt-bench and chatbot arena.
+arXiv preprint arXiv:2306.05685.
+A Annotation Error Types and LLM
+Verifier Prompt
+We identify common annotation error types, each
+illustrated with concise examples:
+• Preference Mismatch: Occurs when an agent
+explicitly prefers response A but ultimately
+selects response B.
+• Adoption Mismatch: Occurs when an agent
+rejects a response due to specific formatting
+issues but subsequently uses the same format-
+ting in their final reply.
+• Incorrect Knowledge Annotation: Occurs
+when the agent provides guidance based on
+certain policies (e.g., advising customer can-
+cellation) but inaccurately labels relevant pol-
+icy documents as irrelevant.
+• Omitted Missing Knowledge: Occurs when
+the agent mentions essential details (e.g., re-
+fund amount) to the customer but fails to an-
+notate this critical contextual information.
+Below is a refined example prompt template uti-
+lized by the LLM-based verifier for missing knowl-
+edge object verification:
+Task:Evaluate whether the provided
+knowledge objects annotated by agents
+sufficiently address the customer’s issue
+described in the conversation.
+Follow these instructions step by step:
+- Read and understand the customer’s
+issue from the provided conversation and
+contextual information.
+- Carefully review the agent’s annotated
+knowledge objects and their response to the
+customer.
+- Determine if the annotated knowledge
+items adequately and directly resolve or
+address the customer’s issue.
+Provide your evaluation strictly in the fol-
+lowing JSON format:
+{ "missing_agreement_reason": "Provide a
+concise yet specific reason why the knowl-
+edge objects are sufficient or insufficient.",
+"missing_agreement": 1 or 0 // 1 if knowl-
+edge provided is insufficient, 0 if sufficient
+}
+Conversation:
+[Customer]: what customer said
+[Agent]: what agent said
+[Customer]: what customer said
+Agent’s Response to Customer:
+agent’s final response provided here
+Provided Knowledge Objects Annotated
+by Agents:
+1. Knowledge item 1 here
+2. Knowledge item 2 here
+
+
+===== PAGE 10 =====
+
+B Helpfulness Metric Definition
+This section will describe the training process for
+helpfulness models.
+We definepoint-wise helpfulness scoreto mea-
+sure the likelihood that internal domain experts
+(e.g. customer support agents) would prefer a par-
+ticular response. This score is generated through
+an ensemble method that combines two distinct
+approaches:
+1. Reference Evaluator Model: We employ an
+internally developed evaluation model based on
+Mistral-7B, fine-tuned using human-annotated pref-
+erence data via a pairwise loss objective. This
+model serves as our reference evaluator, achieving
+an approximate agreement rate of 80% compared
+to the ground-truth annotations provided by the
+expert groups.
+2. GPT-4 Prompt-based Evaluations: We per-
+form multiple GPT-4 evaluations using carefully
+designed prompts that embody internal helpfulness
+criteria. Each evaluation produces a binary indica-
+tor (helpful or not), and we sum these indicators
+across seven distinct prompts to yield an integer
+score ranging from 0 to 7. By averaging these in-
+dicators, we obtain a final continuous helpfulness
+score. This prompt-based mechanism eliminates
+the need for ground-truth labels during inference.
+Evaluation against expert-labeled ground truth con-
+firms an agreement rate of approximately 80%, val-
+idating the reliability of this approach.
+C Retrieval and Ranking Metrics
+We empirically selected Recall@75 and Preci-
+sion@8 as our primary retrieval and ranking met-
+rics, guided by operational constraints and experi-
+mental insights. Recall@75 evaluates the effective-
+ness of our retrieval system in identifying relevant
+articles within the top 75 retrieved candidates. Em-
+pirical analysis showed that the recall increased
+consistently with more retrieved candidates, reach-
+ing approximately 70%-80% at topN=75. Beyond
+75 candidates, recall improvements plateaued, in-
+dicating limited benefits from retrieving additional
+documents.
+Precision@8 was chosen based on practical lim-
+itations, as production environments restrict input
+context lengths for downstream generation mod-
+els. Our experiments indicated that reranker per-
+formance notably surpassed retrieval-only methods
+from topN=5 onward, with topN=8 providing the
+optimal trade-off between performance enhance-
+ment and operational feasibility. Increasing the
+number of retrieved snippets beyond 8 led to re-
+duced helpfulness scores due to excessive infor-
+mation dilution. Thus, Precision@8 effectively
+balances input quality for response generation with
+practical system constraints.
+D Prior AITL Baseline Details
+This appendix details the baseline Retrieval-
+Augmented Generation (RAG) system, outlining
+the three core models: generation, retrieval, and
+ranking.
+Generation ModelOur generation compo-
+nent utilizes an 8×7B Mistral Mixture-of-Experts
+(MoE) model (Jiang et al., 2024). This model is ini-
+tially fine-tuned via supervised fine-tuning (SFT)
+(Ouyang et al., 2022b) on offline human-agent an-
+notations. Subsequently, we apply Odds Ratio Pref-
+erence Optimization (ORPO) (Hong et al., 2024) to
+align the model’s generation with agent-approved
+preferences.
+Retrieval ModelRetrieval is performed by fine-
+tuning a pre-trained Zeta-Alpha-E5-Mistral 7b em-
+bedding model (Câmara et al., 2024). This fine-
+tuned model transforms article chunks into 1024-
+dimensional vector embeddings. When a user
+query is received, it is encoded, and the top-Nrel-
+evant article chunks are retrieved based on cosine
+similarity.
+Ranking ModelAfter retrieval, a ranking
+model refines the top- N retrieved article chunks
+to identify the most relevant and helpful content.
+This ranking is accomplished using an in-house
+fine-tuned FLAN-T5 model(Chung et al., 2022),
+adapted for a ranking task. The model takes the
+user query and each retrieved article chunk’s de-
+tails as input, and outputs a relevance score, which
+is then used to rank the chunks.
+E AITL Training Details
+This appendix details the post-training processes
+and parameters for each component of our
+Retrieval-Augmented Generation (RAG) baseline:
+the Generation Model, Retrieval Model, and Rank-
+ing Model.
+E.1 Generation Model
+Fine-tuning commenced from the baseline check-
+point of the 8 ×7B Mistral Mixture-of-Experts
+(MoE) model. The model was optimized via Odds
+Ratio Preference Optimization (ORPO), using a
+
+
+===== PAGE 11 =====
+
+balanced dataset comprising equal parts newly an-
+notated examples and previously collected train-
+ing data. Training was conducted for a total of
+3 epochs with a batch size of 64, employing an
+initial learning rate of 2×10 −5, which linearly de-
+cayed after a warm-up period covering 5% of total
+training steps. The fine-tuning process utilized 4
+NVIDIA A100 GPUs, each equipped with 80GB
+of memory. After training, the model underwent
+4-bit Quantized Low-Rank Adaptation (QLoRA)
+to substantially decrease computational overhead
+and memory consumption during inference. Sub-
+sequently, the LoRA weights were merged back
+into the original model weights, ensuring efficient
+deployment. Parameter selection and alignment
+loss criteria were informed by comparisons made
+during previous model iterations.
+•Training:
+– ORPO Phase:Incorporates preference
+signals through pairwise feedback. The
+model learns to prioritize more ’helpful’
+or relevant outputs based on labeled data.
+•Observations:
+– ORPO fine-tuning often yields higher co-
+herence and factual correctness than SFT
+alone.
+– We observe slight divergences between
+purely offline vs. online-labeled pref-
+erence data through AITL, motivating
+continuous updates.
+E.2 Retrieval Model
+Following the generation model’s optimization, we
+proceed to detail the training process for the re-
+trieval model of our RAG system.
+•Training:
+– Fine-tuning Methodology:The Zeta-
+Alpha-E5-Mistral 7b model underwent
+fine-tuning employing MultipleNega-
+tivesRankingLoss. Positive training sam-
+ples were comprised of article segments
+marked as "RELEV ANT" or "HELP-
+FUL," supplemented by agent-generated
+content. Negative samples consisted
+of both "NOT RELEV ANT" or "NOT
+HELPFUL" labeled chunks (hard neg-
+atives) and randomly sampled chunks
+from the same batch (easy negatives).
+– Training Setup:Training parameters in-
+cluded a learning rate of 2×10 −5 and
+a weight decay of 2×10 −6. The train-
+ing was conducted for 1 epoch, with a
+training batch size of 1. The model was
+executed on an A100 GPU cluster con-
+sisting of4GPUs.
+•Observations:
+– The retrieval model’s accuracy benefited
+from increased training dataset size and
+demonstrated resilience to data noise.
+Notably, optimal performance was ob-
+served when the model was trained on
+a combination of high-confidence (anno-
+tator and reviewer alignment) and low-
+confidence (annotator and reviewer dis-
+agreement) datasets.
+– For RAG in live support conversations,
+the retrieval models fine-tuned using
+AITL data exhibited substantially supe-
+rior performance compared to the base-
+line, and those fine-tuned using offline
+datasets.
+E.3 Ranking Model
+With the retrieval model established, we now turn
+our attention to the ranking model, which refines
+the retrieved results.
+•Training:
+– SFT:Training data consisted of posi-
+tive and negative examples based on
+agent annotations. Positive examples
+were constructed from article chunks la-
+beled "RELEV ANT" or "HELPFUL,"
+along with agent-generated content. Neg-
+ative examples comprised chunks labeled
+"NOT RELEV ANT" or "NOT HELP-
+FUL." Each training instance was for-
+matted as<prompt + user query + arti-
+cle chunk details>as input, with<rele-
+vant>as the target for positive examples
+and<not_relevant>as the target for neg-
+ative examples. During inference, the rel-
+evance score is determined by the proba-
+bility of the output being "relevant".
+– Training Setup:The model was trained
+for 3 epochs on a single A10 GPU, using
+a learning rate of 1e−5 , a batch size of
+16, and gradient accumulation steps of
+64.
+
+
+===== PAGE 12 =====
+
+•Observations:
+– The ranking model’s performance
+was optimized when trained on high-
+confidence annotated datasets, with
+a balanced 1:2 ratio of historical and
+newly generated AITL data.
+– Utilizing AITL data for fine-tuning rank-
+ing models yielded significantly better
+performance in live support RAG sce-
+narios compared to offline datasets, and
+also surpassed the performance of mod-
+els trained only on historical data.
+F Training Experiment Efficiency
+To improve the efficiency of offline experiments,
+we introduced a framework for the generalized of-
+fline LLM workflow (GLOW) based on reusable
+and parameterized fine-tuning, batch scoring and
+evaluation components. The two main areas of
+focus for GLOW that benefit this research study
+include infra-aware LLM developments and inte-
+gration with template end-to-end workflow.
+Infra-aware LLM DevelopmentsLLM compu-
+tations are very sensitive to the underlying infras-
+tructure, and there are multiple hyperparameters
+that can drastically affect the computation capacity:
+• Compute optimization: whether to apply
+lower precision training, Parameter-Efficient
+Fine Tuning (PEFT) adaptors and model par-
+titioning strategies like DeepSpeed or FSDP
+• Input dataset size, batch size and context
+length
+• Model capacity and architecture
+A typical LLM offline task that has a specific set
+of hyperparams must be deployed to a matching in-
+frastructure to avoid failed tasks due to insufficient
+GPU VRAM, or overprovisioning that led to low
+GPU utilization rate. To solve this problem, GLOW
+in its configuration is integrated with the Ray Clus-
+ter spec section that combines the LLM task with
+ephemeral compute cluster provisioned on-demand.
+This setup not only improves the offline experiment
+task stability, but also guarantees reproducible re-
+sults across multiple experiment runs.
+Templated end-to-end WorkflowGLOW offers
+reusable offline workflow building components for
+end users to customize their developments, and this
+Annotation Step Immediate (%) Delayed (%)
+LLM Human LLM Human
+Step 1 62.6 72.3 61.0 72.8
+Step 2 76.7 74.2 75.1 75.2
+Step 3 91.7 97.5 91.7 98.5
+Step 4 76.1 76.8 57.6 ** 70.3**
+Table 8: Annotation accuracy for LLM and human
+raters. Significance marker **: difference between im-
+mediate and delayed is significant ( p <0.05 for hu-
+mans;∆>5pp for LLM).
+unified API improves production readiness while
+largely reducing prototype development cycles to
+production.
+G Immediate and Delayed Comparison
+In practice we average the human and LLM scores
+to form a hybrid metric. Because the two sources
+correlate strongly ( r >0.90; Table 8), this com-
+posite score inherits human-level reliability while
+remaining inexpensive to scale. All subsequent
+analyses, including the immediate vs. deferred com-
+parison in Figure 9, are therefore reported on this
+hybrid metric.
+Step Q1 Median Q3 Mean Trim. Mean
+Step 1 0.5831.302.967 4.017 2.174
+Step 2 0.4830.952.733 3.711 2.065
+Step 3 1.3171.873.867 4.647 3.332
+Step 4 0.7211.633.317 3.409 2.430
+Table 9: Annotation-time statistics per step (minutes).
+Table 9 shows a pronounced right skew: Means
+and even 10 % trimmed means sit well above the
+medians of 1–2 min. Hence, we quote the median
+as the best indicator of agent annotation time effort,
+with the trimmed mean offered as a reference.

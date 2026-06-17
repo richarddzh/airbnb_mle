@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airbnb ML / LLM / AI 技术分类深度分析</title>
+  <style>
+    body { margin: 0; background: #f6f8fb; color: #172033; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.72; }
+    main { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+    article { background: #fff; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17,24,39,.06); }
+    h1 { margin-top: 0; line-height: 1.25; font-size: 2rem; }
+    h2 { margin-top: 2.2rem; padding-bottom: .35rem; border-bottom: 1px solid #e6ebf2; }
+    h3 { margin-top: 1.4rem; }
+    a { color: #0969da; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    .box { border-left: 4px solid #2f6feb; background: #f1f6ff; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { border-left: 4px solid #2da44e; background: #f6fff1; padding: 14px 18px; border-radius: 8px; }
+    .warn { border-left: 4px solid #bf8700; background: #fff8c5; padding: 14px 18px; border-radius: 8px; }
+    code { background: #f3f4f6; border-radius: 4px; padding: 0.1rem 0.3rem; }
+    .small { color: #57606a; font-size: .92rem; }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>Airbnb ML / LLM / AI 技术分类深度分析报告</h1>
+
+  <section class="box">
+    <strong>重点来源：</strong><a href="https://www.airbnb.co.in/help/article/4097">Airbnb Help Article 4097：How we develop and improve AI models</a>，以及 <a href="https://airbnb.tech/blog/">Airbnb Tech Blog</a> 下可访问的 AI/ML、Data、Infrastructure 文章与 Airbnb 官方研究论文页。<br>
+    <strong>报告目标：</strong>按技术类别总结 Airbnb 使用到的 ML、LLM、AI 技术，解释每类技术的关键点、使用场景、工程约束和产品价值。
+  </section>
+
+  <h2>一、总判断：Airbnb 的 AI 技术版图</h2>
+  <p class="takeaway">Airbnb 的 AI/ML 体系可以概括为“平台数据 + 任务型模型 + LLM 增强 + 人类反馈闭环 + 强工程验证”。它不是单纯把通用大模型接到产品上，而是围绕客服、搜索、推荐、预测、开发者效率和知识图谱等高价值业务流，把传统 ML、深度学习、LLM、检索排序、实验评估和隐私治理组合成可生产化系统。</p>
+
+  <p>从技术博客和帮助文档看，Airbnb 使用 AI 的主要原则是：</p>
+  <ol>
+    <li><strong>数据必须可治理：</strong>Help 4097 明确提到 AI 模型改进可能使用个人信息，但会采取去识别化、加密、假名化和访问限制。</li>
+    <li><strong>模型必须贴近业务任务：</strong>客服不是泛泛聊天，而是 ASR、意图检测、文章检索、LLM 重排、摘要、知识表示和人工转接。</li>
+    <li><strong>LLM 必须被结构化上下文和验证约束：</strong>GraphQL mock 用 schema validation，客服用 LLM verifier 和人工抽检，RAG 用知识库与引用校验。</li>
+    <li><strong>评估必须连接业务指标：</strong>客服看 self-resolution、agent working time、NPS；搜索看 bookings、uncancelled bookings、map moves；工程效率看迁移成功率和测试覆盖保持。</li>
+  </ol>
+
+  <h2>二、Help Article 4097 深入分析：AI 训练数据与隐私保护边界</h2>
+  <p>Airbnb 帮助中心 <a href="https://www.airbnb.co.in/help/article/4097">How we develop and improve AI models</a> 的篇幅很短，但它是理解 Airbnb AI 技术体系的治理前提。原文表达的核心是：Airbnb 可能使用用户个人信息来开发和改进驱动 AI 功能的模型；当这样做时，会采取适当措施保护隐私。</p>
+
+  <table>
+    <thead><tr><th>文档要点</th><th>技术含义</th><th>对 Airbnb AI 系统的影响</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>可能使用 personal information 开发和改进 AI models</td>
+        <td>模型训练/评估可能使用客服对话、预订上下文、用户行为、帮助中心交互、host/guest 相关信息等数据。</td>
+        <td>Airbnb 的 AI 优势来自平台专有数据，但这也要求严格的数据治理。</td>
+      </tr>
+      <tr>
+        <td>训练前可能 de-identify，移除姓名和其他识别信息</td>
+        <td>对训练样本做 PII redaction、实体替换、匿名化或上下文脱敏。</td>
+        <td>尤其适用于客服 LLM、摘要模型、意图分类、RAG 评估数据。</td>
+      </tr>
+      <tr>
+        <td>使用 data encryption</td>
+        <td>训练数据、日志、模型输入输出、存储和传输链路需要加密。</td>
+        <td>支撑跨团队、跨平台 AI 数据使用的安全底座。</td>
+      </tr>
+      <tr>
+        <td>使用 pseudonymization</td>
+        <td>用假名/替代 ID 保留可建模关系，同时降低直接识别风险。</td>
+        <td>适合用户行为序列建模、搜索推荐、客服 case 关联、实验分析。</td>
+      </tr>
+      <tr>
+        <td>限制访问到少数授权人员，并有严格保密义务</td>
+        <td>访问控制、审计、最小权限、数据集审批和安全边界。</td>
+        <td>是 Agent-in-the-Loop、客服摘要、LLM 训练闭环能够合规运行的前提。</td>
+      </tr>
+      <tr>
+        <td>承诺遵循 Airbnb Privacy Principles</td>
+        <td>AI 能力不是孤立技术能力，而被纳入公司隐私原则和数据治理框架。</td>
+        <td>对全球 rollout、多语言客服 AI、个性化推荐尤其重要。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="warn"><strong>关键解读：</strong>Help 4097 没有披露具体模型、训练数据范围、保留期限或 opt-out 细节，但它明确了 Airbnb 的 AI 数据使用逻辑：允许使用个人信息改进 AI，但必须通过去识别化、加密、假名化和访问限制降低风险。因此，阅读 Airbnb 技术博客中的所有 AI 系统时，都应把“数据治理”视为默认架构层，而不是附加说明。</p>
+
+  <h2>三、Airbnb 使用的 ML / LLM / AI 技术分类总表</h2>
+  <table>
+    <thead><tr><th>类别</th><th>代表文章/论文</th><th>使用技术</th><th>关键点</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>客服语音与自助支持 AI</td>
+        <td>Listening, Learning, and Helping at Scale</td>
+        <td>ASR、意图分类、向量检索、LLM reranking、paraphrasing、self-service routing</td>
+        <td>把传统 IVR 改造成自然语言入口，低延迟识别用户问题并推送帮助文章或转人工。</td>
+      </tr>
+      <tr>
+        <td>LLM 客服系统持续学习</td>
+        <td>Agent-in-the-Loop</td>
+        <td>RAG、pairwise preference、agent adoption、knowledge relevance、missing knowledge、LLM verifier、ORPO/PEFT</td>
+        <td>把坐席真实反馈转化为检索、排序、生成模型的持续训练数据。</td>
+      </tr>
+      <tr>
+        <td>客服增量摘要</td>
+        <td>Incremental Summarization</td>
+        <td>Mixtral-8x7B、DeBERTa classifier、progressive note-taking、agent edits、DPO/ORPO/SFT、LLM judge</td>
+        <td>在对话过程中生成 concise bullet notes，减少坐席写 note 和回看上下文时间。</td>
+      </tr>
+      <tr>
+        <td>LLM 友好知识表示</td>
+        <td>LLM-Friendly Knowledge Representation for Customer Support</td>
+        <td>Intent-Context-Action (ICA)、知识结构化、LLM QA/RAG</td>
+        <td>把业务知识改写为 LLM 更容易检索、理解和执行的结构。</td>
+      </tr>
+      <tr>
+        <td>搜索召回与排序</td>
+        <td>Embedding-Based Retrieval、Improving Search Ranking for Maps</td>
+        <td>Two-tower embeddings、contrastive learning、ANN/IVF、booking probability ranking、map-specific attention modeling</td>
+        <td>搜索不只靠文本匹配，而是结合用户旅程、地理、行为、房源特征和界面注意力。</td>
+      </tr>
+      <tr>
+        <td>个性化推荐</td>
+        <td>Recommending Travel Destinations</td>
+        <td>Transformer 序列建模、多任务学习、destination intent prediction、短期/长期兴趣融合</td>
+        <td>把用户行为当作 token 序列，预测目的地意图，服务 autosuggest 和邮件召回。</td>
+      </tr>
+      <tr>
+        <td>商业价值与供给质量建模</td>
+        <td>How Airbnb Measures Listing Lifetime Value</td>
+        <td>LightGBM、LTV prediction、incrementality modeling、production function、daily update</td>
+        <td>估计房源未来价值、增量价值和营销带来的增量价值，支持供给策略。</td>
+      </tr>
+      <tr>
+        <td>预测与时间序列</td>
+        <td>COVID forecasting、Borrow from geography</td>
+        <td>B-DARMA、Bayesian Dirichlet、compositional time series、structural break、hierarchical Bayesian prior propagation</td>
+        <td>处理疫情等结构性冲击下的 lead-time composition 和跨地域需求恢复预测。</td>
+      </tr>
+      <tr>
+        <td>开发者效率 LLM</td>
+        <td>LLM test migration、GraphQL @generateMock</td>
+        <td>LLM code transformation、state-machine validation、retry loops、long-context prompting、schema-constrained generation、Gemini 2.5 Pro</td>
+        <td>用 LLM 做大规模代码迁移和类型安全 mock 生成，但用编译、lint、schema 验证约束输出。</td>
+      </tr>
+      <tr>
+        <td>知识图谱与 Trust/Safety 基础设施</td>
+        <td>Identity graph with unified knowledge graph infrastructure</td>
+        <td>JanusGraph、DynamoDB、OpenSearch、Gremlin、graph traversal optimization</td>
+        <td>大规模身份关系图支撑风控、关联账号识别和更广义的知识图谱基础设施。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>四、类别 1：客服 AI 与语音支持</h2>
+  <h3>4.1 使用了哪些技术</h3>
+  <ul>
+    <li><strong>领域适配 ASR：</strong>针对 noisy phone audio 和 Airbnb 术语做适配，解决 “listing” 等领域词误识别。</li>
+    <li><strong>Contact Reason Detection：</strong>用客服原因 taxonomy 对用户来电进行意图分类。</li>
+    <li><strong>向量检索 + LLM 重排：</strong>Help Article embeddings 存入 vector database，先召回最多 30 篇文章，再由 LLM-based ranking model 重排。</li>
+    <li><strong>Paraphrasing：</strong>不是完全自由生成，而是由 UX writer 预写标准摘要，线上用 embedding nearest-neighbor 匹配。</li>
+    <li><strong>自动化与人工转接：</strong>能自助解决则发 Help Center article 或 workflow；需要人工或用户明确要求人工时转接坐席。</li>
+  </ul>
+
+  <h3>4.2 技术关键点</h3>
+  <table>
+    <thead><tr><th>关键点</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>低延迟</td><td>意图检测平均低于 50ms，文章向量召回约 60ms，适配实时 IVR。</td></tr>
+      <tr><td>领域词优化</td><td>通用 ASR 在 Airbnb 术语上会出错，领域 phrase list 优化使 WER 从 33% 降到约 10%。</td></tr>
+      <tr><td>RAG 前置</td><td>客服 AI 优先把答案 grounding 到 Help Center article，而不是让 LLM 自由编答案。</td></tr>
+      <tr><td>可控生成</td><td>Paraphrasing 使用 curated summaries + embedding 匹配，减少幻觉风险。</td></tr>
+      <tr><td>尊重用户升级</td><td>检测到用户想找人工，系统会转人工，而不是强制自助。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>五、类别 2：LLM 客服、RAG 与知识闭环</h2>
+  <h3>5.1 Agent-in-the-Loop</h3>
+  <p>Agent-in-the-Loop 是 Airbnb 客服 LLM 的核心闭环设计。它采集四类坐席反馈：候选回复偏好、采纳决策与理由、知识相关性、缺失知识。这些反馈分别服务于生成模型、检索/排序模型和知识库更新。</p>
+
+  <table>
+    <thead><tr><th>反馈类型</th><th>对应技术</th><th>关键价值</th></tr></thead>
+    <tbody>
+      <tr><td>Pairwise preference</td><td>偏好学习、ORPO/DPO 类训练</td><td>让模型学习坐席认为更有帮助、更合规的回复。</td></tr>
+      <tr><td>Adoption + rationale</td><td>采纳过滤、自然语言 critique</td><td>避免只学“看似好”的回复，强调真实可用性。</td></tr>
+      <tr><td>Knowledge relevance</td><td>检索/排序监督信号</td><td>提升 RAG 检索召回和排序精度。</td></tr>
+      <tr><td>Missing knowledge</td><td>知识库补全、知识表示更新</td><td>发现政策、流程、经验知识中的缺口。</td></tr>
+      <tr><td>LLM verifier</td><td>质量过滤、consistency check</td><td>过滤低 prompt adherence、幻觉或标注冲突数据。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>5.2 Incremental Summarization</h3>
+  <p>客服摘要系统将 LLM 用于坐席工作流增强，而不是完全替代坐席。核心是 progressive note-taking：每次有新消息/电话摘要时，LLM 只生成新增 bullet，并把之前坐席编辑后的 bullets 放入 prompt，确保人工修改持续生效。</p>
+
+  <table>
+    <thead><tr><th>组件</th><th>技术</th><th>关键点</th></tr></thead>
+    <tbody>
+      <tr><td>摘要 LLM</td><td>微调 Mixtral-8x7B</td><td>生成客服 case 的 concise bullet notes。</td></tr>
+      <tr><td>Bullet classifier</td><td>DeBERTa-based classifier</td><td>过滤寒暄、重复和低价值 bullet，生产二分类 F1 约 0.895。</td></tr>
+      <tr><td>Agent edits</td><td>before-edit / after-edit 记录</td><td>在线影响后续 prompt，离线形成偏好训练数据。</td></tr>
+      <tr><td>模型训练</td><td>SFT、DPO、ORPO</td><td>用高质量 after-edit 和 before/after pair 继续优化模型。</td></tr>
+      <tr><td>评估</td><td>LLM judge + human review</td><td>评估 completeness、truthfulness、conciseness。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>5.3 LLM-Friendly Knowledge Representation</h3>
+  <p>Airbnb 的 COLING 论文提出 ICA（Intent, Context, Action）知识表示。其背后的问题是：普通文档/FAQ 未必适合 LLM 在客服场景中精确执行。ICA 将知识拆为用户意图、适用上下文和应采取动作，使 RAG 检索到的知识更容易被模型用于回答和行动。</p>
+
+  <h2>六、类别 3：搜索、召回、排序与推荐</h2>
+  <h3>6.1 Embedding-Based Retrieval</h3>
+  <p>Airbnb 的 EBR 是典型的大规模候选召回系统。模型采用 two-tower architecture：listing tower 离线每日计算房源 embedding，query tower 在线计算搜索 query embedding。训练数据不是随机采样，而是基于用户 trip journey 构建 hard negatives：用户曝光、点击、wishlist 但最终未预订的房源。</p>
+
+  <table>
+    <thead><tr><th>技术点</th><th>关键原因</th></tr></thead>
+    <tbody>
+      <tr><td>Contrastive learning</td><td>让 query embedding 更接近最终预订房源，远离未预订但曾考虑过的 hard negatives。</td></tr>
+      <tr><td>Two-tower</td><td>listing tower 可离线批处理，降低在线延迟。</td></tr>
+      <tr><td>IVF over HNSW</td><td>HNSW 指标略好，但 Airbnb 房源价格/可订状态实时更新频繁，内存和过滤延迟不理想；IVF 更容易接入现有 search filter。</td></tr>
+      <tr><td>Euclidean distance</td><td>相比 dot product，产生更均衡的 IVF cluster size，提升召回系统判别力。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.2 地图 ranking</h3>
+  <p>地图搜索不能直接套用列表搜索的 rank-decay 假设。Airbnb 采用用户注意力建模：uniform attention、tiered attention、discounted attention。具体做法包括限制地图 pins 的 booking probability 差距、用 mini-pins 分层展示低优先级房源、移动地图中心让高 booking probability 房源处于用户更容易注意的位置。</p>
+
+  <h3>6.3 目的地推荐</h3>
+  <p>Destination recommendation 使用类似语言模型的思想：把用户行为视为 token 序列，用 transformer 建模 booking history、view history、search history。每个 action 表示为 city/region/days-to-today embedding 之和，并加入当前时间等上下文捕捉季节性。</p>
+  <p>关键设计是同时覆盖 active users 和 dormant users：对每次 booking 生成 14 个训练样本，其中 7 个模拟预订前 1-7 天的 active 状态，7 个随机采样预订前 8-365 天且只使用 booking data，模拟早期规划/沉睡用户。模型还用 multi-task learning 同时预测 region-level 和 city-level destination，以学习更丰富的地理表示。</p>
+
+  <h2>七、类别 4：商业价值、供给质量与预测建模</h2>
+  <h3>7.1 Listing Lifetime Value</h3>
+  <p>Airbnb 用 ML 估计房源未来 365 天 booking 数，形成 baseline LTV；再用 incrementality modeling 扣除 cannibalized value，估计某个房源真正带来的增量价值；最后估计 marketing-induced incremental LTV 来衡量运营/营销干预的贡献。</p>
+  <p>技术关键点包括：使用丰富 listing/host 特征；应对 365 天标签延迟；COVID 期间缩短训练窗口、加入细粒度地理信息和人工提供的外部因素；采用 LightGBM 处理高基数地理特征；每天根据实际 accrued bookings、更新特征和相似房源价值到达模式修正 LTV。</p>
+
+  <h3>7.2 预测系统与结构性冲击</h3>
+  <p>Airbnb 的数据博客展示了更偏统计 ML 的预测能力。COVID 使 booking date 和 trip date 之间的 lead-time composition 发生结构性变化。Airbnb 将预测拆成两部分：booking-date axis 上的 gross metrics，以及 lead-time composition。后者是比例向量，必须非负且和为 1，因此开发 B-DARMA（Bayesian Dirichlet Auto-Regressive Moving Average）来建模 compositional time series。</p>
+  <p>当历史失效时，Airbnb 还使用 hierarchical Bayesian prior propagation：如果一个地理 corridor 先经历恢复/冲击，其 posterior 可以作为结构相似、稍后经历变化的 corridor 的 informative prior。这种“从地理借历史”的方法适用于疫情、政策 rollout、支付功能上线、监管变化等顺序发生的市场变化。</p>
+
+  <h2>八、类别 5：LLM 提升工程效率</h2>
+  <h3>8.1 大规模测试迁移</h3>
+  <p>Airbnb 用 LLM 在 6 周内迁移近 3,500 个 Enzyme test files 到 React Testing Library。关键不是一次性让 LLM 改完整仓库，而是构建自动化迁移流水线：</p>
+  <ol>
+    <li>按文件拆分任务，使用 state machine 管理步骤。</li>
+    <li>每步先跑验证，失败才调用 LLM 修复。</li>
+    <li>把 Jest、lint、tsc 错误回填给 LLM，形成 retry loop。</li>
+    <li>复杂文件提供 40k-100k tokens 上下文，包括组件源码、相关测试、同目录模式和 few-shot 示例。</li>
+    <li>用 “sample, tune, sweep” 处理长尾错误，从 75% 自动成功率提升到 97%。</li>
+  </ol>
+  <p>这说明 Airbnb 对 LLM coding 的理解是：LLM 负责生成候选修改，传统工程工具负责验证、定位错误、驱动重试和最终兜底。</p>
+
+  <h3>8.2 GraphQL mock 生成</h3>
+  <p>Airbnb 的 <code>@generateMock</code> 将 LLM 嵌入 GraphQL codegen 工具 Niobe。工程师在 query、fragment 或 field 上加 directive，系统收集 GraphQL 子 schema、文档注释、设计图快照、hints、平台信息和合法图片 URL，调用 Gemini 2.5 Pro 生成 mock JSON。随后用 GraphQL schema 验证，若失败则把错误反馈给 LLM 修复。</p>
+  <p>关键点是“上下文 + 约束”：LLM 获得产品和设计上下文，所以 mock 真实；GraphQL schema 和 hash 检查保证类型安全和随 query 演化保持同步。<code>@respondWithMock</code> 还支持客户端在后端未完成时本地响应 mock，甚至只 mock 部分字段。</p>
+
+  <h2>九、类别 6：知识图谱与 AI 基础设施</h2>
+  <p>Airbnb 的 identity graph 是 Trust & Safety 基础层，包含约 70 亿 nodes、110 亿 edges，每天新增约 500 万 edges，支持 4-8 hop 查询。Airbnb 从第三方 SaaS 图数据库迁移到内部 JanusGraph + DynamoDB + OpenSearch，使用 Gremlin 查询，并做事务、并行查询、observability 和 client-side query rewriting 优化。</p>
+  <p>它本身不一定是 LLM，但对 AI 平台很重要：身份解析、关联账号、欺诈检测、库存知识图谱、数据 lineage 等都需要关系推理。未来 AI agent 如果需要安全地理解“用户—房源—预订—支付—消息—风险”的复杂关系，知识图谱基础设施会是重要支撑。</p>
+
+  <h2>十、按“传统 ML / 深度学习 / LLM / AI 系统工程”重新归类</h2>
+  <table>
+    <thead><tr><th>技术范式</th><th>Airbnb 示例</th><th>关键能力</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>传统 ML / 统计模型</td>
+        <td>LightGBM LTV、production function incrementality、B-DARMA、Bayesian prior propagation、A/B/DiD/counterfactual evaluation</td>
+        <td>可解释、稳健、适合业务预测和因果/增量评估。</td>
+      </tr>
+      <tr>
+        <td>深度学习 / 表征学习</td>
+        <td>Two-tower EBR、transformer destination model、DeBERTa classifier、listing embeddings、多模态 listing 表征</td>
+        <td>处理大规模行为、文本、图片、地理和房源特征。</td>
+      </tr>
+      <tr>
+        <td>LLM / 生成式 AI</td>
+        <td>LLM reranking、客服回复生成、Mixtral 摘要、LLM judge、GraphQL mock、代码迁移、ICA 知识表示</td>
+        <td>语言理解、生成、重写、评估、结构化输出和开发者自动化。</td>
+      </tr>
+      <tr>
+        <td>RAG / 知识系统</td>
+        <td>Help article retrieval、customer support RAG、knowledge relevance、missing knowledge、ICA、knowledge graph</td>
+        <td>让 LLM grounded 到企业知识，降低幻觉，支持更新与引用。</td>
+      </tr>
+      <tr>
+        <td>AI 系统工程</td>
+        <td>validation/retry loops、schema-constrained generation、LLM verifier、人类审核、PEFT、Triton/TensorRT-LLM、dynamic config、observability</td>
+        <td>把模型能力变成可上线、可监控、可回滚、可持续改进的产品系统。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>十一、Airbnb 技术关键点的共性总结</h2>
+  <ol>
+    <li><strong>先把任务定义清楚，再选模型：</strong>客服语音被拆成 ASR、intent、retrieval、ranking、paraphrase、routing；搜索被拆成召回、排序、地图展示；LLM 开发工具被拆成生成、验证、修复。</li>
+    <li><strong>专有数据与上下文是核心壁垒：</strong>用户行为序列、房源属性、地理关系、帮助中心知识、客服 case、坐席 edits、身份图关系共同构成 Airbnb AI 的差异化数据。</li>
+    <li><strong>LLM 输出必须被验证：</strong>GraphQL schema validation、Jest/lint/tsc、LLM verifier、人类抽检、citation correctness 都是同一类思想。</li>
+    <li><strong>人类反馈被产品化：</strong>坐席偏好、采纳、编辑、缺失知识不是事后访谈，而是嵌入工作流的数据采集机制。</li>
+    <li><strong>界面形态会改变模型目标：</strong>地图搜索不能使用列表 ranking 的注意力假设；客服摘要也不能照搬全文摘要指标。</li>
+    <li><strong>模型评估必须贴近真实业务：</strong>Airbnb 强调 bookings、uncancelled bookings、agent working time、self-resolution、NPS、coverage、latency，而非只报告离线准确率。</li>
+    <li><strong>隐私治理是 AI 能力边界：</strong>Help 4097 的去识别化、加密、假名化和访问限制，决定了生产数据能否进入 AI flywheel。</li>
+  </ol>
+
+  <h2>十二、资料索引</h2>
+  <table>
+    <thead><tr><th>来源</th><th>链接</th><th>覆盖技术</th></tr></thead>
+    <tbody>
+      <tr><td>Airbnb Help</td><td><a href="https://www.airbnb.co.in/help/article/4097">How we develop and improve AI models</a></td><td>AI 训练数据、去识别化、加密、假名化、访问控制。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/">Listening, Learning, and Helping at Scale</a></td><td>ASR、intent detection、help article retrieval/ranking、paraphrasing。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/">Embedding-Based Retrieval for Airbnb Search</a></td><td>Two-tower embeddings、contrastive learning、ANN/IVF。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/">Improving Search Ranking for Maps</a></td><td>地图 ranking、用户注意力建模、A/B 实验。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/recommending-travel-destinations-to-help-users-explore/">Recommending Travel Destinations</a></td><td>Transformer 行为序列建模、多任务地理目的地推荐。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/how-airbnb-measures-listing-lifetime-value/">How Airbnb Measures Listing Lifetime Value</a></td><td>LightGBM、LTV、incrementality、marketing-induced value。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/data/what-covid-did-to-our-forecasting-models-and-what-we-built-to-handle-the-next-shock/">What COVID did to our forecasting models</a></td><td>B-DARMA、compositional time series、structural break。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/data/when-history-fails-you-borrow-from-geography/">When history fails you, borrow from geography</a></td><td>Hierarchical Bayesian、prior propagation、corridor forecasting。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/ai-ml/accelerating-large-scale-test-migration-with-llms/">Accelerating Large-Scale Test Migration with LLMs</a></td><td>LLM 代码迁移、state machine、retry loops、long-context prompting。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/infrastructure/graphql-data-mocking-at-scale-with-llms-and-generatemock/">GraphQL Data Mocking at Scale with LLMs and @generateMock</a></td><td>LLM mock generation、GraphQL validation、Gemini 2.5 Pro、schema evolution。</td></tr>
+      <tr><td>Tech Blog</td><td><a href="https://airbnb.tech/infrastructure/scaling-airbnbs-identity-graph-with-a-unified-knowledge-graph-infrastructure/">Scaling Airbnb’s identity graph</a></td><td>Knowledge graph、JanusGraph、DynamoDB、OpenSearch、Gremlin。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.06674">Agent-in-the-Loop</a></td><td>客服 LLM 数据飞轮、RAG、坐席反馈、LLM verifier。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.06677">Incremental Summarization</a></td><td>Mixtral 摘要、DeBERTa bullet classifier、agent edits。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.10331">LLM-Friendly Knowledge Representation</a></td><td>ICA 知识表示、客服 LLM/RAG。</td></tr>
+    </tbody>
+  </table>
+
+  <p class="small">本报告生成于 2026-06-17，保存位置：<code>blogs\airbnb_ml_llm_ai_tech_classification_report_zh.html</code>。</p>
+</article>
+</main>
+</body>
+</html>

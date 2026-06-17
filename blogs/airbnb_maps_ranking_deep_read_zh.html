@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Airbnb 地图搜索排序文章解读</title>
+<style>body{margin:0;background:#f6f8fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.72}main{max-width:980px;margin:0 auto;padding:32px 20px 64px}article{background:#fff;border:1px solid #dfe5ef;border-radius:16px;padding:32px;box-shadow:0 8px 28px rgba(17,24,39,.06)}h1{margin-top:0;line-height:1.25}h2{margin-top:2rem;border-bottom:1px solid #e6ebf2;padding-bottom:.35rem}a{color:#0969da}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.95rem}th,td{border:1px solid #d8dee9;padding:8px 10px;vertical-align:top}th{background:#f3f6fa;text-align:left}code{background:#f3f4f6;border-radius:4px;padding:.1rem .3rem}pre{background:#f3f4f6;border-radius:8px;padding:12px 14px;overflow-x:auto}.box{border-left:4px solid #2f6feb;background:#f1f6ff;padding:14px 18px;border-radius:8px}.takeaway{border-left:4px solid #2da44e;background:#f6fff1;padding:14px 18px;border-radius:8px}.small{color:#57606a;font-size:.92rem}</style></head>
+<body><main><article>
+<h1>解读：Improving Search Ranking for Maps</h1>
+<section class="box"><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/">Improving Search Ranking for Maps</a><br><strong>主题：</strong>地图搜索、排序、用户注意力、A/B 测试、booking probability。</section>
+<h2>一句话总结</h2>
+<p class="takeaway">Airbnb 发现列表排序的 rank-decay 注意力假设不适用于地图，于是围绕地图空间中的用户注意力重新设计排序与展示策略，包括限制低价值 pin、设置 mini-pin 层级、以及将高预订概率房源移动到地图注意力中心附近。</p>
+<h2>核心问题</h2>
+<p>列表搜索中，用户注意力通常从第一名开始递减；但地图中房源是空间散点，没有天然第一名。因此单纯按 booking probability 选出房源后铺在地图上，未必能最大化用户发现高质量房源的概率。</p>
+<h2>概念解释：CTR 与 rank-decay 注意力假设</h2>
+<p><strong>CTR</strong> 是 <strong>Click-Through Rate</strong>，中文通常叫点击率，计算方式是 <code>点击次数 / 展示次数</code>。例如某个房源 pin 被展示 1000 次、被点击 50 次，则 CTR 为 5%。在这篇文章里，CTR 用来衡量某个列表排名或地图位置上的房源被用户点击的概率。</p>
+<p><strong>Rank-decay 注意力假设</strong> 指的是：在列表页中，用户注意力会随着排名从上到下递减。第 1 名通常获得最多曝光和点击，第 2 名次之，越靠后的结果越少被看到和点击。这个假设不是 Transformer 里的 attention，而是搜索排序系统对用户浏览行为的建模。</p>
+<pre><code>列表页中的点击/预订机会 ≈ 位置注意力 A(rank) × 房源本身转化概率 P(book | listing, user)
+其中 A(1) &gt; A(2) &gt; A(3) &gt; ... &gt; A(n)</code></pre>
+<p>因此在列表排序中，如果目标是最大化预订，最自然的策略是把 booking probability 最高的房源放到用户注意力最高的位置，也就是按预订概率从高到低排序。</p>
+<table><thead><tr><th>房源</th><th>预订概率</th><th>理想列表位置</th><th>原因</th></tr></thead><tbody>
+<tr><td>A</td><td>8%</td><td>Rank 1</td><td>最高转化概率，应获得最高注意力。</td></tr>
+<tr><td>B</td><td>5%</td><td>Rank 2</td><td>次高转化概率，对应次高曝光。</td></tr>
+<tr><td>C</td><td>2%</td><td>Rank 3</td><td>较低转化概率，放在较低注意力位置。</td></tr>
+</tbody></table>
+<p>这篇文章的关键洞察是：地图页没有天然的 Rank 1、Rank 2、Rank 3。房源以 pin 的形式散布在地图上，用户注意力不再主要由列表排名决定，而会受到 pin 是否展示、pin 样式、屏幕坐标、是否靠近地图中心等因素影响。所以列表页的 rank-decay 假设在地图页失效，排序问题也从“给房源安排列表位置”变成了“决定哪些 pin 展示、用什么视觉层级展示、以及如何设置地图中心”。</p>
+<h2>三种注意力建模</h2>
+<table><thead><tr><th>策略</th><th>假设</th><th>方法</th><th>结果</th></tr></thead><tbody>
+<tr><td>Uniform attention</td><td>展示出的 map pins 近似共享用户有限注意力。</td><td>限制 pin 集合中最高/最低 booking probability 比值。</td><td>带来 Airbnb ranking 历史中较大的 bookings improvement，并提升 5-star trips。</td></tr>
+<tr><td>Tiered attention</td><td>不同视觉样式获得不同点击概率。</td><td>高概率房源显示带价格 oval pins，较低概率房源显示 mini-pins。</td><td>mini-pins CTR 约为普通 pins 的 1/8，适合桌面固定 pin 数量场景。</td></tr>
+<tr><td>Discounted attention</td><td>地图坐标位置影响注意力。</td><td>根据坐标 CTR 选择新地图中心，让高 booking probability 房源更靠近中心。</td><td>A/B 提升 uncancelled bookings 0.27%，map moves 减少 1.5%。</td></tr>
+</tbody></table>
+<h2>关键启发</h2>
+<ol><li>排序目标必须适配 UI 形态：列表、网格、地图不是同一个 ranking problem。</li><li>用户注意力是稀缺资源，展示更多候选不一定更好。</li><li>视觉层级本身就是排序系统的一部分，mini-pin 是把模型分数转化为注意力分配的产品机制。</li></ol>
+<p class="small">保存位置：<code>blogs\airbnb_maps_ranking_deep_read_zh.html</code></p>
+</article></main></body></html>

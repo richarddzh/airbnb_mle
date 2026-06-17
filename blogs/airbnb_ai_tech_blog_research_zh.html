@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airbnb 技术博客与 AI 客服体系深度调研</title>
+  <style>
+    body { margin: 0; background: #f6f8fb; color: #172033; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.72; }
+    main { max-width: 1080px; margin: 0 auto; padding: 32px 20px 64px; }
+    article { background: #fff; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17,24,39,.06); }
+    h1 { margin-top: 0; line-height: 1.25; font-size: 2rem; }
+    h2 { margin-top: 2.2rem; padding-bottom: .35rem; border-bottom: 1px solid #e6ebf2; }
+    h3 { margin-top: 1.4rem; }
+    a { color: #0969da; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .96rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    .meta, .takeaway, .warning { border-left: 4px solid #2f6feb; background: #f1f6ff; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { border-left-color: #2da44e; background: #f6fff1; }
+    .warning { border-left-color: #bf8700; background: #fff8c5; }
+    code { background: #f3f4f6; border-radius: 4px; padding: 0.1rem 0.3rem; }
+    .small { color: #57606a; font-size: .92rem; }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>Airbnb 技术博客与文章深度调研：从 AI 客服到 AI-native 旅行平台</h1>
+
+  <section class="meta">
+    <strong>调研对象：</strong>Airbnb 官方技术博客、Airbnb 学术论文页、Airbnb 帮助中心 AI 隐私说明、TechCrunch 报道，以及可访问的投资者关系材料。<br>
+    <strong>重点问题：</strong>Airbnb 如何把 AI/LLM 用于客服、搜索推荐、内部工程效率和底层基础设施；这些技术如何支撑 CEO 所说的 AI-native Airbnb。<br>
+    <strong>注意：</strong>用户给出的 Fortune 链接抓取结果只返回版权页，未能获取正文，因此本报告不直接采信 Fortune 正文中的任何不可验证细节。
+  </section>
+
+  <h2>一、总览结论</h2>
+  <p class="takeaway">Airbnb 的 AI 战略不是单点“接一个聊天机器人”，而是围绕自身平台数据和产品闭环构建的生产级 AI 系统：客服侧从 chatbot/IVR 发展到 AI agent 与 agent feedback flywheel；搜索侧从深度排序发展到 embedding retrieval、地图 ranking 和多模态 listing 表征；工程侧用 LLM 做代码迁移和 GraphQL mock；基础设施侧则建设知识图谱、数据网格、可观测性和动态配置等平台能力。</p>
+
+  <p>从调研材料看，Airbnb AI 技术路线有三个显著特征：</p>
+  <ol>
+    <li><strong>以专有数据为护城河：</strong>TechCrunch 报道中，Brian Chesky 强调通用聊天机器人没有 Airbnb 的 2 亿 verified identities、5 亿 proprietary reviews，也无法给 host 发消息；这说明 Airbnb 将 AI 的价值定位在“叠加在平台能力之上”，而不是做一个孤立 chatbot。</li>
+    <li><strong>以生产闭环为核心：</strong>客服 AI 不只是回答问题，还会通过坐席采纳、编辑、缺失知识、知识相关性标注持续更新模型和知识库。</li>
+    <li><strong>以工程基础设施落地：</strong>Airbnb 的博客反复强调验证、回滚、schema、低延迟、A/B/DiD 实验、质量门、LLM judge 与人工审核，说明其 AI 工程更偏“可运营系统”而非 demo。</li>
+  </ol>
+
+  <h2>二、时间线：Airbnb AI 客服从试点到规模化</h2>
+  <table>
+    <thead><tr><th>时间/来源</th><th>关键信息</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>早期客服 chatbot 博客</td>
+        <td>2025 年语音支持博客引用了此前的 <em>Task-Oriented Conversational AI in Airbnb Customer Support</em> 和 <em>Using Chatbots to Provide Faster COVID-19 Community Support</em>。</td>
+        <td>Airbnb 的客服 AI 不是 2025/2026 才开始，而是从消息式自动化和 COVID 支持场景逐步扩展。</td>
+      </tr>
+      <tr>
+        <td>2025-05 TechCrunch</td>
+        <td>Airbnb 在美国推出 AI 客服 bot；Chesky 称 50% 美国用户已经在客服中使用 AI bot，并带来 15% 的 live human agent 联系需求下降。</td>
+        <td>AI 客服开始从有限测试进入美国规模化部署，目标是先解决客服而不是先做旅行规划。</td>
+      </tr>
+      <tr>
+        <td>2025 技术博客：Voice Support</td>
+        <td>Airbnb 发布机器学习驱动 IVR：ASR、Contact Reason Detection、Help Article Retrieval/Ranking、Paraphrasing model。</td>
+        <td>客服 AI 覆盖 voice channel，不只限于文本聊天。</td>
+      </tr>
+      <tr>
+        <td>2025 EMNLP 论文</td>
+        <td>发布 Agent-in-the-Loop 和 Incremental Summarization 两篇客服 LLM 论文。</td>
+        <td>从“自动回答”扩展到坐席反馈、知识库更新、摘要、持续训练的数据飞轮。</td>
+      </tr>
+      <tr>
+        <td>2026-02 TechCrunch</td>
+        <td>Airbnb 自研 AI agent 已处理美国和加拿大约三分之一客服问题，并准备全球 rollout；目标一年内让 AI voice/chat 处理超过 30% 总客服 tickets。</td>
+        <td>客服 AI 进入北美大规模运营阶段，并被管理层定义为成本与服务质量的双重杠杆。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>三、客服 AI 技术栈拆解</h2>
+  <h3>3.1 Voice Support：从传统 IVR 到自然语言客服入口</h3>
+  <p>Airbnb 官方技术博客 <a href="https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/">Listening, Learning, and Helping at Scale</a> 描述了其语音支持系统。传统 IVR 依赖固定菜单树，而 Airbnb 让用户用自然语言描述问题，然后由 ML 组件完成转写、意图识别、知识检索、答案推送或人工转接。</p>
+
+  <table>
+    <thead><tr><th>模块</th><th>技术实现</th><th>关键指标/效果</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>ASR</td>
+        <td>从通用预训练 ASR 迁移到适配 noisy phone audio 的模型，并做 Airbnb 领域短语优化。</td>
+        <td>样本评估中 WER 从 33% 降到约 10%。</td>
+      </tr>
+      <tr>
+        <td>Contact Reason Detection</td>
+        <td>基于客服原因 taxonomy 做意图分类，部署在 Issue Detection Service，并行运行模型。</td>
+        <td>平均延迟低于 50ms，适合实时 IVR。</td>
+      </tr>
+      <tr>
+        <td>Help Article Retrieval and Ranking</td>
+        <td>将 Help Article embedding 存入向量数据库；先用 cosine similarity 召回最多 30 篇文章，再用 LLM-based ranking model 重排。</td>
+        <td>召回通常约 60ms；该系统同时支持 IVR、客服 chatbot 和 Help Center search。</td>
+      </tr>
+      <tr>
+        <td>Paraphrasing model</td>
+        <td>UX writer 预先写好标准摘要，线上用 embedding nearest-neighbor 匹配到合适 paraphrase。</td>
+        <td>人工评估端到端 precision 超过 90%；实验中提高用户对文章内容的 engagement 和 self-resolution。</td>
+      </tr>
+      <tr>
+        <td>Escalation</td>
+        <td>如果用户明确要求人工，或问题需要人工干预，就带着上下文转接到合适团队。</td>
+        <td>体现了“自动化优先，但不阻断人工”的客服体验原则。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 AI Agent：从 help article 到问题解决</h3>
+  <p>TechCrunch 2026 报道称 Airbnb 自研 AI agent 已处理北美约三分之一客服问题。报道还提到 Airbnb 正计划全球扩展到所有有人类客服支持的语言，并将覆盖 voice 和 chat。与早期 IVR/Help Article Retrieval 相比，AI agent 更接近“端到端客服问题处理”：不只是推荐文章，而是在 Airbnb 自有上下文、政策、身份、评论、host messaging 和支付/保障体系上完成更复杂的判断与操作。</p>
+
+  <p>这也解释了 Chesky 对通用 AI 平台威胁的回应：Airbnb 的核心不是一个聊天窗口，而是双边市场的完整产品系统，包括 guest app、host app、客服、保险/保障、身份验证和支付网络。AI 更像是把这些平台能力重新编排为自然语言入口。</p>
+
+  <h3>3.3 Agent-in-the-Loop 数据飞轮</h3>
+  <p>Airbnb 2025 EMNLP 论文 <a href="https://arxiv.org/abs/2510.06674">Agent-in-the-Loop: A Data Flywheel for Continuous Improvement in LLM-based Customer Support</a> 解释了客服 LLM 如何持续改进。系统将坐席真实工作中的四类反馈写入训练闭环：</p>
+  <ol>
+    <li>候选回复的 pairwise preference。</li>
+    <li>坐席是否采纳模型建议以及采纳/拒绝理由。</li>
+    <li>知识资源是否与当前 case 相关。</li>
+    <li>当前知识库缺少哪些解决问题所需信息。</li>
+  </ol>
+  <p>论文报告的生产试点包括 40 名美国客服坐席、超过 5,000 个 customer support cases。相比离线标注，AITL 将模型更新周期从数月缩短到按周，并提升检索 Recall@75、Precision@8、生成 helpfulness、citation correctness 和 agent adoption。</p>
+
+  <h3>3.4 增量摘要：让 AI 帮坐席“边聊边记”</h3>
+  <p>另一篇 EMNLP 论文 <a href="https://arxiv.org/abs/2510.06677">Incremental Summarization for Customer Support via Progressive Note-Taking and Agent Feedback</a> 关注客服坐席的 note-taking。系统用微调后的 Mixtral-8x7B 持续生成新 bullet notes，并用 DeBERTa classifier 过滤琐碎/冗余内容。坐席 edits 会立即进入当前 case 的后续 prompt，也会离线形成 before/after preference data 用于 ORPO/SFT 等训练。</p>
+  <p>论文报告的线上 DiD 准实验显示：整体 agent working time 降低 3%，复杂 case 最高降低 9%；英语/法语/西语坐席满意或非常满意比例分别为 95.2%、81.8%、89.4%；Customer NPS 保持中性。这说明客服 AI 的价值不只是自动替代人工，也包括增强人工处理复杂 case 的效率。</p>
+
+  <h3>3.5 LLM-Friendly Knowledge Representation：把业务知识改写成 LLM 更容易用的格式</h3>
+  <p>Airbnb 2025 年度研究回顾提到 COLING 论文 <a href="https://arxiv.org/abs/2510.10331">LLM-Friendly Knowledge Representation for Customer Support</a>。该论文提出 ICA（Intent, Context, Action）格式，用于把客服业务知识结构化为更适合 LLM QA 和客服工作流使用的表示。结合 AITL 中的 missing knowledge 与 knowledge relevance 标注，可以看出 Airbnb 的客服 AI 重点不只是模型，而是“知识如何组织、检索、引用和持续更新”。</p>
+
+  <h2>四、隐私与数据治理</h2>
+  <p>Airbnb 帮助中心文章 <a href="https://www.airbnb.co.in/help/article/4097">How we develop and improve AI models</a> 说明：Airbnb 可能使用个人信息开发和改进 AI 模型，但会采取隐私保护措施，包括在训练前去识别化、移除姓名和其他识别信息、数据加密、pseudonymization，以及限制只有少数受严格保密义务约束的授权人员可访问。</p>
+  <p>这与客服 AI 的技术路线高度相关：客服场景天然包含身份、预订、支付、退款、纠纷、消息和政策信息。要把这些数据用于模型训练和持续学习，必须建立去识别化、访问控制、日志审计和训练数据质量门。否则，生产数据飞轮会带来隐私与合规风险。</p>
+
+  <h2>五、搜索、推荐与 AI-native App</h2>
+  <p>TechCrunch 2026 报道称 Airbnb 正在实验 AI-powered search，流量占比仍然很小，并计划让搜索更 conversational。Chesky 还描述未来 app 不只是“帮你搜索”，而是“knows you”：帮助 guest 规划完整旅程，帮助 host 经营业务，并提升公司规模化运营效率。</p>
+
+  <h3>5.1 Embedding-Based Retrieval for Search</h3>
+  <p>官方技术博客 <a href="https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/">Embedding-Based Retrieval for Airbnb Search</a> 描述了 Airbnb 第一套 EBR 搜索召回系统。核心是 two-tower model：listing tower 离线每天计算房源 embedding，query tower 在线计算搜索 query embedding。训练数据通过用户 trip journey 构建 positive/negative pairs：最终预订房源为 positive，曝光、点击、wishlist 但未预订的房源为 hard negatives。</p>
+  <p>在线 serving 上，Airbnb 比较了 HNSW 与 IVF，最终选择 IVF，因为 Airbnb 房源价格和可订状态更新频繁，HNSW 内存增长和过滤条件下延迟表现较差；IVF 更容易与现有 search index/filter 集成。上线到 Search 和 Email Marketing 后，A/B 测试带来 statistically significant bookings gain，提升幅度可与过去两年最大级别的 search ranking ML 改进相当。</p>
+
+  <h3>5.2 地图搜索排名</h3>
+  <p><a href="https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/">Improving Search Ranking for Maps</a> 指出，列表 ranking 中“用户注意力随 rank 衰减”的假设不适用于地图。Airbnb 依次尝试了 uniform user attention、tiered user attention、discounted user attention 三类建模：限制展示 pins 的 booking probability 差距、把低概率房源显示成 mini-pins、以及重定位地图中心使高 booking probability 房源更靠近用户注意力中心。在线实验中，重定位算法提升 uncancelled bookings 0.27%，并减少 1.5% map moves。</p>
+
+  <h3>5.3 研究版图：搜索、ranking、推荐、多模态</h3>
+  <p>Airbnb 2025 年度研究回顾显示，其 CIKM/KDD 工作覆盖 search ranking、interleaving/counterfactual evaluation、maps ranking、comparison shopping、listing multimodal alignment、guest search result augmentation 等。特别是 BiListing 使用大语言模型与图文模型将 listing 文本和图片转为统一 embedding，并报告 NDCB gain 与数千万美元级增量收入。这些工作为“AI-native app”提供搜索与个性化底座。</p>
+
+  <h2>六、LLM 在内部工程效率中的使用</h2>
+  <h3>6.1 大规模测试迁移</h3>
+  <p><a href="https://airbnb.tech/ai-ml/accelerating-large-scale-test-migration-with-llms/">Accelerating Large-Scale Test Migration with LLMs</a> 介绍了 Airbnb 如何在 6 周内把近 3,500 个 Enzyme React component tests 迁移到 React Testing Library。手工估计需要 1.5 年工程时间，而 LLM + 自动化 pipeline 显著缩短周期。</p>
+  <p>关键工程经验包括：把迁移拆成 per-file state machine；每一步先 validation，失败再让 LLM 修复；用 retry loop 和动态 prompt 输入 validation errors；为复杂文件提供 40k-100k token 上下文，最多包含 50 个相关文件、few-shot 示例、同目录测试风格。第一次 bulk run 4 小时迁移 75%，经过 “sample, tune, sweep” 四天提升到 97%，剩余 3% 手工收尾。</p>
+
+  <h3>6.2 GraphQL mock 生成</h3>
+  <p><a href="https://airbnb.tech/infrastructure/graphql-data-mocking-at-scale-with-llms-and-generatemock/">GraphQL Data Mocking at Scale with LLMs and @generateMock</a> 展示了 Airbnb 如何把 LLM 集成到 GraphQL 工具链 Niobe。工程师在 GraphQL query/fragment/field 上加 <code>@generateMock</code>，Niobe 会收集 query 子集、schema 文档、设计图快照、hints、平台信息和合法图片 URL，调用 Gemini 2.5 Pro 生成 JSON mock，并用 GraphQL schema 验证。若出现 enum 幻觉或 required field 缺失，错误会反馈给 LLM 自修复。</p>
+  <p>该系统还提供 <code>@respondWithMock</code>，允许客户端在后端未实现时使用本地 mock，甚至只 mock 某些字段，与真实 server response 拼接。Niobe 会在 mock JSON 中写入 query hash 和 directive argument hash，保证 schema/query 演化后 mock 不会静默过期。博客称过去数月 Airbnb 工程师已生成并合并超过 700 个 mocks。</p>
+
+  <h2>七、底层平台：知识图谱、数据与可观测性</h2>
+  <p>Airbnb 的 AI 系统依赖强平台能力，而不仅是模型 API。官方博客 <a href="https://airbnb.tech/infrastructure/scaling-airbnbs-identity-graph-with-a-unified-knowledge-graph-infrastructure/">Scaling Airbnb’s identity graph with a unified knowledge graph infrastructure</a> 描述了 identity graph 从关系型数据库/KV、第三方 SaaS 图数据库迁移到内部 JanusGraph + DynamoDB + OpenSearch 的统一知识图谱平台。</p>
+  <p>身份图包含约 70 亿 nodes 和 110 亿 edges，每天新增约 500 万 edges，读查询多为 4-8 hops，服务 Trust & Safety 等关键场景。迁移后，通过自定义 transaction、parallel query execution、distributed tracing、client-side Gremlin query rewriting 等方式降低长尾延迟。博客报告新内部方案在各类 graph query pattern 上均优于第三方 vendor，end-to-end read API P95/P99 大幅下降，write QPS 在压测中可扩展到旧方案 10 倍。</p>
+
+  <h2>八、Airbnb AI 方法论总结</h2>
+  <table>
+    <thead><tr><th>方法论</th><th>在 Airbnb 的体现</th><th>可复用启发</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>AI 叠加在产品闭环上</td>
+        <td>客服 AI 依赖身份、预订、host messaging、评论、Help Center、政策和人工转接。</td>
+        <td>企业 AI 的壁垒通常来自业务系统与数据闭环，而不是单个模型。</td>
+      </tr>
+      <tr>
+        <td>检索 + 排序 + 生成分层</td>
+        <td>Voice support 中 vector retrieval 召回 help articles，LLM reranker 排序；搜索中 EBR 先召回，再由重模型排序。</td>
+        <td>低延迟场景应把召回、重排、生成拆开优化，而不是端到端硬塞给 LLM。</td>
+      </tr>
+      <tr>
+        <td>人类反馈不是泛泛点赞</td>
+        <td>AITL 拆出 preference、adoption、knowledge relevance、missing knowledge；摘要系统记录 before/after edits。</td>
+        <td>高价值反馈应结构化，并对应到具体模型模块。</td>
+      </tr>
+      <tr>
+        <td>LLM 必须被验证器包住</td>
+        <td>GraphQL mock 用 schema 验证和 retry 自修复；AITL 用 LLM verifier + sampled human review 过滤数据。</td>
+        <td>生产 LLM 系统要把 validation、retry、rollback、schema 和人工抽检作为一等公民。</td>
+      </tr>
+      <tr>
+        <td>从辅助人工到替代部分流程</td>
+        <td>增量摘要提升坐席效率；AI agent 处理约三分之一北美客服问题。</td>
+        <td>AI 落地路径可先增强人工，再逐步自动化高确定性任务。</td>
+      </tr>
+      <tr>
+        <td>评估要贴近业务</td>
+        <td>客服看 self-resolution、agent working time、NPS；搜索看 bookings、uncancelled bookings、map moves；工程效率看迁移成功率和覆盖率。</td>
+        <td>不要只看离线语义指标，应设计能反映业务价值和用户体验的 online metrics。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>九、风险与未解问题</h2>
+  <ol>
+    <li><strong>客服质量的边界：</strong>TechCrunch 报道“三分之一客服问题由 AI 处理”，但不同问题类型复杂度差异很大。需要进一步区分退款、取消、纠纷、安全、host/guest 双边冲突等 case 的自动化率。</li>
+    <li><strong>隐私与训练数据治理：</strong>帮助中心说明了去识别化、加密和访问限制，但未公开训练数据保留期限、用户 opt-out 粒度、不同地区监管差异等细节。</li>
+    <li><strong>LLM judge 偏差：</strong>客服论文多处使用 LLM judge/virtual judge，虽然有人工相关性验证，但长期运行仍可能出现模型偏差、prompt 漂移或对某些语言/文化场景不敏感。</li>
+    <li><strong>坐席反馈选择偏差：</strong>哪些坐席参与标注、哪些 case 被标注、AI 展示哪些候选回复，都会影响数据飞轮的训练分布。</li>
+    <li><strong>AI-native search 的商业化：</strong>TechCrunch 报道提到未来 search 可能集成 sponsored listings。对 conversational search 来说，广告/赞助排序如何保持透明、公平与用户信任，是重要问题。</li>
+    <li><strong>外部报道可验证性：</strong>Fortune 链接未能抓取正文；部分二手报道中的成本、满意度、处理时间等数字需要官方材料或原文进一步核验。</li>
+  </ol>
+
+  <h2>十、资料索引</h2>
+  <table>
+    <thead><tr><th>类别</th><th>链接</th><th>本报告使用方式</th></tr></thead>
+    <tbody>
+      <tr><td>外部报道</td><td><a href="https://techcrunch.com/2026/02/13/airbnb-says-a-third-of-its-customer-support-is-now-handled-by-ai-in-the-u-s-and-canada/">TechCrunch: one third customer support handled by AI</a></td><td>用于 2026 北美客服 AI 规模、全球 rollout、AI-native app、专有数据护城河、工程师 AI 工具采用等信息。</td></tr>
+      <tr><td>外部报道</td><td><a href="https://techcrunch.com/2025/05/02/airbnb-is-quietly-rolling-out-an-ai-customer-service-bot-in-the-us/">TechCrunch: AI customer service bot rollout in US</a></td><td>用于 2025 美国 AI bot rollout 与 15% 人工联系需求下降。</td></tr>
+      <tr><td>隐私说明</td><td><a href="https://www.airbnb.co.in/help/article/4097">Airbnb Help: How we develop and improve AI models</a></td><td>用于 AI 训练数据隐私保护措施。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/blog/">Airbnb Tech Blog</a></td><td>用于总体技术博客目录与主题分布。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/">Listening, Learning, and Helping at Scale</a></td><td>用于 voice support IVR、ASR、intent detection、retrieval/ranking、paraphrasing。</td></tr>
+      <tr><td>官方论文页</td><td><a href="https://airbnb.tech/research/academic-papers/">Academic Papers</a></td><td>用于 Airbnb 2025/2026 论文版图和客服 AI 论文列表。</td></tr>
+      <tr><td>官方研究回顾</td><td><a href="https://airbnb.tech/infrastructure/academic-publications-airbnb-tech-2025-year-in-review/">Academic Publications & Airbnb Tech: 2025 Year in Review</a></td><td>用于 KDD/CIKM/EMNLP/COLING 研究主题与论文摘要。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.06674">Agent-in-the-Loop</a></td><td>用于客服 LLM 数据飞轮与生产试点。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.06677">Incremental Summarization</a></td><td>用于 progressive note-taking、agent edits、在线业务指标。</td></tr>
+      <tr><td>论文</td><td><a href="https://arxiv.org/abs/2510.10331">LLM-Friendly Knowledge Representation</a></td><td>用于 ICA 知识表示方向。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/">Embedding-Based Retrieval for Airbnb Search</a></td><td>用于 EBR 搜索召回、two-tower、ANN/IVF 选择。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/ai-ml/improving-search-ranking-for-maps/">Improving Search Ranking for Maps</a></td><td>用于地图 ranking 用户注意力建模。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/ai-ml/accelerating-large-scale-test-migration-with-llms/">Accelerating Large-Scale Test Migration with LLMs</a></td><td>用于 LLM 驱动测试迁移工程实践。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/infrastructure/graphql-data-mocking-at-scale-with-llms-and-generatemock/">GraphQL Data Mocking at Scale with LLMs and @generateMock</a></td><td>用于 GraphQL mock、schema validation、LLM self-healing。</td></tr>
+      <tr><td>官方技术博客</td><td><a href="https://airbnb.tech/infrastructure/scaling-airbnbs-identity-graph-with-a-unified-knowledge-graph-infrastructure/">Scaling Airbnb’s identity graph</a></td><td>用于知识图谱基础设施、身份图规模、JanusGraph + DynamoDB。</td></tr>
+      <tr><td>投资者关系</td><td><a href="https://investors.airbnb.com/press-releases/news-details/2026/Airbnb-Announces-Fourth-Quarter-and-Full-Year-2025-Results/default.aspx">Airbnb Q4 2025 results press release</a></td><td>仅用于确认官方发布 Q4/FY2025 财报入口；该页面未包含详细 AI 论述。</td></tr>
+      <tr><td>未采信</td><td><a href="https://fortune.com/2026/03/09/how-ai-has-transformed-customer-service-at-airbnb/">Fortune: How AI has transformed customer service at Airbnb</a></td><td>抓取只返回版权页，未用于事实依据。</td></tr>
+    </tbody>
+  </table>
+
+  <p class="small">生成时间：2026-06-17。本报告放置于 <code>blogs</code> 子目录，供本地浏览和后续扩展。</p>
+</article>
+</main>
+</body>
+</html>

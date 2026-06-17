@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Airbnb 语音客服 AI 解读</title>
+<style>body{margin:0;background:#f6f8fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.72}main{max-width:980px;margin:0 auto;padding:32px 20px 64px}article{background:#fff;border:1px solid #dfe5ef;border-radius:16px;padding:32px;box-shadow:0 8px 28px rgba(17,24,39,.06)}h1{margin-top:0;line-height:1.25}h2{margin-top:2rem;border-bottom:1px solid #e6ebf2;padding-bottom:.35rem}a{color:#0969da}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.95rem}th,td{border:1px solid #d8dee9;padding:8px 10px;vertical-align:top}th{background:#f3f6fa;text-align:left}.box{border-left:4px solid #2f6feb;background:#f1f6ff;padding:14px 18px;border-radius:8px}.takeaway{border-left:4px solid #2da44e;background:#f6fff1;padding:14px 18px;border-radius:8px}.small{color:#57606a;font-size:.92rem}</style></head>
+<body><main><article>
+<h1>解读：Listening, Learning, and Helping at Scale</h1>
+<section class="box"><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/listening-learning-and-helping-at-scale-how-machine-learning-transforms-airbnbs-voice-support-experience/">Listening, Learning, and Helping at Scale</a><br><strong>主题：</strong>语音客服、IVR、ASR、意图识别、Help Article 检索、LLM 重排。</section>
+<h2>一句话总结</h2>
+<p class="takeaway">Airbnb 用 ML 改造传统 IVR：用户自然语言说出问题，系统通过领域 ASR、意图检测、帮助文章检索与 LLM 重排完成自助解决或带上下文转人工。</p>
+<h2>系统链路</h2>
+<ol><li>用户来电后，IVR 让用户用几句话描述问题。</li><li>Airbnb-specific ASR 转写语音。</li><li>Contact Reason Detection 分类退款、取消、账号等问题。</li><li>Help Article Retrieval and Ranking 召回并重排相关帮助文章。</li><li>Paraphrasing model 解释系统理解到的问题，再发送文章链接。</li><li>如需人工或用户要求人工，带上下文转接合适团队。</li></ol>
+<h2>关键技术</h2>
+<table><thead><tr><th>模块</th><th>关键点</th><th>指标</th></tr></thead><tbody>
+<tr><td>ASR</td><td>适配 noisy phone audio，并优化 Airbnb 领域短语。</td><td>WER 从 33% 降至约 10%。</td></tr>
+<tr><td>Contact Reason Detection</td><td>基于客服 taxonomy 分类；Issue Detection Service 并行部署。</td><td>平均延迟低于 50ms。</td></tr>
+<tr><td>Help Article Retrieval</td><td>文章 embedding 入向量库，cosine similarity 召回最多 30 篇。</td><td>召回通常约 60ms。</td></tr>
+<tr><td>LLM Ranking</td><td>LLM-based ranking model 重排召回文章。</td><td>用 Precision@N 持续评估。</td></tr>
+<tr><td>Paraphrasing</td><td>UX writer 预写标准摘要，embedding nearest-neighbor 匹配。</td><td>人工评估 precision 超过 90%。</td></tr>
+</tbody></table>
+<h2>关键启发</h2>
+<ol><li>客服 AI 应优先 grounded 到已审核帮助文章，而不是直接自由生成。</li><li>语音入口的第一瓶颈是领域 ASR 准确率；识别错误会放大到下游意图和检索。</li><li>用户想找人工时要尊重升级意图，这是客服体验的安全阀。</li></ol>
+<p class="small">保存位置：<code>blogs\airbnb_voice_support_ai_deep_read_zh.html</code></p>
+</article></main></body></html>

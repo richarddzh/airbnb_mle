@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Airbnb LLM 测试迁移解读</title>
+<style>body{margin:0;background:#f6f8fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.72}main{max-width:980px;margin:0 auto;padding:32px 20px 64px}article{background:#fff;border:1px solid #dfe5ef;border-radius:16px;padding:32px;box-shadow:0 8px 28px rgba(17,24,39,.06)}h1{margin-top:0;line-height:1.25}h2{margin-top:2rem;border-bottom:1px solid #e6ebf2;padding-bottom:.35rem}a{color:#0969da}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.95rem}th,td{border:1px solid #d8dee9;padding:8px 10px;vertical-align:top}th{background:#f3f6fa;text-align:left}.box{border-left:4px solid #2f6feb;background:#f1f6ff;padding:14px 18px;border-radius:8px}.takeaway{border-left:4px solid #2da44e;background:#f6fff1;padding:14px 18px;border-radius:8px}.small{color:#57606a;font-size:.92rem}</style></head>
+<body><main><article>
+<h1>解读：Accelerating Large-Scale Test Migration with LLMs</h1>
+<section class="box"><strong>原文：</strong><a href="https://airbnb.tech/infrastructure/accelerating-large-scale-test-migration-with-llms/">Accelerating Large-Scale Test Migration with LLMs</a><br><strong>主题：</strong>LLM 代码迁移、Enzyme 到 React Testing Library、自动验证、长上下文。</section>
+<h2>一句话总结</h2>
+<p class="takeaway">Airbnb 将 LLM 放进验证驱动的迁移流水线中，用 state machine、retry loops、动态错误反馈和长上下文提示，在 6 周内完成近 3,500 个测试文件迁移，替代原估 1.5 年手工工作。</p>
+<h2>问题背景</h2>
+<p>Airbnb 自 2020 起新测试转向 React Testing Library，但遗留大量 Enzyme 测试。不能直接删除，因为会损失覆盖率；也不能简单替换 API，因为 Enzyme 与 RTL 的测试理念不同。</p>
+<h2>工程方案</h2>
+<table><thead><tr><th>设计</th><th>做法</th><th>意义</th></tr></thead><tbody>
+<tr><td>State machine</td><td>每个文件依次经过 refactor、fix Jest、fix lint、fix tsc、complete。</td><td>将复杂迁移拆成可验证阶段。</td></tr>
+<tr><td>Validation-first</td><td>每步先跑验证，失败才调用 LLM 修复。</td><td>用确定性工具约束 LLM 输出。</td></tr>
+<tr><td>Retry loops</td><td>把错误和最新文件内容回填给 LLM，最多多轮尝试。</td><td>比一次性 prompt 更可靠。</td></tr>
+<tr><td>Long context</td><td>复杂文件 prompt 40k-100k tokens，含组件源码、相关测试、few-shot 示例。</td><td>让 LLM 学到团队局部模式。</td></tr>
+<tr><td>Sample, tune, sweep</td><td>抽样失败模式，改 prompt/脚本，小样本验证后全量扫。</td><td>系统性处理长尾。</td></tr>
+</tbody></table>
+<h2>结果</h2>
+<p>首次 bulk run 在 4 小时内自动迁移 75%；4 天调优后达到 97%；剩余 3% 人工基于 LLM baseline 修复。最终 6 周完成迁移并保持测试意图和覆盖率。</p>
+<h2>关键启发</h2>
+<ol><li>LLM coding 的核心是“生成 + 验证 + 反馈 + 重试”，不是单轮聊天。</li><li>选择相关上下文比微调提示词措辞更重要。</li><li>自动化迁移应 breadth-first 处理共性错误，最后再人工处理真正长尾。</li></ol>
+<p class="small">保存位置：<code>blogs\airbnb_llm_test_migration_deep_read_zh.html</code></p>
+</article></main></body></html>

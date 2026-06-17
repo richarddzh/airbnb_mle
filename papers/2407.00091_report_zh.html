@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文解读：Learning to Rank for Maps at Airbnb</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.72; margin: 0; color: #172033; background: #f6f8fb; }
+    main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 56px; }
+    article { background: #fff; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17, 24, 39, 0.06); }
+    h1 { line-height: 1.25; margin-top: 0; font-size: 2rem; }
+    h2 { margin-top: 2rem; border-bottom: 1px solid #e6ebf2; padding-bottom: 0.35rem; }
+    h3 { margin-top: 1.35rem; }
+    a { color: #0969da; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.95rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    pre { background: #f3f4f6; border-radius: 8px; padding: 12px 14px; overflow-x: auto; }
+    pre code { padding: 0; background: transparent; }
+    .meta, .box { background: #f1f6ff; border-left: 4px solid #2f6feb; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { background: #f6fff1; border-left: 4px solid #2da44e; padding: 14px 18px; border-radius: 8px; }
+    .warn { background: #fff8c5; border-left: 4px solid #bf8700; padding: 14px 18px; border-radius: 8px; }
+    .small { color: #57606a; font-size: 0.92rem; }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>论文解读：Learning to Rank for Maps at Airbnb</h1>
+
+  <section class="meta">
+    <strong>论文信息</strong><br>
+    作者：Malay Haldar, Hongwei Zhang, Kedar Bellare, Sherry Chen, Soumyadip Banerjee, Xiaotang Wang, Mustafa Abdool, Huiji Gao, Pavan Tapadia, Liwei He, Sanjeev Katariya<br>
+    机构：Airbnb, Inc.<br>
+    arXiv：<a href="https://arxiv.org/abs/2407.00091">2407.00091</a>，PDF：<a href="2407.00091.pdf">2407.00091.pdf</a>，提取文本：<a href="2407.00091.extracted.txt">2407.00091.extracted.txt</a><br>
+    相关技术博客：<a href="../blogs/airbnb_maps_ranking_deep_read_zh.html">Improving Search Ranking for Maps 中文解读</a><br>
+    主题：Learning to Rank、地图搜索、用户注意力建模、CTR、NDCG、A/B 测试、双边市场搜索排序
+  </section>
+
+  <h2>一句话概括</h2>
+  <p class="takeaway">这篇论文的核心贡献是证明“列表排序”的 rank-decay 注意力假设在地图界面不成立，并把地图排序问题重构为用户注意力分配问题：先选择哪些房源 pin 应该展示，再用 pin 数量、pin 样式和地图中心位置把用户有限注意力导向更可能被预订的房源。</p>
+
+  <h2>业务背景与规模</h2>
+  <p>Airbnb 搜索同时有两种主要展示界面：列表卡片（list-results）和地图 pin（map-results）。传统排序系统把两者都当作同一个问题处理：按房源的 booking probability 排序，并选择 top listings 展示。但论文指出，地图不是列表，这个基础假设会导致排序目标和评价指标失真。</p>
+  <table>
+    <thead><tr><th>维度</th><th>论文披露信息</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>平台规模</td><td>截至 2024-06-01，Airbnb 有超过 770 万 active listings，覆盖 10 万多个城市和城镇，累计 guest arrivals 超过 15 亿。</td><td>搜索排序必须泛化，不能只记住热门房源；每个房源有唯一地理位置、图片、价格、可订日期和供给约束。</td></tr>
+      <tr><td>搜索来源</td><td>Search box 产生约 20% 搜索，其余大量搜索来自用户移动地图产生的 implicit query。</td><td>地图不是小功能，而是核心搜索入口；地图场景的排序假设错误会影响大规模流量。</td></tr>
+      <tr><td>模型能力</td><td>在 pairwise 判断中，排序模型能 88% 判断哪套房源被预订，而 ranking engineers 约 70%。</td><td>问题不在于模型没有学习能力，而在于同一个模型分数如何映射到不同 UI 的曝光/注意力机制。</td></tr>
+      <tr><td>目标指标</td><td>核心目标是 uncanceled bookings，同时关注 5-star trips、CTR、impressions/clicks to discovery、map moves 等。</td><td>Airbnb 不是只优化点击，而是优化最终可取消过滤后的预订和高质量入住体验。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>基础概念：为什么列表排序有效</h2>
+  <p>传统列表排序依赖一个非常强的界面假设：用户注意力从列表顶部向底部递减。也就是说，rank 1 的结果天然获得最多曝光，rank 2 次之，越靠后越少被看到和点击。</p>
+  <pre><code>P_booking(Q) = Σ P_attention(i) × P_booking(li)
+其中 i 是列表位置，P_attention(1) &gt; P_attention(2) &gt; ... &gt; P_attention(N)</code></pre>
+  <p>在这种情况下，把最高 booking probability 的房源放在最高 attention 的位置，是最大化整体预订概率的自然策略。这也是 NDCG 等列表排序指标成立的基础：位置折损（discount）近似用户注意力衰减。</p>
+
+  <h2>核心发现：Map ≠ List</h2>
+  <p>地图界面中，房源不是从上到下排列的序列，而是散布在二维空间里的 pin。用户并不知道某个 pin 是“第 1 名”还是“第 10 名”，所以列表 rank 本身不再决定注意力。</p>
+  <p>论文用一个在线 A/B 实验验证这个判断：对移动端 map-generated queries，将 top results 随机打乱。若 rank 对地图 pin 重要，随机化会造成明显 booking 损失；但实验显示 treatment 与 control 几乎相同，bookings 没有差异。这说明：</p>
+  <pre><code>对 map-results：
+排序仍然负责从候选房源中选择 top listings
+但一旦这些房源被展示为地图 pins，它们之间的相对排序基本无效</code></pre>
+  <p class="warn">这不是说 ranking model 没用。它仍然用于选择哪些房源进入地图 pin 集合；失效的是“展示后的 pin 还有第 1、2、3 名这种位置注意力差异”的列表假设。</p>
+
+  <h2>第一阶段：Uniform User Attention 与 Less Is More</h2>
+  <p>如果地图上的 top pins 没有列表 rank，那么一个简单近似是：被展示出来的 pins 近似均分用户注意力。</p>
+  <pre><code>P_attention(i) = 1 / N
+P_booking(Q) = (1 / N) × Σ P_booking(li)</code></pre>
+  <p>这导出一个很反直觉但很重要的性质：在 map-results 中，整体 booking probability 与展示 pins 的平均 booking probability 相关。如果展示太多低质量 pin，它们会稀释用户有限注意力，让用户更难发现真正可订、合适的房源。</p>
+  <p>论文称这个原则为 <strong>Less Is More</strong>：在地图上展示更少但更可预订的 pin，可能比展示固定数量的大量 pin 更好。论文也指出不能极端化到只展示 1 个 pin，因为用户需要选择空间；点击分布显示 95% 的用户点击不超过约 12 个不同 map pins，而历史固定展示数量是 18 个。</p>
+
+  <h3>Bookability Filter：怎么决定哪些 pin 展示</h3>
+  <p>Airbnb 的第一版算法不是随机删 pin，而是用 ranking model 输出的 booking probability/logit 做动态过滤。核心思想是：最高分房源必须展示；后续房源只有在 booking probability 与最高分房源差距不大时才展示。</p>
+  <pre><code>保留 listing lk 的条件：
+logit(lmax) - logit(lk) &lt; α
+
+等价于：
+P_booking(lmax) / P_booking(lk) &lt; e^α
+也就是：
+P_booking(lk) &gt; P_booking(lmax) / e^α</code></pre>
+  <table>
+    <thead><tr><th>参数 α</th><th>含义</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td>较小</td><td>只允许与 anchor booking probability 很接近的房源进入地图。</td><td>pins 更少，平均 booking probability 更高，但选择更少。</td></tr>
+      <tr><td>较大</td><td>允许更多低于 anchor 的房源进入地图。</td><td>pins 更多，选择更丰富，但可能稀释注意力。</td></tr>
+      <tr><td>∞</td><td>近似无过滤。</td><td>回到固定展示 18 个 pins 的 baseline。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Uniform attention 的实验结果</h3>
+  <table>
+    <thead><tr><th>实验/指标</th><th>结果</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>离线探索 α=1.0</td><td>map pins 数量 -39%，平均 booking probability +47%，平均总价 -19%，评论数 +14%。</td><td>严格过滤显著提高展示集合质量，也倾向保留更有吸引力/更可订的供给。</td></tr>
+      <tr><td>在线 α=1.0</td><td>uncanceled bookings +1.7%，5-star trips +1.6%，impressions to discovery -14%，clicks to discovery -5.7%。</td><td>用户更快发现最终预订房源，预订和入住质量同步提升。</td></tr>
+      <tr><td>大规模最终实验</td><td>control 和 treatment 各 3400 万 searchers；uncanceled bookings +1.9%，5-star trips +2%，results seen before booked click -16%，clicked results -6.8%。</td><td>这是 Airbnb 搜索排序历史上最大级别的提升之一；收益机制来自减少劣质选择带来的认知负担。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>鲁棒性：anchor booking probability 不能太依赖第一名</h2>
+  <p>Bookability Filter 最初用最高分房源作为 anchor。如果最高分是异常值，过滤会过严，导致地图上可选 pin 过少。论文先尝试 top 3 平均，再认为 median 更稳健，最终相当于用 top 3 的中位数，也就是第二高分房源作为 anchor。</p>
+  <p>在线 A/B 中，在 α=1.0 下，把 anchor 从最高分改为第二高分，使 map pins 数量增加 6%，searchers to listing viewers conversion 提升 0.15%，且其他指标无负面影响。进一步地，论文让 anchor rank 随地图区域内总候选房源数变化：候选越多，越可能出现 outlier，anchor 可以更保守一些；这又增加 2.6% map pins 而不损伤指标。</p>
+
+  <h2>Focus vs. Urgency：提升来自聚焦还是制造紧迫感？</h2>
+  <p>减少 pin 数量可能有两种解释：一种是更聚焦，用户更容易发现高质量房源；另一种是制造紧迫感，让用户以为选择变少而更快预订。论文设计了一个关键实验区分两者：</p>
+  <table>
+    <thead><tr><th>组别</th><th>展示方式</th><th>目的</th></tr></thead>
+    <tbody>
+      <tr><td>Control</td><td>展示 baseline 18 个 map pins。</td><td>原始体验。</td></tr>
+      <tr><td>Treatment 1</td><td>减少到 14 个 pins，并从 baseline 18 个中选择 booking probability 最高的 14 个。</td><td>同时减少数量、提高平均质量。</td></tr>
+      <tr><td>Treatment 2</td><td>同样减少到 14 个 pins，但从 baseline 18 个中随机选择。</td><td>只减少数量，不保证质量。</td></tr>
+    </tbody>
+  </table>
+  <p>如果收益来自紧迫感，Treatment 2 也应该有类似提升；但实验显示 Treatment 2 相比 Control bookings 下降 1.5%，p-value &lt; 10^-6。因此论文认为收益不是来自制造稀缺/紧迫感，而是来自把用户注意力聚焦到更可订的房源上。</p>
+
+  <h2>第二阶段：Tiered User Attention</h2>
+  <p>桌面端有一个特殊约束：左侧列表网格展示 18 个房源，右侧地图必须为这些房源都提供对应 pin，因此不能像移动端那样直接减少 pin 数量。Airbnb 的解决方式是引入两级视觉层级：</p>
+  <table>
+    <thead><tr><th>Pin 类型</th><th>样式</th><th>相对注意力</th><th>分配规则</th></tr></thead>
+    <tbody>
+      <tr><td>Regular pin</td><td>带价格的 oval pin</td><td>1</td><td>booking probability 较高、满足 Bookability Filter 的房源。</td></tr>
+      <tr><td>Mini-pin</td><td>较小、不显示价格的 pin</td><td>约 1/8</td><td>必须在地图中出现、但相对低概率的房源。</td></tr>
+    </tbody>
+  </table>
+  <pre><code>P_attention(i) =
+  1   if li is regular pin
+  1/8 if li is mini-pin
+  0   otherwise</code></pre>
+  <p>在线实验中，treatment 把符合过滤条件的房源显示为 regular pins，其余房源显示为 mini-pins。结果：uncanceled bookings +0.7%，5-star trips +0.5%，average impressions to discovery -21%，average clicks to discovery -1.7%。这说明“视觉样式”本身就是排序系统的一部分：模型分数不仅决定顺序，也能决定 UI 强弱。</p>
+
+  <h2>第三阶段：Discounted User Attention</h2>
+  <p>Uniform attention 假设所有展示 pins 共享注意力；Tiered attention 把注意力离散成 regular/mini 两档；Discounted attention 进一步把用户注意力建模成地图坐标上的连续分布。</p>
+  <p>论文把 map pins 的 CTR 按屏幕坐标画成二维热力图，结论是：用户注意力在地图中心附近最高，并向边缘径向衰减。桌面端因为左侧列表存在，注意力还会受到左侧区域牵引；移动 web 中顶部卡片遮挡导致某些区域不可点击，这个问题也因此被发现并修复。</p>
+
+  <h3>地图中心如何计算：不是简单平均，也不是普通加权平均</h3>
+  <p>对于 search box 发起的查询，系统可以构造新的地图边界，因此论文提出 Algorithm 2：先固定要展示的 listings，再寻找最优地图中心。</p>
+  <pre><code>给定 listing li 的地图坐标：x(li), y(li)
+候选地图中心：x0, y0
+
+P_attention(li) =
+  ctr(x(li) - x0, y(li) - y0) / ctr(0, 0)
+
+Score(center) =
+  Σ P_attention(li) × P_booking(li)
+
+选择：
+center* = argmax_center Score(center)</code></pre>
+  <p>这不是 <code>center = average(lat, lng)</code>，也不是简单的 <code>center = weighted_average(lat, lng, weight=P_booking)</code>。它是基于经验 CTR heatmap 的网格搜索优化：在选中 pins 的 bounding box 内，以步长 ε 枚举候选中心；对每个中心，查每个房源相对中心偏移处的历史 CTR 注意力，再乘以该房源 booking probability 求和；最后选择目标值最大的中心。</p>
+  <table>
+    <thead><tr><th>方法</th><th>是否是论文方法</th><th>问题</th></tr></thead>
+    <tbody>
+      <tr><td>简单平均中心</td><td>否</td><td>只考虑地理分布，不考虑哪些房源更可能被预订，也不考虑用户屏幕注意力。</td></tr>
+      <tr><td>booking probability 加权平均中心</td><td>否</td><td>考虑了房源质量，但默认注意力是对称、线性、平滑的，无法表达真实 CTR 热力图和桌面左侧牵引。</td></tr>
+      <tr><td>CTR heatmap + booking probability 网格搜索</td><td>是</td><td>直接优化“高 booking probability 房源落在高注意力屏幕区域”的目标。</td></tr>
+    </tbody>
+  </table>
+  <p>论文指出，若要同时从 t 个候选中选 k 个 listings 并优化中心，暴力搜索需要评估 <code>C(t, k)</code> 个子集，线上延迟不可接受。因此 Algorithm 2 使用贪心启发式：先按 booking probability 选 top-n pins，再只优化地图中心。其复杂度为 <code>O(k²n)</code>，其中 k 与地图宽度和步长 ε 有关，n 是输出 map pins 数量。</p>
+
+  <h3>Discounted attention 的实验结果</h3>
+  <table>
+    <thead><tr><th>查询类型</th><th>方法</th><th>结果</th><th>解读</th></tr></thead>
+    <tbody>
+      <tr><td>用户移动地图产生的 implicit query</td><td>在 ranking model 中加入 pin 到地图中心距离特征。</td><td>uncanceled bookings +0.27%，map pin CTR +2%。</td><td>地图区域和 pins 位置已固定，此时把 distance-to-center 纳入模型即可学习注意力衰减。</td></tr>
+      <tr><td>Search box 发起的 query</td><td>用 Algorithm 2 在已选 pins 上搜索最优中心。</td><td>新用户 uncanceled bookings +0.39%，p=0.006；map moves -1.5%；遇到极少 listings 区域的概率 -0.8%。</td><td>对新用户尤其有帮助，因为系统把更可订房源放在地图注意力中心附近，减少探索成本。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>统一视角：论文真正优化的是 attention，而不只是 ranking score</h2>
+  <p>论文把三个阶段统一到同一个公式框架：整体 booking 机会由房源本身的 booking probability 和用户注意力分配共同决定。传统 LTR 大多集中优化 <code>P_booking(li)</code>，而这篇论文的创新在于系统性重写地图界面下的 <code>P_attention</code>。</p>
+  <table>
+    <thead><tr><th>注意力模型</th><th>数学形态</th><th>产品机制</th><th>主要收益</th></tr></thead>
+    <tbody>
+      <tr><td>Uniform</td><td>展示 pins 平均共享注意力。</td><td>Bookability Filter 动态减少低质量 pins。</td><td>移动地图搜索的大幅 booking 与 5-star trips 提升。</td></tr>
+      <tr><td>Discrete / Tiered</td><td>regular pin 注意力为 1，mini-pin 约为 1/8。</td><td>桌面端用 regular/mini pins 分配视觉层级。</td><td>在固定 18 个 pins 的约束下继续提升 booking。</td></tr>
+      <tr><td>Continuous / Discounted</td><td>注意力来自相对地图中心坐标上的 CTR heatmap。</td><td>加入 distance-to-center 特征，或重算地图中心。</td><td>带来进一步增量收益，减少 map moves。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>工程启发</h2>
+  <ol>
+    <li><strong>排序问题必须绑定 UI 形态。</strong>同一批候选、同一个模型分数，在列表、地图、网格中的最优展示策略可能完全不同。</li>
+    <li><strong>NDCG 不一定适合所有界面。</strong>NDCG 的位置折损依赖列表 rank-decay，如果界面没有序列 rank，指标可能不再对应用户真实行为。</li>
+    <li><strong>展示更多不总是更好。</strong>在用户注意力有限时，低质量候选会消耗注意力，减少用户发现高质量结果的概率。</li>
+    <li><strong>视觉层级是 ranking system 的一部分。</strong>regular pin、mini-pin、价格是否显示、地图中心位置，都能把模型分数转化为不同程度的用户注意力。</li>
+    <li><strong>实验设计要排除错误解释。</strong>Focus vs. Urgency 实验非常关键，证明收益来自更高质量的展示集合，而不是制造稀缺焦虑。</li>
+    <li><strong>先用简单假设拿到大收益，再逐步精细化。</strong>Uniform attention 带来最大收益，tiered/discounted attention 在产品约束和更细粒度注意力建模下提供增量提升。</li>
+  </ol>
+
+  <h2>局限与未来方向</h2>
+  <table>
+    <thead><tr><th>方向</th><th>论文观点</th><th>进一步解读</th></tr></thead>
+    <tbody>
+      <tr><td>Map-results 的 unbiased LTR</td><td>列表 LTR 已有较多 unbiased learning 研究，地图也需要类似方法。</td><td>地图点击受坐标、缩放、pin 样式和地图中心影响，偏置校正比列表更复杂。</td></tr>
+      <tr><td>更多视觉层级</td><td>Tiered attention 证明两档 pin 有效，未来可继续细分。</td><td>可以探索价格显示、颜色、大小、聚合 pin、hover 状态等更多 attention controls。</td></tr>
+      <tr><td>适合 map 的 loss function</td><td>map 中 top results 的相对顺序不重要，top-k precision 相关 loss 可能优于 pairwise cross-entropy。</td><td>训练目标应更贴近“选出展示集合”而不是“精确排列顺序”。</td></tr>
+      <tr><td>公开基准</td><td>该领域缺乏 public benchmarks，Airbnb 计划创建数据集。</td><td>地图搜索排序仍是研究空白，很多电商、本地生活、旅游和地图产品都有类似问题。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>最终结论</h2>
+  <p>这篇论文的价值不只是提出几个地图排序 trick，而是给出了一个更通用的产品机器学习方法论：不要默认模型分数在所有 UI 中都以同样方式转化为用户行为。列表页的核心是 rank-decay，地图页的核心是 spatial attention。Airbnb 通过在线实验先证明 rank 在地图中无效，再逐步建立 uniform、tiered、discounted 三种注意力模型，把房源选择、视觉样式和地图中心都纳入排序系统，最终获得显著的 booking 与用户体验提升。</p>
+
+  <p class="small">保存位置：<code>papers\2407.00091_report_zh.html</code></p>
+</article>
+</main>
+</body>
+</html>

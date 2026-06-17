@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Airbnb Embedding-Based Retrieval 解读</title>
+<style>body{margin:0;background:#f6f8fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;line-height:1.72}main{max-width:980px;margin:0 auto;padding:32px 20px 64px}article{background:#fff;border:1px solid #dfe5ef;border-radius:16px;padding:32px;box-shadow:0 8px 28px rgba(17,24,39,.06)}h1{margin-top:0;line-height:1.25}h2{margin-top:2rem;border-bottom:1px solid #e6ebf2;padding-bottom:.35rem}a{color:#0969da}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.95rem}th,td{border:1px solid #d8dee9;padding:8px 10px;vertical-align:top}th{background:#f3f6fa;text-align:left}.box{border-left:4px solid #2f6feb;background:#f1f6ff;padding:14px 18px;border-radius:8px}.takeaway{border-left:4px solid #2da44e;background:#f6fff1;padding:14px 18px;border-radius:8px}.small{color:#57606a;font-size:.92rem}</style></head>
+<body><main><article>
+<h1>解读：Embedding-Based Retrieval for Airbnb Search</h1>
+<section class="box"><strong>原文：</strong><a href="https://airbnb.tech/ai-ml/embedding-based-retrieval-for-airbnb-search/">Embedding-Based Retrieval for Airbnb Search</a><br><strong>主题：</strong>搜索召回、Two-tower、Contrastive Learning、ANN、IVF。</section>
+<h2>一句话总结</h2>
+<p class="takeaway">Airbnb 构建首个 embedding-based retrieval 搜索召回系统，用 two-tower 模型把 query 和 listing 映射到向量空间，并选择更适合高频更新与过滤条件的 IVF 方案服务线上检索。</p>
+<h2>业务问题</h2>
+<p>Airbnb 搜索面对数百万房源，大范围地点和 flexible dates 会产生巨大候选集。需要在重排序模型之前快速筛出相关候选，否则在线延迟和计算成本不可控。</p>
+<h2>核心技术</h2>
+<table><thead><tr><th>模块</th><th>做法</th><th>关键原因</th></tr></thead><tbody>
+<tr><td>训练数据</td><td>按 trip 聚合历史 query；最终预订房源为 positive；曝光/点击/wishlist 但未预订为 hard negatives。</td><td>随机负样本太简单，无法学习真实选择边界。</td></tr>
+<tr><td>Contrastive learning</td><td>拉近 query 与 booked listing，推远 query 与 negative listing。</td><td>学习 query-aware 的房源相关性。</td></tr>
+<tr><td>Two-tower</td><td>listing tower 处理房源特征，query tower 处理地点、人数、住宿时长等。</td><td>listing embeddings 可每日离线预计算，线上只算 query tower。</td></tr>
+<tr><td>ANN 选择</td><td>比较 HNSW 和 IVF，最终选择 IVF。</td><td>HNSW recall 略好，但面对高频价格/可订更新和地理 filter 延迟差；IVF 更易集成现有搜索系统。</td></tr>
+<tr><td>相似度函数</td><td>比较 dot product 与 Euclidean distance。</td><td>Euclidean 产生更均衡 cluster size，提升 IVF 判别力。</td></tr>
+</tbody></table>
+<h2>结果</h2>
+<p>EBR 上线 Search 和 Email Marketing 后，A/B 测试带来 statistically significant overall bookings gain，且提升幅度可与 Airbnb 过去两年最大级别搜索 ranking ML 改进相当。</p>
+<h2>关键启发</h2>
+<ol><li>大规模搜索要分层：召回阶段用高效向量检索，后续再用重排序模型。</li><li>生产 ANN 选择不能只看 recall，还要看更新频率、过滤、内存、延迟和架构集成。</li><li>Hard negatives 是检索模型质量的核心，因为它们来自用户真实考虑但未选择的房源。</li></ol>
+<p class="small">保存位置：<code>blogs\airbnb_embedding_retrieval_search_deep_read_zh.html</code></p>
+</article></main></body></html>
