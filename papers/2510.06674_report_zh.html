@@ -37,6 +37,7 @@
 
   <h2>一句话概括</h2>
   <p class="takeaway">这篇论文提出 AITL（Agent-in-the-Loop）框架：把客服坐席在真实服务过程中的选择、采纳、知识相关性判断和缺失知识标注直接转化为训练数据，从而让 RAG 客服系统从“离线批量标注、数月更新”变成“生产反馈驱动、按周持续改进”的数据飞轮。</p>
+  <p><strong>术语澄清：</strong>本文标题中的 <strong>agent</strong> 指的是客服人员/人工坐席（customer support agent），不是 LLM AI agent。LLM 也参与流程，但论文通常称其为 <strong>LLM verifier</strong> 或 <strong>virtual judge</strong>，主要负责一致性检查、质量过滤和辅助评估，而不是标题里 “Agent-in-the-Loop” 的那个 agent。</p>
 
   <h2>研究问题与动机</h2>
   <p>传统客服 LLM/RAG 系统通常依赖离线日志和批量人工标注。问题在于：产品政策、用户偏好、业务流程和知识库都在持续变化，离线数据很快会过期；同时，标注与真实生产场景脱节，会导致偏好漂移、知识遗漏和引用错误。论文认为，客服坐席每天都在做高价值判断：哪个回复更适合、是否真正采用了模型建议、引用的知识是否相关、系统是否缺少某类知识。如果能把这些判断嵌入工作流，就可以形成高质量、低延迟的生产数据反馈闭环。</p>
@@ -65,6 +66,132 @@
     <li><strong>离线评估与上线：</strong>通过 curated evaluation、virtual judge 和人工偏好评估验证，再部署回 RAG 系统。</li>
   </ol>
 
+  <h3>Agent-in-the-Loop 的 “loop” 里哪些步骤使用了 agent</h3>
+  <p>这里的 agent 主要指真实客服坐席，而不是自动化软件代理或 LLM AI agent。更准确地说，它是 <strong>Customer Support Agent-in-the-Loop</strong>：论文的核心设计是让坐席在真实处理客户问题时，顺手把原本隐性的专业判断显式记录下来。LLM/自动化组件也在 loop 中参与，但角色不同：坐席负责产生高价值业务标签，LLM verifier 负责质检和过滤，训练流水线负责把这些标签转成模型更新。</p>
+  <table>
+    <thead><tr><th>Loop 环节</th><th>agent 如何参与</th><th>产生的数据/作用</th></tr></thead>
+    <tbody>
+      <tr><td>客服交互与候选回复展示</td><td>系统基于当前客户问题、历史上下文和知识库生成候选回复与引用知识，坐席在真实服务界面中查看。</td><td>获得真实生产场景下的 query、上下文、候选回复、检索到的知识 chunk 和最终客户回复。</td></tr>
+      <tr><td>Step 1：偏好判断</td><td>坐席比较两个随机打乱顺序的候选回复，判断哪个更好以及偏好强度。</td><td>形成 chosen/rejected 类型的成对偏好数据，用于生成模型偏好优化。</td></tr>
+      <tr><td>Step 2：采纳判断与理由</td><td>坐席记录是否采用模型回复：直接采用、修改后采用或拒绝，并给出自由文本理由。</td><td>形成 adoption 标签和 rationale，用来过滤偏好样本、分析模型失败模式，并提升生成回复的实际可用性。</td></tr>
+      <tr><td>Step 3：知识相关性判断</td><td>坐席判断系统提示中引用的知识资源是否真正支持当前问题。</td><td>形成 relevant/helpful 与 not relevant/not helpful 的正负样本，用于检索器和排序器训练。</td></tr>
+      <tr><td>Step 4：缺失知识识别</td><td>坐席指出解决客户问题时依赖了哪些系统没有检索到、知识库也可能缺失的政策、经验或内部信息。</td><td>形成知识缺口信号，用于补全知识库、改进召回覆盖和适应新政策/新业务流程。</td></tr>
+      <tr><td>审核与过滤</td><td>人工审核者与 LLM verifier 检查坐席标注和真实回复之间是否冲突。</td><td>形成 reliability/agreement 信号，过滤低质量、幻觉或不遵循提示的训练样本。</td></tr>
+      <tr><td>重训、评估、再上线</td><td>更新后的检索、排序和生成模型重新进入客服系统，后续坐席继续在真实服务中产生新反馈。</td><td>把新模型部署回生产，开启下一轮数据采集和训练。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>数据飞轮如何形成：数据从哪里来、训练什么</h3>
+  <p>AITL 的数据来源不是单一离线数据集，而是生产客服工作流本身：客户问题、对话上下文、模型候选回复、模型引用的知识资源、坐席最终发送给客户的回复、坐席标注的偏好/采纳/知识相关性/缺失知识，以及人工与 LLM verifier 的审核结果。这些数据经过聚合、规则过滤和 LLM verifier 过滤后，分别进入 RAG 系统的不同模块。</p>
+  <table>
+    <thead><tr><th>数据来源</th><th>转成什么训练信号</th><th>训练/改进的对象</th></tr></thead>
+    <tbody>
+      <tr><td>Step 1 的成对偏好标注，以及坐席最终回复</td><td>更优回复 vs 较差回复的 preference pair；论文中用于 ORPO 等偏好优化。</td><td>生成模型，使其更倾向输出坐席认为 helpful、相关、可用于真实服务的回复。</td></tr>
+      <tr><td>Step 2 的采纳标签和采纳/拒绝理由</td><td>adopted 样本过滤条件、失败原因和业务可用性信号。</td><td>主要用于过滤生成模型训练数据：只看“偏好更高”可能提升 helpfulness 但损害引用正确性，加入 adopted 过滤后能恢复并提升 citation correctness。</td></tr>
+      <tr><td>Step 3 的知识相关性标注</td><td>知识 chunk 的正负样本：RELEVANT/HELPFUL vs NOT RELEVANT/NOT HELPFUL。</td><td>检索模型和排序模型；检索器用正负样本提升 Recall@75，排序器学习对 query + article chunk 输出相关性分数，提升 Precision@8。</td></tr>
+      <tr><td>Step 4 的缺失知识标注</td><td>知识库缺口、未覆盖政策、未记录最佳实践或新的业务语境。</td><td>知识库补全和检索覆盖改进，让后续 RAG 有更完整的候选知识可检索。</td></tr>
+      <tr><td>人工审核与 LLM verifier 的一致性检查</td><td>agreement/reliability 分数、低质量样本过滤信号。</td><td>训练数据质量门：论文中 LLM 过滤会在检索/排序训练前移除 14.3% 样本，在生成训练前移除 34.5% 样本。</td></tr>
+      <tr><td>历史标注 + 新一轮 AITL 标注</td><td>混合的历史/新鲜训练集，避免只依赖最近样本。</td><td>周期性重训检索、排序、生成模型；论文强调混合历史数据和新数据能提升适应性并降低过拟合。</td></tr>
+    </tbody>
+  </table>
+  <p>因此，飞轮的闭环是：生产系统生成候选回复和知识引用 → 坐席服务客户并留下高质量反馈 → 审核与过滤形成可靠训练集 → 重训检索、排序、生成和知识库 → 新模型上线后服务更多真实 case → 再产生更新、更贴近当前政策和用户偏好的反馈。它的工程价值在于把模型迭代从“离线抽样、数月一轮”缩短到“生产反馈驱动、按周更新”。</p>
+
+  <h3>知识库如何构建，以及如何改进检索和回答</h3>
+  <p>论文介绍的是 RAG 系统使用的<strong>外部统一知识库（Unified Knowledge Base）</strong>，不是 LLM 参数内部的“知识库”。它说明了知识来源、训练信号和模型更新方式，但没有展开到具体工程实现细节，例如 chunking 策略、索引更新机制、metadata schema、CMS 数据模型或向量数据库选型。</p>
+  <table>
+    <thead><tr><th>部分</th><th>论文说明</th><th>没有详细展开的内容</th></tr></thead>
+    <tbody>
+      <tr><td>知识来源</td><td>统一整合 customer guides、FAQ、internal policies、workflows、dynamic context（如 reservation status）和 historical cases。</td><td>各类知识源的同步频率、清洗规则、去重规则和版本管理。</td></tr>
+      <tr><td>知识管理</td><td>资源被放入集中式内容管理系统，并带有详细 metadata，方便坐席实时检索、引用和标注。</td><td>metadata 字段设计、权限控制、内容生命周期和人工审核流程。</td></tr>
+      <tr><td>知识切片与召回</td><td>论文将知识资源称为 article chunks，检索模型把 chunks 编码成向量后召回 top-N。</td><td>chunk 大小、重叠策略、层级结构、标题/正文拼接方式和向量库实现。</td></tr>
+    </tbody>
+  </table>
+  <p>检索改进主要来自坐席对知识资源的相关性和缺失知识标注。Step 3 会把 article chunks 标成 RELEVANT/HELPFUL 或 NOT RELEVANT/NOT HELPFUL；这些标签分别构成检索和排序训练的正负样本。Step 4 则让坐席指出系统没有检索到、但真实解决客户问题需要的政策、经验或业务上下文，用于补全知识库并提升后续召回覆盖。</p>
+  <table>
+    <thead><tr><th>模型/模块</th><th>如何训练或更新</th><th>改进目标</th></tr></thead>
+    <tbody>
+      <tr><td>Retrieval model</td><td>基于 fine-tuned Zeta-Alpha-E5-Mistral 7B embedding model，将 article chunks 编码为 1024 维向量；用户 query 也被编码，再通过 cosine similarity 召回 top-N chunks。训练使用 MultipleNegativesRankingLoss，正样本来自 RELEVANT/HELPFUL chunks，负样本包括 NOT RELEVANT/NOT HELPFUL hard negatives 和同 batch 随机 easy negatives。</td><td>提升 Recall@75，即在前 75 个候选中召回更多真正相关知识。</td></tr>
+      <tr><td>Ranking model</td><td>召回后用内部 fine-tuned FLAN-T5 reranker 精排。训练样本来自坐席知识相关性标注，输入格式为 prompt + user query + article chunk details，目标输出为 relevant 或 not_relevant；推理时用 relevant 概率作为相关性分数。</td><td>提升 Precision@8，即在送入生成模型的有限上下文中保留更高质量知识，避免信息稀释。</td></tr>
+      <tr><td>Knowledge base</td><td>Step 4 的 missing knowledge 标注会暴露知识缺口，如缺失政策、未记录最佳实践或新的运营语境，再回流到知识库补全流程。</td><td>提升知识覆盖面，让后续 RAG 能检索到原本缺失的信息。</td></tr>
+      <tr><td>Generation model</td><td>生成模型使用 8×7B Mistral MoE，先基于人工/坐席标注数据做 SFT，再用 ORPO 对齐坐席偏好。Step 1 产生成对偏好，Step 2 的 adoption 标签用于过滤偏好样本。</td><td>提升 helpfulness、response correctness 和 citation correctness，让回复不仅“看起来更好”，也更符合真实客服使用。</td></tr>
+    </tbody>
+  </table>
+  <p>论文中特别强调：只使用 better/significantly better 的偏好样本会提升 helpfulness，但可能降低 citation correctness；加入坐席 adoption 作为过滤条件后，引用正确性恢复并提升。这说明知识检索、引用和回答质量是联动的：检索器需要找到相关知识，排序器需要把最有用的知识放进有限上下文，生成模型还需要学会基于这些知识生成坐席愿意采纳的回复。</p>
+
+  <h3>RAG 流程：文档如何处理、检索、排序并进入回答</h3>
+  <p>论文中的 RAG 系统可以拆成两条链路：一条是<strong>离线/准实时的知识处理链路</strong>，负责把业务文档变成可检索的 article chunks；另一条是<strong>在线回答链路</strong>，负责在客户咨询到来时检索知识、重排知识、生成回复，并把结果展示给坐席。</p>
+  <table>
+    <thead><tr><th>阶段</th><th>做了什么</th><th>产出</th></tr></thead>
+    <tbody>
+      <tr><td>1. 知识收集</td><td>整合用户指南、FAQ、内部政策、客服 workflow、订单/预订等动态上下文、历史 case。</td><td>统一进入 Unified Knowledge Base 的原始知识资源。</td></tr>
+      <tr><td>2. 内容管理与元数据补充</td><td>资源进入集中式内容管理系统，并附带 metadata，方便后续检索、引用、权限控制和标注。论文没有展开 metadata schema，但强调 metadata 对实时检索和坐席标注很重要。</td><td>带结构和元数据的知识条目。</td></tr>
+      <tr><td>3. 文档切分为 article chunks</td><td>知识条目被处理成可检索的 article chunks。论文没有详细说明 chunk size、overlap、标题拼接或版本策略，只说明后续 retrieval/ranking 都以 article chunk 为基本单位。</td><td>可被向量化和排序的 chunk 集合。</td></tr>
+      <tr><td>4. 向量化与索引</td><td>fine-tuned Zeta-Alpha-E5-Mistral 7B embedding model 将 article chunks 编码成 1024 维向量，进入向量检索索引。</td><td>chunk embedding index。</td></tr>
+      <tr><td>5. 在线 query 编码</td><td>客户问题和必要上下文进入系统后，用户 query 被同一个检索模型编码成向量。</td><td>query embedding。</td></tr>
+      <tr><td>6. 初召回 retrieval</td><td>系统用 cosine similarity 在向量索引中召回 top-N 相关 article chunks。论文用 Recall@75 衡量前 75 个候选中能否覆盖相关知识。</td><td>候选知识 chunks。</td></tr>
+      <tr><td>7. 精排 reranking</td><td>FLAN-T5 reranker 读取 prompt、user query 和 article chunk details，判断 chunk 是否 relevant，并用 P(relevant) 作为排序分数。</td><td>排序后的高质量 chunks；论文用 Precision@8 衡量前 8 个知识片段质量。</td></tr>
+      <tr><td>8. 上下文组装</td><td>系统把排名靠前的 chunks、客户上下文、业务状态等组装进生成模型 prompt。选择 Precision@8 是因为生成模型上下文长度有限，放太多片段会造成信息稀释。</td><td>带知识引用的生成 prompt。</td></tr>
+      <tr><td>9. 生成回复</td><td>8×7B Mistral MoE generation model 基于 prompt 生成候选客服回复，并带有知识引用。</td><td>候选回复、引用知识和可供坐席审阅的结果。</td></tr>
+      <tr><td>10. 坐席使用与反馈</td><td>坐席查看候选回复和引用知识，决定是否采用、如何修改、知识是否相关、是否缺失知识。</td><td>进入 AITL 的 annotation 数据，回流到下一轮 retrieval/ranking/generation 训练。</td></tr>
+    </tbody>
+  </table>
+  <p>因此，文档处理不是简单地“把文档塞给 LLM”。更准确的流程是：业务文档先变成带元数据的知识条目，再被切成 article chunks，embedding 模型负责粗召回，FLAN-T5 reranker 负责精排，生成模型只看到被筛选后的少量高价值知识。AITL 的作用是在坐席真实使用时持续校正这条链路：哪些 chunk 应该被召回、哪些应该排前、哪些知识缺失、哪些生成回复真正可用。</p>
+
+  <h3>Annotation 具体做了什么</h3>
+  <p>AITL 的 annotation 不是单一“打分”，而是把坐席在真实客服工作中的判断拆成四类信号，并额外加入审核与过滤。每类 annotation 都对应 RAG 系统中不同的改进目标。</p>
+  <table>
+    <thead><tr><th>标注步骤</th><th>坐席实际操作</th><th>标注产出</th><th>用于改进什么</th></tr></thead>
+    <tbody>
+      <tr><td>Step 1：Pairwise response preference</td><td>系统展示两个随机打乱顺序的候选回复，坐席比较哪个更适合当前客户问题，并标注偏好强度：significantly better、better 或 slightly better。</td><td>成对偏好数据，例如 chosen response 与 rejected response。</td><td>用于生成模型偏好学习，例如 ORPO，让模型更倾向输出坐席认可的回复。</td></tr>
+      <tr><td>Step 2：Adoption decision and rationale</td><td>坐席记录是否采用模型回复：直接采用、修改后采用或拒绝；同时用自由文本说明采纳或拒绝理由。</td><td>adoption 标签、修改/拒绝理由、模型失败模式。</td><td>用于过滤偏好数据和解释生成质量问题。论文显示只用偏好样本可能损害 citation correctness，加入 adoption 过滤后效果更平衡。</td></tr>
+      <tr><td>Step 3：Knowledge relevance check</td><td>坐席查看 prompt 中引用的知识资源，判断这些 article chunks 是否真正支持当前问题和回复。</td><td>RELEVANT/HELPFUL 与 NOT RELEVANT/NOT HELPFUL 的 chunk 标签。</td><td>用于检索器和排序器训练，构造正负样本，提升 Recall@75 和 Precision@8。</td></tr>
+      <tr><td>Step 4：Missing knowledge identification</td><td>坐席通过 Knowledge Resources Selection Interface 标出解决问题时依赖但系统没有提供的知识，例如缺失政策、未记录经验或特定运营语境。</td><td>缺失知识条目、知识缺口引用、需要补全的业务信息。</td><td>用于知识库补全和检索覆盖改进。论文强调这类信号最依赖真实语境，不适合完全由 LLM 生成。</td></tr>
+      <tr><td>Review annotation</td><td>人工专家和 LLM verifier 检查坐席标注与真实客户交互是否一致，识别偏好不匹配、采纳不一致、知识相关性错误和遗漏缺失知识。</td><td>agreement/reliability 分数、冲突类型、低质量样本标记。</td><td>作为训练数据质量门，过滤不遵循提示、幻觉或与真实交互冲突的样本。</td></tr>
+    </tbody>
+  </table>
+  <p>这套 annotation 的关键在于“绑定真实任务”：坐席不是在脱离上下文的表格里事后判断，而是在处理客户问题时基于完整上下文做判断。Step 1 捕获“哪个回复更好”，Step 2 捕获“实际会不会用”，Step 3 捕获“知识是否支持回答”，Step 4 捕获“系统缺了什么知识”。这四类信号分别进入生成、检索、排序和知识库更新，形成比单纯点赞/点踩更细粒度的数据飞轮。</p>
+
+  <h3>MultipleNegativesRankingLoss 是什么，为什么使用 softmax cross-entropy</h3>
+  <p><strong>MultipleNegativesRankingLoss</strong> 是训练 embedding 检索模型常用的对比学习损失。它的目标是让用户 query 与正确知识 chunk 的向量更接近，同时与同一个 batch 中其他不匹配的 chunks 更远。假设一个 batch 中有四对样本 <code>(q1, d1)</code>、<code>(q2, d2)</code>、<code>(q3, d3)</code>、<code>(q4, d4)</code>，对 <code>q1</code> 来说，<code>d1</code> 是正样本，而 <code>d2</code>、<code>d3</code>、<code>d4</code> 会被自动当作负样本；对其他 query 也同理。因此，一个 batch 可以高效地产生多个负样本，不必为每个 query 单独人工构造大量负例。</p>
+  <p>训练时通常会计算 query 与 batch 内所有文档的相似度矩阵，并让正确配对出现在对角线上：</p>
+  <pre><code>          d1      d2      d3      d4
+q1      高      低      低      低
+q2      低      高      低      低
+q3      低      低      高      低
+q4      低      低      低      高</code></pre>
+  <p>它常写成 softmax cross-entropy 的形式：</p>
+  <pre><code>Loss(qi) = -log exp(sim(qi, di)) / Σj exp(sim(qi, dj))</code></pre>
+  <p>这里 <code>di</code> 是 <code>qi</code> 的正确 chunk，<code>dj</code> 是 batch 中所有候选 chunk，<code>sim</code> 通常是 cosine similarity 或 dot product。这个公式可以直接从 cross entropy 推导出来。给定一个 query <code>qi</code>，batch 中有候选文档 <code>d1, d2, ..., dN</code>，模型先计算相似度 <code>sij = sim(qi, dj)</code>，再用 softmax 把相似度变成“候选文档是正确文档”的概率：</p>
+  <pre><code>P(dj | qi) = exp(sim(qi, dj)) / Σk exp(sim(qi, dk))</code></pre>
+  <p>真实标签是 one-hot：如果正确文档是 <code>di</code>，则 <code>yii = 1</code>，其他 <code>yij = 0</code>。cross entropy 的通用形式为：</p>
+  <pre><code>CE(y, p) = -Σj yij log P(dj | qi)</code></pre>
+  <p>因为只有正确文档那一项的标签为 1，其他项都为 0，所以它会简化为：</p>
+  <pre><code>CE(qi) = -log P(di | qi)</code></pre>
+  <p>再把 softmax 概率代入，就得到：</p>
+  <pre><code>CE(qi) = -log [ exp(sim(qi, di)) / Σj exp(sim(qi, dj)) ]</code></pre>
+  <p>这正是 MultipleNegativesRankingLoss 对单个 query 的形式。因此它不是一个脱离分类损失的新公式，而是“相似度打分 → softmax 变概率 → one-hot cross entropy”在检索任务中的应用。使用 <strong>cross entropy loss</strong> 的原因是：检索训练可以被看成一个多分类问题——给定一个 query，需要从 batch 内多个候选 chunk 中选出正确的那个。cross entropy 会惩罚模型把概率分给错误 chunk，同时鼓励正确 chunk 的概率最大。</p>
+  <p>使用 <strong>softmax</strong> 而不是只做简单的正负 pairwise margin，是因为 softmax 会在同一个归一化分母中比较所有候选文档：如果某个错误 chunk 与 query 很像，它会在分母中形成更强竞争，从而产生更大的梯度；如果错误 chunk 明显不相关，它的影响会较小。这使训练更关注难负样本，也让模型学习“正确 chunk 必须相对所有候选都更相关”，而不仅是比某一个负例高一点。在 AITL 场景中，坐席标成 RELEVANT/HELPFUL 的 chunks 可作为正样本，NOT RELEVANT/NOT HELPFUL 是 hard negatives，同 batch 随机 chunks 是 easy negatives，因此这种损失很适合训练 knowledge retrieval 模型。</p>
+
+  <h3>FLAN-T5 reranker 如何得到 relevant 概率</h3>
+  <p>论文中的 FLAN-T5 reranker 不是直接回归一个连续的 relevance score，而是把排序问题转成文本生成/分类问题。训练时，每个样本的输入是 <code>prompt + user query + article chunk details</code>，目标输出是 <code>&lt;relevant&gt;</code> 或 <code>&lt;not_relevant&gt;</code>。推理时，系统读取模型生成 <code>&lt;relevant&gt;</code> 这个标签的概率，并把它当作该 chunk 的相关性分数，用于对召回结果重排。</p>
+  <table>
+    <thead><tr><th>chunk</th><th>P(relevant)</th><th>排序含义</th></tr></thead>
+    <tbody>
+      <tr><td>chunk A</td><td>0.91</td><td>最可能相关，排在前面</td></tr>
+      <tr><td>chunk B</td><td>0.63</td><td>中等相关</td></tr>
+      <tr><td>chunk C</td><td>0.12</td><td>相关性低，排在后面</td></tr>
+    </tbody>
+  </table>
+  <p>从 LLM 机制上看，T5/FLAN-T5 是 encoder-decoder 模型。encoder 读入 query 和 chunk，decoder 生成标签 token。模型在每个 decoder 位置都会输出一个 vocabulary logits 分布，经过 softmax 后得到下一个 token 的概率。如果标签刚好是一个 token，那么 <code>P(&lt;relevant&gt; | input)</code> 可以直接从该 token 的 softmax 概率读取；如果标签被 tokenizer 切成多个 token，则标签概率通常用整段标签的序列概率表示：</p>
+  <pre><code>P(label | input) = Πt P(label_t | input, label_&lt;t)</code></pre>
+  <p>实际实现中通常使用 log probability 更稳定：</p>
+  <pre><code>score(label) = Σt log P(label_t | input, label_&lt;t)</code></pre>
+  <p>然后比较 <code>&lt;relevant&gt;</code> 和 <code>&lt;not_relevant&gt;</code> 两个候选标签的分数，必要时再做一次二分类 softmax，把它们归一化成概率：</p>
+  <pre><code>P(relevant | input) =
+  exp(score(&lt;relevant&gt;)) /
+  [exp(score(&lt;relevant&gt;)) + exp(score(&lt;not_relevant&gt;))]</code></pre>
+  <p>论文没有说明 <code>&lt;relevant&gt;</code> 是否被加入 tokenizer 作为特殊 token。一般来说，如果没有显式添加特殊 token，<code>&lt;relevant&gt;</code> 只是一个文本标签，会被 tokenizer 切成一个或多个普通 subword token；如果工程实现中把它注册成 added special token，它才会成为单个特殊 token。无论是哪种情况，排序分数的本质都是读取“生成 relevant 标签”的概率或序列 log-likelihood，而不是让模型直接输出一个数值。</p>
+
   <h2>实验设计</h2>
   <p>论文在美国异步消息客服场景中部署试点，涉及 40 名坐席，收集超过 5,000 个客服 case 的标注。基线是原有离线标注流程：生产日志和模拟数据先被离线整理，再通过表格或 Labelbox 标注，整轮模型更新约需三个月。AITL 的目标是比较在线嵌入式标注在标注质量、模型性能和迭代效率上的收益。</p>
 
@@ -84,6 +211,17 @@
       <tr><td>模型更新周期</td><td>约三个月</td><td>按周</td><td>这是论文最重要的工程价值之一。</td></tr>
     </tbody>
   </table>
+
+  <h3>标注一致性（agreement score）是怎么评估的</h3>
+  <p>表中 Step 1~3 的两列数字（如偏好判断的 0.635 与 0.832）是<strong>一致性评分（agreement score）</strong>，衡量“坐席所做的标注”与“坐席给客户的真实回复/真实交互”之间是否一致，<strong>不是模型准确率</strong>。分数越高，代表标注与真实回复的冲突越少，标注质量越高。具体评估方式如下：</p>
+  <ul>
+    <li><strong>标注任务（以 Step 1 偏好判断为例）：</strong>坐席对两个<em>随机打乱顺序</em>的候选回复做成对比较（pairwise），标注偏好程度为 significantly better / better / slightly better，用于生成偏好学习的训练对。</li>
+    <li><strong>Step 1 与 Step 2 的区别：</strong>Step 1 问“两个候选回复哪个更好”，输出相对偏好；Step 2 问“坐席在真实服务中是否采纳了模型回复，以及为什么”，输出实际使用行为。换句话说，偏好判断更像 pairwise ranking，采纳判断更像生产可用性反馈。0.721 是离线流程下采纳判断的一致性分数，高于 Step 1 的 0.635，说明“是否采纳”通常比“哪个候选更好”更容易从日志和行为中判断；但在线 AITL 仍提升到 0.775，因为它更贴近坐席当时的真实操作和理由。</li>
+    <li><strong>一致性检测：</strong>由<strong>人工专家</strong>与<strong>LLM verifier</strong> 两方共同检测标注与真实交互之间的不一致（如偏好不匹配、采纳不一致、知识相关性错误等），两方判断取平均得到 agreement score；人工与 LLM verifier 的判断高度相关（论文 Appendix G）。</li>
+    <li><strong>盲评以减少偏差：</strong>审核者对坐席给出的标签是<strong>盲评（blinded）</strong>的，避免被原标签影响。</li>
+    <li><strong>离线 vs 在线对比：</strong>0.635 来自离线流程（事后用生产日志/电子表格、Labelbox 补标注，整轮模型周期约三个月）；0.832 来自在线 AITL（40 名坐席在真实服务当下顺手标注，覆盖 5,000+ 真实客服 case）。</li>
+    <li><strong>为何在线更高：</strong>离线事后标注存在<strong>偏好漂移（preference drift）</strong>，标注者脱离真实对话语境、回顾判断容易失准；在线标注让坐席在完整的真实语境中即时判断，因此一致性更高。Step 3 知识相关性提升最大（0.436→0.923），Step 4 缺失知识因离线工具限制无法评估，故未列入。</li>
+  </ul>
 
   <h2>消融与工程经验</h2>
   <h3>立即标注 vs 延迟标注</h3>
