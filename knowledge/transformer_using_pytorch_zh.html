@@ -1,0 +1,905 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Transformer using PyTorch：MLE 基础知识分析</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f6f8fb;
+      color: #172033;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.72;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    article {
+      background: #fff;
+      border: 1px solid #dfe5ef;
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 8px 28px rgba(17, 24, 39, .06);
+    }
+    h1 {
+      margin-top: 0;
+      line-height: 1.25;
+      font-size: 2rem;
+    }
+    h2 {
+      margin-top: 2.2rem;
+      padding-bottom: .35rem;
+      border-bottom: 1px solid #e6ebf2;
+    }
+    nav {
+      margin: 1.2rem 0 1.8rem;
+      padding: 16px 18px;
+      background: #f8fafc;
+      border: 1px solid #dfe5ef;
+      border-radius: 12px;
+    }
+    nav strong {
+      display: block;
+      margin-bottom: .5rem;
+    }
+    nav ol {
+      margin: 0;
+      padding-left: 1.4rem;
+      columns: 2;
+    }
+    nav li {
+      break-inside: avoid;
+      margin: .15rem 0;
+    }
+    a { color: #0969da; }
+    code {
+      background: #f3f4f6;
+      border-radius: 4px;
+      padding: 0.1rem 0.3rem;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+    pre {
+      overflow-x: auto;
+      background: #0f172a;
+      color: #e5e7eb;
+      border-radius: 10px;
+      padding: 14px 16px;
+      line-height: 1.55;
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+      color: inherit;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1rem 0;
+      font-size: .95rem;
+    }
+    th, td {
+      border: 1px solid #d8dee9;
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+    th {
+      background: #f3f6fa;
+      text-align: left;
+    }
+    .box {
+      border-left: 4px solid #2f6feb;
+      background: #f1f6ff;
+      padding: 14px 18px;
+      border-radius: 8px;
+    }
+    .takeaway {
+      border-left: 4px solid #2da44e;
+      background: #f6fff1;
+      padding: 14px 18px;
+      border-radius: 8px;
+      font-weight: 600;
+    }
+    .small {
+      color: #57606a;
+      font-size: .92rem;
+    }
+    @media (max-width: 720px) {
+      article { padding: 22px; }
+      nav ol { columns: 1; }
+    }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>Transformer using PyTorch：MLE 基础知识分析</h1>
+
+  <section class="box">
+    <strong>来源：</strong>
+    <a href="https://www.geeksforgeeks.org/deep-learning/transformer-using-pytorch/">GeeksforGeeks - Transformer using PyTorch</a><br>
+    <strong>本文目标：</strong>先分析这篇文章中的 Multi-Head Attention 基础，并重点解释
+    <code>split_heads</code> 里 <code>transpose(1, 2)</code> 的作用，同时补充
+    <code>nn.Linear</code>、<code>K.transpose(-2, -1)</code>、高维 <code>torch.matmul</code>、mask、softmax、<code>contiguous</code>、SwiGLU、SiLU、Pre-LN/Post-LN 和 RMSNorm 的理解。
+  </section>
+
+  <nav aria-label="目录">
+    <strong>目录</strong>
+    <ol>
+      <li><a href="#split-heads-transpose">split_heads 里的 transpose(1, 2)</a></li>
+      <li><a href="#why-transpose">为什么必须这样换维度</a></li>
+      <li><a href="#example">具体例子</a></li>
+      <li><a href="#intuition">直觉理解</a></li>
+      <li><a href="#combine-heads">combine_heads 的关系</a></li>
+      <li><a href="#linear-last-dim">nn.Linear 与最后一维</a></li>
+      <li><a href="#k-transpose">K.transpose(-2, -1)</a></li>
+      <li><a href="#matmul-high-dim">高维 torch.matmul</a></li>
+      <li><a href="#mask-negative">mask 为什么填 -1e9</a></li>
+      <li><a href="#softmax-dim">softmax 的维度和形状</a></li>
+      <li><a href="#contiguous">contiguous 的作用</a></li>
+      <li><a href="#swiglu-ffn">SwiGLU 实现 FFN</a></li>
+      <li><a href="#silu">SiLU 计算公式</a></li>
+      <li><a href="#layernorm-rmsnorm">Pre-LN、Post-LN 与 RMSNorm</a></li>
+      <li><a href="#mle-takeaways">MLE 需要掌握的要点</a></li>
+      <li><a href="#summary">总结</a></li>
+    </ol>
+  </nav>
+
+  <p>这篇文章用 PyTorch 从零搭建了一个基础 Transformer，核心模块包括 Multi-Head Attention、Position-Wise Feed Forward、Positional Encoding、Encoder Layer、Decoder Layer 和 Transformer 主模型。</p>
+
+  <p>对 MLE 来说，这篇文章最值得掌握的基础不是“把代码背下来”，而是理解张量 shape 如何在模型中流动。Transformer 的很多 bug 都不是数学公式错了，而是维度顺序、mask 广播、<code>transpose</code>、<code>view</code>、<code>contiguous</code> 的使用不正确。</p>
+
+  <h2 id="split-heads-transpose">重点问题：<code>split_heads</code> 里的 <code>transpose(1, 2)</code> 是什么作用？</h2>
+
+  <p>文章中的代码如下：</p>
+
+  <pre><code class="language-python">def split_heads(self, x):
+    batch_size, seq_length, d_model = x.size()
+    return x.view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)</code></pre>
+
+  <p>假设输入 <code>x</code> 的 shape 是：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>其中：</p>
+  <ul>
+    <li><code>batch_size</code>：一次输入多少个样本。</li>
+    <li><code>seq_length</code>：序列长度，比如一句话有多少个 token。</li>
+    <li><code>d_model</code>：每个 token 的 embedding 维度。</li>
+  </ul>
+
+  <p>Multi-Head Attention 会把 <code>d_model</code> 拆成多个 head：</p>
+
+  <pre><code>d_model = num_heads * d_k</code></pre>
+
+  <p>所以这一步：</p>
+
+  <pre><code class="language-python">x.view(batch_size, seq_length, self.num_heads, self.d_k)</code></pre>
+
+  <p>会把 shape 从：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>变成：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>也就是：每个 token 的大向量被拆成了 <code>num_heads</code> 个小向量。</p>
+
+  <p>但是这个 shape 还不适合后面计算 attention。Scaled Dot-Product Attention 通常希望每个 head 独立计算注意力，因此更方便的 shape 是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <section class="takeaway">
+    <code>transpose(1, 2)</code> 的作用就是交换第 1 维和第 2 维，把张量从“按 token 组织 head”改成“按 head 组织完整序列”。
+  </section>
+
+  <p>在 PyTorch 中维度编号从 0 开始：</p>
+
+  <pre><code>原始 view 后：
+0: batch_size
+1: seq_length
+2: num_heads
+3: d_k</code></pre>
+
+  <p>执行 <code>transpose(1, 2)</code> 后变成：</p>
+
+  <pre><code>0: batch_size
+1: num_heads
+2: seq_length
+3: d_k</code></pre>
+
+  <p>也就是：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)
+        ↓ transpose(1, 2)
+(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <h2 id="why-transpose">为什么必须这样换维度？</h2>
+
+  <p>因为后面的 attention 计算是：</p>
+
+  <pre><code class="language-python">attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)</code></pre>
+
+  <p>此时如果 <code>Q</code> 和 <code>K</code> 的 shape 是：</p>
+
+  <pre><code>Q: (batch_size, num_heads, seq_length, d_k)
+K: (batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>那么：</p>
+
+  <pre><code class="language-python">K.transpose(-2, -1)</code></pre>
+
+  <p>会把 <code>K</code> 的最后两维交换：</p>
+
+  <pre><code>K:                  (batch_size, num_heads, seq_length, d_k)
+K.transpose(-2,-1): (batch_size, num_heads, d_k, seq_length)</code></pre>
+
+  <p>于是矩阵乘法变成：</p>
+
+  <pre><code>(seq_length, d_k) @ (d_k, seq_length) = (seq_length, seq_length)</code></pre>
+
+  <p>所以 <code>attn_scores</code> 的 shape 是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, seq_length)</code></pre>
+
+  <p>含义是：对每个 batch、每个 head，序列中每个 token 都会对所有 token 计算一个 attention score。</p>
+
+  <p>如果不做 <code>transpose(1, 2)</code>，shape 会停留在：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>这时 PyTorch 会把 <code>seq_length</code> 当成一个批处理维度，把 <code>num_heads</code> 放在矩阵乘法的倒数第二维，语义就错了。你想要的是“每个 head 独立对整条序列做 attention”，而不是“每个位置拿 head 维度去做 attention”。</p>
+
+  <h2 id="example">一个具体例子</h2>
+
+  <p>假设：</p>
+
+  <pre><code>batch_size = 2
+seq_length = 5
+d_model = 512
+num_heads = 8
+d_k = 64</code></pre>
+
+  <p>输入：</p>
+
+  <pre><code>x.shape = (2, 5, 512)</code></pre>
+
+  <p>先拆 head：</p>
+
+  <pre><code class="language-python">x.view(2, 5, 8, 64)</code></pre>
+
+  <p>得到：</p>
+
+  <pre><code>(2, 5, 8, 64)</code></pre>
+
+  <p>含义是：2 个样本，每个样本 5 个 token，每个 token 被拆成 8 个 head，每个 head 64 维。</p>
+
+  <p>再交换维度：</p>
+
+  <pre><code class="language-python">x.transpose(1, 2)</code></pre>
+
+  <p>得到：</p>
+
+  <pre><code>(2, 8, 5, 64)</code></pre>
+
+  <p>含义变成：2 个样本，每个样本 8 个 head，每个 head 都有一条长度为 5 的序列，每个 token 在这个 head 下是 64 维。</p>
+
+  <p>这个形状正好适合并行计算 8 个 attention head。</p>
+
+  <h2 id="intuition">直觉理解</h2>
+
+  <p><code>transpose(1, 2)</code> 的目的不是改变数据本身的数值，而是改变数据的组织方式。</p>
+
+  <pre><code>原来：按 token 看，每个 token 里面有多个 head
+变成：按 head 看，每个 head 里面有完整的 token 序列</code></pre>
+
+  <p>Multi-Head Attention 的目标是让不同 head 从不同表示子空间观察整句话。因此每个 head 都必须拿到完整的序列，而不是只拿到某个 token 的一部分。</p>
+
+  <h2 id="combine-heads">和 <code>combine_heads</code> 的关系</h2>
+
+  <p>文章中还有反向操作：</p>
+
+  <pre><code class="language-python">def combine_heads(self, x):
+    batch_size, _, seq_length, d_k = x.size()
+    return x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)</code></pre>
+
+  <p>attention 计算完成后，<code>x</code> 的 shape 是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>先执行：</p>
+
+  <pre><code class="language-python">x.transpose(1, 2)</code></pre>
+
+  <p>变回：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>再通过：</p>
+
+  <pre><code class="language-python">view(batch_size, seq_length, self.d_model)</code></pre>
+
+  <p>把多个 head 拼回原来的 <code>d_model</code> 维度：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>这里的 <code>.contiguous()</code> 很重要，因为 <code>transpose</code> 通常只改变张量的 stride 视图，不一定让内存连续排列；而 <code>view</code> 要求张量在内存中是连续的。没有 <code>.contiguous()</code> 时，后面的 <code>view</code> 可能报错或行为不符合预期。</p>
+
+  <h2 id="linear-last-dim">补充问题一：<code>nn.Linear</code> 总是在最后一个维度上计算吗？</h2>
+
+  <p>是的。PyTorch 中的 <code>nn.Linear</code> 会作用在输入 tensor 的最后一个维度上，要求最后一维等于 <code>in_features</code>，然后把最后一维变成 <code>out_features</code>。前面的维度都会原样保留，可以理解成 batch-like 维度。</p>
+
+  <p>一般形式是：</p>
+
+  <pre><code>输入:  (*, in_features)
+输出:  (*, out_features)</code></pre>
+
+  <p>其中 <code>*</code> 表示任意数量的前置维度，比如 batch、sequence、head 等。</p>
+
+  <p>例如：</p>
+
+  <pre><code class="language-python">linear = nn.Linear(512, 512)
+x.shape = (batch_size, seq_length, 512)
+y = linear(x)</code></pre>
+
+  <p>输出 shape 是：</p>
+
+  <pre><code>y.shape = (batch_size, seq_length, 512)</code></pre>
+
+  <p>它等价于对每个样本、每个 token 的最后一维向量单独做一次 <code>512 -&gt; 512</code> 的线性投影。</p>
+
+  <p>所以在 Transformer 里：</p>
+
+  <pre><code class="language-python">Q = self.W_q(Q)
+K = self.W_k(K)
+V = self.W_v(V)</code></pre>
+
+  <p>如果输入是：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>那么 <code>nn.Linear(d_model, d_model)</code> 会对每个 token 的 <code>d_model</code> 向量做投影，输出仍然是：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <section class="takeaway">
+    直觉上，<code>nn.Linear</code> 不关心前面有多少维；它只看最后一维是不是自己的 <code>in_features</code>。
+  </section>
+
+  <h2 id="k-transpose">补充问题二：<code>attn_scores</code> 里的 <code>K.transpose(-2, -1)</code> 是什么意思？</h2>
+
+  <p>在这行代码里：</p>
+
+  <pre><code class="language-python">attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)</code></pre>
+
+  <p><code>K.transpose(-2, -1)</code> 的作用是交换 <code>K</code> 的最后两个维度。这里的 <code>-1</code> 表示最后一维，<code>-2</code> 表示倒数第二维。</p>
+
+  <p>假设：</p>
+
+  <pre><code>Q.shape = (batch_size, num_heads, seq_length, d_k)
+K.shape = (batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>那么：</p>
+
+  <pre><code class="language-python">K.transpose(-2, -1)</code></pre>
+
+  <p>会把 <code>K</code> 从：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>变成：</p>
+
+  <pre><code>(batch_size, num_heads, d_k, seq_length)</code></pre>
+
+  <p>这样矩阵乘法就变成了 attention 公式里的 <code>QK^T</code>：</p>
+
+  <pre><code>(seq_length, d_k) @ (d_k, seq_length)
+= (seq_length, seq_length)</code></pre>
+
+  <p>最终得到：</p>
+
+  <pre><code>attn_scores.shape = (batch_size, num_heads, seq_length, seq_length)</code></pre>
+
+  <p>它的含义是：每个 token 的 Query 都会和所有 token 的 Key 做点积，得到“这个 token 应该关注其它每个 token 多少”的分数。</p>
+
+  <p>注意区分两个 <code>transpose</code>：</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>位置</th>
+        <th>代码</th>
+        <th>作用</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>split_heads</code></td>
+        <td><code>transpose(1, 2)</code></td>
+        <td>把 head 维度提前，从而让每个 head 拿到完整序列。</td>
+      </tr>
+      <tr>
+        <td><code>attn_scores</code></td>
+        <td><code>K.transpose(-2, -1)</code></td>
+        <td>把 Key 的最后两维转置，实现矩阵乘法里的 <code>K^T</code>。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="matmul-high-dim">补充问题三：高维 tensor 做 <code>torch.matmul</code> 时，只计算后两维吗？</h2>
+
+  <p>是的。当 <code>torch.matmul</code> 的输入是高维 tensor 时，它会把最后两维当作矩阵维度做乘法，前面的维度当作 batch 维度。</p>
+
+  <p>一般形式是：</p>
+
+  <pre><code>A.shape = (..., m, n)
+B.shape = (..., n, p)
+
+torch.matmul(A, B).shape = (..., m, p)</code></pre>
+
+  <p>其中 <code>...</code> 是前置 batch 维度，并且这些 batch 维度需要相同或可以广播。</p>
+
+  <p>在 Multi-Head Attention 中：</p>
+
+  <pre><code>A.shape = (batch_size, num_heads, seq_length, d_k)
+B.shape = (batch_size, num_heads, d_k, seq_length)</code></pre>
+
+  <p><code>torch.matmul(A, B)</code> 实际做的是：</p>
+
+  <pre><code>(seq_length, d_k) @ (d_k, seq_length)</code></pre>
+
+  <p>前面的：</p>
+
+  <pre><code>(batch_size, num_heads)</code></pre>
+
+  <p>只是 batch 维度，表示对每个 batch、每个 head 都独立做一次矩阵乘法。</p>
+
+  <p>所以输出是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, seq_length)</code></pre>
+
+  <p><code>torch.matmul</code> 的前置 batch 维度还支持 broadcasting。例如：</p>
+
+  <pre><code>A.shape = (2, 8, 5, 64)
+B.shape = (1, 8, 64, 5)</code></pre>
+
+  <p>这里 batch 维度 <code>(2, 8)</code> 和 <code>(1, 8)</code> 可以广播成 <code>(2, 8)</code>，所以它们也可以相乘。</p>
+
+  <h2 id="mask-negative">补充问题四：为什么 <code>masked_fill</code> 不填 0，而是填 <code>-1e9</code>？</h2>
+
+  <p>相关代码是：</p>
+
+  <pre><code class="language-python">if mask is not None:
+    attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+
+attn_probs = torch.softmax(attn_scores, dim=-1)</code></pre>
+
+  <p>关键点是：<code>masked_fill</code> 发生在 <code>softmax</code> 之前。此时 <code>attn_scores</code> 还不是概率，而是 logits，也就是还没有归一化的注意力分数。</p>
+
+  <p><code>softmax</code> 的形式是：</p>
+
+  <pre><code>softmax(x_i) = exp(x_i) / sum(exp(x_j))</code></pre>
+
+  <p>如果把被 mask 的位置填成 <code>0</code>，它仍然会参与 softmax，因为 <code>exp(0) = 1</code>，概率可能并不小。例如：</p>
+
+  <pre><code>scores = [2, 1, 0]
+softmax(scores) ≈ [0.665, 0.245, 0.090]</code></pre>
+
+  <p>如果第三个位置本来应该被 mask，但你填了 <code>0</code>，它仍然拿到了约 9% 的注意力权重。</p>
+
+  <p><code>-1e9</code> 表示：</p>
+
+  <pre><code>-1e9 = -1 * 10^9 = -1000000000</code></pre>
+
+  <p>这是一个极大的负数。因为：</p>
+
+  <pre><code>exp(-1e9) ≈ 0</code></pre>
+
+  <p>所以 softmax 后，被 mask 的位置概率几乎就是 0。</p>
+
+  <section class="takeaway">
+    填 <code>0</code> 只是给它一个普通分数；填 <code>-1e9</code> 等价于告诉 softmax：“这个位置绝对不要看”。
+  </section>
+
+  <p>实际工程中也常见 <code>float("-inf")</code> 或 dtype 对应的最小值。教学代码里常用 <code>-1e9</code>，因为简单、直观，数值上足够接近负无穷。</p>
+
+  <h2 id="softmax-dim">补充问题五：<code>softmax(attn_scores, dim=-1)</code> 在哪个维度上做？结果是什么形状？</h2>
+
+  <p>在 Multi-Head Attention 中，<code>attn_scores</code> 的形状通常是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, seq_length)</code></pre>
+
+  <p>更一般地写是：</p>
+
+  <pre><code>(batch_size, num_heads, query_len, key_len)</code></pre>
+
+  <p>含义是：</p>
+
+  <pre><code>每个 batch
+  每个 head
+    每个 query token
+      对每个 key token 的注意力分数</code></pre>
+
+  <p>这句代码：</p>
+
+  <pre><code class="language-python">attn_probs = torch.softmax(attn_scores, dim=-1)</code></pre>
+
+  <p><code>dim=-1</code> 表示在最后一维上做 softmax，也就是在 <code>key_len</code> 这个维度上归一化。</p>
+
+  <p>换句话说，对每个 query token 来说，它会把“这个 query 对所有 key 的分数”归一化成概率：</p>
+
+  <pre><code>attn_scores[b, h, q, :] -> softmax</code></pre>
+
+  <p>其中：</p>
+
+  <pre><code>attn_scores[b, h, q, :].shape = (key_len,)
+attn_probs[b, h, q, :].shape  = (key_len,)</code></pre>
+
+  <p>并且这一行概率和为 1：</p>
+
+  <pre><code>sum(attn_probs[b, h, q, :]) = 1</code></pre>
+
+  <p>softmax 不改变 tensor 的整体形状，所以结果仍然是：</p>
+
+  <pre><code>attn_probs.shape = (batch_size, num_heads, query_len, key_len)</code></pre>
+
+  <p>在 self-attention 中通常 <code>query_len == key_len == seq_length</code>，所以就是：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, seq_length)</code></pre>
+
+  <section class="takeaway">
+    直觉上：每个 token 作为 query 时，对整句话里所有 token 分配一组注意力权重。
+  </section>
+
+  <h2 id="contiguous">补充问题六：<code>contiguous()</code> 是什么作用？</h2>
+
+  <p>在 <code>combine_heads</code> 中：</p>
+
+  <pre><code class="language-python">def combine_heads(self, x):
+    batch_size, _, seq_length, d_k = x.size()
+    return x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)</code></pre>
+
+  <p><code>contiguous()</code> 的作用是把一个内存不连续的 tensor 重新整理成内存连续的 tensor，这样后面的 <code>view(...)</code> 才能安全工作。</p>
+
+  <p><code>transpose(1, 2)</code> 会把 shape 从：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>变成：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>但是 PyTorch 的 <code>transpose</code> 通常不会真的复制数据并重新排列内存，它只是改变 tensor 的视图和 stride。因此，看起来维度换了，但底层内存排列可能还是原来的顺序。</p>
+
+  <p>而 <code>view(...)</code> 要求 tensor 在内存中是连续排列的，否则它不知道怎么按照新 shape 正确解释内存。所以这里需要：</p>
+
+  <pre><code class="language-python">x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)</code></pre>
+
+  <p>把：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>合并成：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>其中：</p>
+
+  <pre><code>d_model = num_heads * d_k</code></pre>
+
+  <section class="takeaway">
+    <code>transpose</code> 改变维度视图，但可能导致内存不连续；<code>contiguous</code> 重新整理内存；<code>view</code> 依赖连续内存来 reshape。
+  </section>
+
+  <p>现在很多时候也可以写成：</p>
+
+  <pre><code class="language-python">x.transpose(1, 2).reshape(batch_size, seq_length, self.d_model)</code></pre>
+
+  <p>因为 <code>reshape</code> 在需要时会自动复制成连续内存。但教学代码里经常写成 <code>transpose(...).contiguous().view(...)</code>，这样更明确地表达：先换维度，再保证内存连续，再合并 head。</p>
+
+  <h2 id="swiglu-ffn">补充问题七：PyTorch 有没有 SwiGLU？如何用 SwiGLU 实现 FFN？</h2>
+
+  <p>PyTorch 标准库里有 <code>nn.GLU</code>，也有 <code>F.silu</code> / <code>nn.SiLU</code>，但通常没有一个专门叫 <code>nn.SwiGLU</code> 的模块。SwiGLU 一般自己用两个 <code>Linear</code> 加 <code>SiLU</code> 实现。</p>
+
+  <p>经典 Transformer FFN 是：</p>
+
+  <pre><code>FFN(x) = W2(activation(W1(x)))</code></pre>
+
+  <p>SwiGLU FFN 是：</p>
+
+  <pre><code>FFN(x) = W_down(SiLU(W_gate(x)) * W_up(x))</code></pre>
+
+  <p>也就是先做两个并行投影：一个产生 gate，一个产生 value，然后用 <code>SiLU(gate) * value</code> 做逐元素门控。</p>
+
+  <pre><code class="language-python">import torch
+from torch import nn
+import torch.nn.functional as F
+
+class SwiGLUFFN(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.w_gate = nn.Linear(d_model, d_ff)
+        self.w_up = nn.Linear(d_model, d_ff)
+        self.w_down = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))</code></pre>
+
+  <p>如果原来的 FFN 是：</p>
+
+  <pre><code class="language-python">class PositionWiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))</code></pre>
+
+  <p>可以替换成：</p>
+
+  <pre><code class="language-python">class PositionWiseSwiGLUFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_ff)
+        self.up_proj = nn.Linear(d_model, d_ff)
+        self.down_proj = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        x = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        return self.down_proj(x)</code></pre>
+
+  <p>输入如果是：</p>
+
+  <pre><code>(batch_size, seq_length, d_model)</code></pre>
+
+  <p>那么中间 shape 是：</p>
+
+  <pre><code>gate_proj(x): (batch_size, seq_length, d_ff)
+up_proj(x):   (batch_size, seq_length, d_ff)
+相乘后:       (batch_size, seq_length, d_ff)
+down_proj:    (batch_size, seq_length, d_model)</code></pre>
+
+  <p>注意参数量：SwiGLU 有三个 <code>Linear</code>，而普通 FFN 只有两个 <code>Linear</code>。所以很多 LLaMA 类模型会把 SwiGLU 的 hidden dim 调小，比如用 <code>int(2/3 * 4 * d_model)</code>，这样参数量和普通 <code>4 * d_model</code> FFN 接近。</p>
+
+  <h2 id="silu">补充问题八：PyTorch 的 SiLU 计算是什么？</h2>
+
+  <p><code>torch.nn.SiLU</code> / <code>torch.nn.functional.silu</code> 计算的是 Sigmoid Linear Unit，也叫 Swish。</p>
+
+  <p>公式是：</p>
+
+  <pre><code>SiLU(x) = x * sigmoid(x)</code></pre>
+
+  <p>其中：</p>
+
+  <pre><code>sigmoid(x) = 1 / (1 + exp(-x))</code></pre>
+
+  <p>所以：</p>
+
+  <pre><code>SiLU(x) = x / (1 + exp(-x))</code></pre>
+
+  <p>PyTorch 中：</p>
+
+  <pre><code class="language-python">import torch
+import torch.nn.functional as F
+
+y = F.silu(x)</code></pre>
+
+  <p>等价于：</p>
+
+  <pre><code class="language-python">y = x * torch.sigmoid(x)</code></pre>
+
+  <p>它和 ReLU 的区别是：ReLU 对负数直接截断成 0，而 SiLU 对负数是平滑压小，不是硬截断。</p>
+
+  <pre><code>ReLU(x) = max(0, x)
+SiLU(x) = x * sigmoid(x)</code></pre>
+
+  <p>在 SwiGLU 里：</p>
+
+  <pre><code class="language-python">F.silu(gate_proj(x)) * up_proj(x)</code></pre>
+
+  <p>意思是先用 SiLU 生成一个平滑的 gate，再用这个 gate 去逐元素调制另一条分支。</p>
+
+  <h2 id="layernorm-rmsnorm">补充问题九：这是 Pre-LN 还是 Post-LN？RMSNorm 如何计算？</h2>
+
+  <p>文章中的 DecoderLayer 代码是：</p>
+
+  <pre><code class="language-python">def forward(self, x, enc_output, src_mask, tgt_mask):
+    attn_output = self.self_attn(x, x, x, tgt_mask)
+    x = self.norm1(x + self.dropout(attn_output))
+    attn_output = self.cross_attn(x, enc_output, enc_output, src_mask)
+    x = self.norm2(x + self.dropout(attn_output))
+    ff_output = self.feed_forward(x)
+    x = self.norm3(x + self.dropout(ff_output))
+    return x</code></pre>
+
+  <p>这是 <strong>Post-LayerNorm（Post-LN）</strong>，因为它的结构是：</p>
+
+  <pre><code>x = LayerNorm(x + Sublayer(x))</code></pre>
+
+  <p>也就是先做子层计算和残差连接，再做 LayerNorm。LayerNorm 放在残差连接之后，所以叫 Post-LN。</p>
+
+  <p>如果是 <strong>Pre-LayerNorm（Pre-LN）</strong>，通常会写成：</p>
+
+  <pre><code class="language-python">norm_x = self.norm1(x)
+attn_output = self.self_attn(norm_x, norm_x, norm_x, tgt_mask)
+x = x + self.dropout(attn_output)</code></pre>
+
+  <p>结构是：</p>
+
+  <pre><code>x = x + Sublayer(LayerNorm(x))</code></pre>
+
+  <p>也就是 LayerNorm 放在子层之前。</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>结构</th>
+        <th>公式</th>
+        <th>特点</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Post-LN</td>
+        <td><code>LayerNorm(x + Sublayer(x))</code></td>
+        <td>原始 Transformer 常用；深层模型训练更容易不稳定。</td>
+      </tr>
+      <tr>
+        <td>Pre-LN</td>
+        <td><code>x + Sublayer(Norm(x))</code></td>
+        <td>现代深层 Transformer / LLM 更常用；梯度更容易沿残差路径传播。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>现代主流 LLM 基本采用 Pre-LN，并且很多模型不用标准 LayerNorm，而使用 <strong>RMSNorm</strong>。LLaMA 风格大致是：</p>
+
+  <pre><code class="language-python">h = x + self_attn(rms_norm(x))
+out = h + mlp(rms_norm(h))</code></pre>
+
+  <h3>RMSNorm 如何计算？</h3>
+
+  <p>RMSNorm 的核心是：只用均方根 RMS 做缩放，不减均值。</p>
+
+  <p>给定输入向量：</p>
+
+  <pre><code>x = [x1, x2, ..., xd]</code></pre>
+
+  <p>RMS 是：</p>
+
+  <pre><code>RMS(x) = sqrt((1/d) * sum(x_i^2))</code></pre>
+
+  <p>RMSNorm 计算：</p>
+
+  <pre><code>RMSNorm(x) = x / sqrt(mean(x^2) + eps) * weight</code></pre>
+
+  <p>也就是：</p>
+
+  <pre><code>y_i = x_i / sqrt((1/d) * sum_j(x_j^2) + eps) * g_i</code></pre>
+
+  <p>其中 <code>g_i</code> 是可学习缩放参数 <code>weight</code>，<code>eps</code> 是防止除 0 的小常数。</p>
+
+  <p>PyTorch 实现大概是：</p>
+
+  <pre><code class="language-python">class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        x = x / rms
+        return self.weight * x</code></pre>
+
+  <p>也常写成更高效的形式：</p>
+
+  <pre><code class="language-python">x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)</code></pre>
+
+  <p>其中 <code>rsqrt(z)</code> 表示：</p>
+
+  <pre><code>rsqrt(z) = 1 / sqrt(z)</code></pre>
+
+  <p>LayerNorm 和 RMSNorm 的区别：</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Norm</th>
+        <th>计算方式</th>
+        <th>是否减均值</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>LayerNorm</td>
+        <td><code>(x - mean(x)) / sqrt(var(x) + eps)</code></td>
+        <td>是</td>
+      </tr>
+      <tr>
+        <td>RMSNorm</td>
+        <td><code>x / sqrt(mean(x^2) + eps)</code></td>
+        <td>否</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <section class="takeaway">
+    总结：文章代码是 Post-LN；现代主流 LLM 多用 Pre-LN，并常用 RMSNorm 替代 LayerNorm，以提升深层模型训练稳定性并减少一点计算。
+  </section>
+
+  <h2 id="mle-takeaways">MLE 需要掌握的要点</h2>
+
+  <table>
+    <thead>
+      <tr>
+        <th>知识点</th>
+        <th>为什么重要</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Tensor shape</td>
+        <td>深度学习工程中大量错误来自维度不匹配。</td>
+      </tr>
+      <tr>
+        <td><code>view</code> / <code>reshape</code></td>
+        <td>用来改变张量形状，常用于拆分或合并维度。</td>
+      </tr>
+      <tr>
+        <td><code>transpose</code></td>
+        <td>用来交换维度，使张量符合矩阵乘法或广播需求。</td>
+      </tr>
+      <tr>
+        <td>Batched matrix multiplication</td>
+        <td>Transformer attention 依赖高维批量矩阵乘法。</td>
+      </tr>
+      <tr>
+        <td>Attention score shape</td>
+        <td>通常是 <code>(batch_size, num_heads, query_len, key_len)</code>。</td>
+      </tr>
+      <tr>
+        <td>Memory layout / <code>contiguous</code></td>
+        <td>理解 PyTorch 中 <code>view</code> 和 <code>transpose</code> 的底层约束。</td>
+      </tr>
+      <tr>
+        <td>Mask before softmax</td>
+        <td>理解为什么用极大负数屏蔽 token，而不是把 score 设为 0。</td>
+      </tr>
+      <tr>
+        <td><code>softmax(dim=-1)</code></td>
+        <td>理解 attention 中每个 query 对所有 key 的权重归一化。</td>
+      </tr>
+      <tr>
+        <td>SwiGLU / SiLU</td>
+        <td>理解现代 LLM FFN 常用的门控激活结构。</td>
+      </tr>
+      <tr>
+        <td>Pre-LN / Post-LN / RMSNorm</td>
+        <td>理解现代深层 Transformer 为什么通常把 norm 放到子层之前，并常用 RMSNorm。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="summary">总结</h2>
+
+  <p><code>split_heads</code> 里的 <code>transpose(1, 2)</code> 是为了把张量从：</p>
+
+  <pre><code>(batch_size, seq_length, num_heads, d_k)</code></pre>
+
+  <p>转换为：</p>
+
+  <pre><code>(batch_size, num_heads, seq_length, d_k)</code></pre>
+
+  <p>这样每个 attention head 都可以独立地对完整序列计算 self-attention。它是 Multi-Head Attention 能正确并行计算多个 head 的关键步骤。</p>
+
+  <p class="small">备注：本文是 knowledge 目录中的第一篇 Transformer / MLE 基础知识笔记。</p>
+</article>
+</main>
+</body>
+</html>
