@@ -102,6 +102,12 @@
       border-radius: 8px;
       font-weight: 600;
     }
+    .warn {
+      border-left: 4px solid #cf222e;
+      background: #fff1f1;
+      padding: 14px 18px;
+      border-radius: 8px;
+    }
     .small {
       color: #57606a;
       font-size: .92rem;
@@ -142,6 +148,20 @@
       <li><a href="#swiglu-ffn">SwiGLU 实现 FFN</a></li>
       <li><a href="#silu">SiLU 计算公式</a></li>
       <li><a href="#layernorm-rmsnorm">Pre-LN、Post-LN 与 RMSNorm</a></li>
+      <li><a href="#session-0623">2026-06-23 实战补充：从零写 decoder-only layer</a></li>
+      <li><a href="#broadcast">- PyTorch 广播规则</a></li>
+      <li><a href="#rsqrt">- torch.sqrt vs torch.rsqrt</a></li>
+      <li><a href="#mask-semantics">- causal mask 的语义与 ~mask</a></li>
+      <li><a href="#two-dropouts">- attention dropout vs residual dropout</a></li>
+      <li><a href="#kv-cache">- KV Cache 与推理优化</a></li>
+      <li><a href="#dff">- SwiGLU FFN 的 d_ff 选择</a></li>
+      <li><a href="#full-layer-code">- 最终可训练的 decoder-only layer</a></li>
+      <li><a href="#rope">- RotaryPositionEmbedding (RoPE) 实现</a></li>
+      <li><a href="#rope-when">- RoPE 应在 linear 之前还是之后</a></li>
+      <li><a href="#rope-per-layer">- 为什么 RoPE 每层都要做</a></li>
+      <li><a href="#rope-kv-cache">- KV cache 缓存的是旋转前还是旋转后的 K</a></li>
+      <li><a href="#rope-no-v">- 为什么 V 不旋转</a></li>
+      <li><a href="#long-context-pe">- 1M context 的位置编码方案（PI/NTK/YaRN）</a></li>
       <li><a href="#mle-takeaways">MLE 需要掌握的要点</a></li>
       <li><a href="#summary">总结</a></li>
     </ol>
@@ -831,6 +851,685 @@ out = h + mlp(rms_norm(h))</code></pre>
 
   <section class="takeaway">
     总结：文章代码是 Post-LN；现代主流 LLM 多用 Pre-LN，并常用 RMSNorm 替代 LayerNorm，以提升深层模型训练稳定性并减少一点计算。
+  </section>
+
+  <h2 id="session-0623">2026-06-23 实战补充：从零写一个 decoder-only layer</h2>
+
+  <p>本节整理 2026-06-23 与 Copilot 一起迭代实现 LLaMA 风格 decoder-only layer 的过程：从最初实现的若干 bug，到最终可训练版本，过程中涉及的关键概念以及背后的工程考量。</p>
+
+  <section class="box">
+    <strong>本节问题清单：</strong>
+    <ul>
+      <li>PyTorch 张量相乘时是如何广播的？<code>[n]</code> 与 <code>[d, n, n, d]</code> 能否直接相乘？</li>
+      <li>causal mask 怎么生成、shape 是什么、True/False 的语义是什么、<code>~mask</code> 起什么作用？</li>
+      <li><code>torch.sqrt</code> 与 <code>torch.rsqrt</code> 的区别？为什么 RMSNorm 推荐用 <code>rsqrt</code>？</li>
+      <li>attention dropout 和 residual dropout 是同一个 dropout 吗？要不要都加？</li>
+      <li>为什么朴素自回归 decode 会重复计算 K/V？KV Cache 是如何解决的？</li>
+      <li>SwiGLU FFN 的 <code>d_ff</code> 应该取多少？</li>
+    </ul>
+  </section>
+
+  <h3 id="broadcast">1. PyTorch 广播规则：右对齐</h3>
+
+  <p>PyTorch（NumPy 也是一样）的广播规则是<strong>从最右边的维度开始对齐</strong>，逐维比较，要求每一维要么相等，要么其中之一是 1。</p>
+
+  <p>以"<code>A: [n]</code> 与 <code>B: [d, n, n, d]</code>，且 <code>d ≠ n</code>"为例：</p>
+
+  <pre><code>A:           [         n]
+B: [d, n, n, d]   ← 最后一维是 d，与 A 的 n 不相等，且都不是 1
+</code></pre>
+
+  <p>结果：<strong>直接报错</strong>。</p>
+
+  <pre><code>RuntimeError: The size of tensor a (n) must match the size of tensor b (d)
+at non-singleton dimension 3</code></pre>
+
+  <p>如果想让 <code>[n]</code> 和 B 的某个中间维度 <code>n</code> 对齐，必须手动 reshape：</p>
+
+  <pre><code>A.view(n, 1, 1) * B          # 对齐到倒数第 3 维的 n
+A.view(1, n, 1, 1) * B       # 对齐到倒数第 4 维（前面用 1 补齐）
+</code></pre>
+
+  <section class="takeaway">
+    PyTorch 不会"智能匹配"同名维度。<code>[n]</code> 只能对齐到最后一维，其他位置必须显式 <code>view</code> 或 <code>unsqueeze</code>。这是写 attention、mask 广播时最常踩的坑之一。
+  </section>
+
+  <h3 id="rsqrt">2. <code>torch.sqrt</code> vs <code>torch.rsqrt</code></h3>
+
+  <table>
+    <thead><tr><th>函数</th><th>计算</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>torch.sqrt(x)</code></td><td>√x</td><td>平方根</td></tr>
+      <tr><td><code>torch.rsqrt(x)</code></td><td>1 / √x</td><td><strong>r</strong>eciprocal <strong>sqrt</strong>，平方根的倒数</td></tr>
+    </tbody>
+  </table>
+
+  <p>数学上 <code>rsqrt(x) == 1 / sqrt(x)</code>，但实际有几点区别：</p>
+
+  <ol>
+    <li><strong>性能</strong>：GPU/CPU 都有专门的 rsqrt 硬件指令（NVIDIA <code>rsqrt.approx</code>、x86 <code>RSQRTSS</code>），一条指令出结果；而 <code>1/sqrt(x)</code> 需要 sqrt + div 两步，div 又是 GPU 上较慢的操作。</li>
+    <li><strong>数值精度</strong>：硬件 rsqrt 通常是"近似 + 一步 Newton 迭代"，精度可能略低，但深度学习里完全够用。</li>
+    <li><strong>定义域</strong>：<code>sqrt(0) = 0</code>；<code>rsqrt(0) = +inf</code>。所以 RMSNorm 一定要加 <code>eps</code>。</li>
+  </ol>
+
+  <p>RMSNorm 的两种写法：</p>
+
+  <pre><code># 写法 A：直观但慢
+rms = torch.sqrt(torch.mean(x*x, dim=-1, keepdim=True) + eps)
+x = x / rms
+
+# 写法 B：快且数值稳定（推荐，工业标准）
+x = x * torch.rsqrt(torch.mean(x*x, dim=-1, keepdim=True) + eps)
+</code></pre>
+
+  <section class="takeaway">
+    LLaMA、FlashAttention、PyTorch 官方 LayerNorm CUDA kernel 内部都用 <code>rsqrt</code>。归一化层里看到 <code>x / sqrt(...)</code>，几乎都应改成 <code>x * rsqrt(...)</code>。
+  </section>
+
+  <h3 id="mask-semantics">3. Causal mask 的语义与 <code>~mask</code></h3>
+
+  <h4>生成 causal mask</h4>
+
+  <pre><code>seq_len = x.size(1)
+mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool))
+mask = mask.view(1, 1, seq_len, seq_len)   # 广播到 [B, n_heads, S, S]
+</code></pre>
+
+  <ul>
+    <li><code>torch.tril</code> 生成下三角矩阵：第 <code>i</code> 行只有列 <code>j ≤ i</code> 的位置为 1（True）。</li>
+    <li>本约定下：<strong>True = 要保留的位置（合法可见的过去 token）</strong>。</li>
+    <li>形状 <code>[1, 1, S, S]</code> 可以广播到 <code>[B, n_heads, S, S]</code>，与 attn_scores 对齐。</li>
+    <li>用 <code>dtype=torch.bool</code> 比 float 更省内存，也避免 <code>mask == 0</code> 的浮点比较。</li>
+  </ul>
+
+  <h4>应用 mask 时为何要 <code>~mask</code>？</h4>
+
+  <p><code>masked_fill(condition, value)</code> 的语义是：condition 为 True 的位置填 value。因此要"屏蔽未来 token"，要把 mask 反过来：</p>
+
+  <pre><code>if mask is not None:
+    attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+</code></pre>
+
+  <ul>
+    <li><code>~</code> 是按位取反，对 bool tensor 来说就是 True/False 互换。</li>
+    <li><code>~mask</code> 之后，"上三角的未来 token 位置" 变成 True，被填成 <code>-inf</code>；softmax 后这些位置概率为 0。</li>
+  </ul>
+
+  <section class="warn">
+    最容易踩的坑：直接写 <code>masked_fill(mask, -inf)</code>，会把"要保留的位置"全部填成 <code>-inf</code>，整行变 <code>-inf</code> 触发 NaN，模型完全坏掉。一定要确认 mask 的语义约定。
+  </section>
+
+  <h4>两种约定都常见</h4>
+
+  <table>
+    <thead><tr><th>约定</th><th>True 含义</th><th>典型来源</th><th>SDPA 内部写法</th></tr></thead>
+    <tbody>
+      <tr><td>A</td><td>True = 保留</td><td>PyTorch <code>F.scaled_dot_product_attention</code></td><td><code>masked_fill(~mask, -inf)</code></td></tr>
+      <tr><td>B</td><td>True = 屏蔽</td><td>HuggingFace 4D causal mask</td><td><code>masked_fill(mask, -inf)</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>两种都可以，关键是<strong>在 docstring 里写清楚约定</strong>，否则使用者很容易传反。</p>
+
+  <h4>填 <code>-inf</code> 还是 <code>-1e9</code>？</h4>
+
+  <p>之前的版本用 <code>-1e9</code>，在 fp16 下会溢出（fp16 范围约 ±65504）。推荐：</p>
+
+  <pre><code>attn_scores.masked_fill(~mask, float('-inf'))
+# 或者更通用：
+attn_scores.masked_fill(~mask, torch.finfo(attn_scores.dtype).min)
+</code></pre>
+
+  <h3 id="two-dropouts">4. Attention dropout vs Residual dropout</h3>
+
+  <p>这两个 dropout 位置不同、作用不同，常常被混淆：</p>
+
+  <table>
+    <thead><tr><th>类型</th><th>位置</th><th>丢弃对象</th><th>直觉</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Attention dropout</td>
+        <td>softmax 之后、与 V 相乘之前</td>
+        <td>注意力权重 <code>P[i, j]</code></td>
+        <td>随机让"第 i 个 token 看不见第 j 个 token"，防止过度依赖单一 attention 边</td>
+      </tr>
+      <tr>
+        <td>Residual dropout</td>
+        <td>子层输出加到残差之前（<code>x + dropout(sublayer(x))</code>）</td>
+        <td>整层的输出向量</td>
+        <td>随机让"这一层完全不贡献"，防止过度依赖某一层</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4>是否需要 attention dropout？</h4>
+
+  <ul>
+    <li><strong>原始 Transformer / BERT / GPT-2</strong>：两个都加。</li>
+    <li><strong>现代 LLaMA 风格大模型</strong>：通常<strong>两个都不加</strong>（大数据 + 大模型不需要 dropout，反而拖慢训练）。</li>
+    <li><strong>小数据微调 / 学术实验</strong>：可以两个都加，正则化更强。</li>
+  </ul>
+
+  <p>如果要加，代码改动很小：</p>
+
+  <pre><code># __init__ 里
+self.attn_dropout = nn.Dropout(dropout)
+
+# scaled_dot_product_attention 里，softmax 之后
+attn_probs = torch.softmax(attn_scores, dim=-1)
+attn_probs = self.attn_dropout(attn_probs)   # ← 新增
+output = torch.matmul(attn_probs, v)
+</code></pre>
+
+  <h3 id="kv-cache">5. KV Cache：为什么朴素 decode 会浪费</h3>
+
+  <h4>问题</h4>
+
+  <p>自回归生成时，假设已生成 <code>[t1, t2, t3]</code>，现在要生成 <code>t4</code>：</p>
+
+  <pre><code>输入 [t1, t2, t3]
+→ K = W_k · [t1, t2, t3]     # 3 个 key
+→ V = W_v · [t1, t2, t3]     # 3 个 value
+→ out = softmax(QK^T)V       # 输出 3 个 token 的表示
+→ 只取最后一个 token 过 LM head，采样得到 t4
+</code></pre>
+
+  <p>下一步生成 <code>t5</code> 时：</p>
+
+  <pre><code>输入 [t1, t2, t3, t4]
+→ K = W_k · [t1, t2, t3, t4]   # t1,t2,t3 的 K 又算了一遍！
+→ V = W_v · [t1, t2, t3, t4]   # 同样浪费
+</code></pre>
+
+  <p>朴素方式生成 N 个 token 的总计算量是 <strong>O(N³)</strong>，其中大量重复计算。</p>
+
+  <h4>KV Cache 的核心观察</h4>
+
+  <ol>
+    <li>由于 causal mask，token <code>i</code> 的输出只依赖 <code>j ≤ i</code> 的 K、V。</li>
+    <li>过去 token 的 K、V 一旦算出<strong>永远不变</strong>，缓存即可。</li>
+    <li>过去 token 的 Q 是没用的（它们的输出我们已经用过、采样过了）。</li>
+    <li>生成新 token 时，只需：算新 token 的 Q、K、V → 把新 K、V 拼接到缓存 → 新 Q 对完整缓存 K、V 做 attention。</li>
+  </ol>
+
+  <table>
+    <thead><tr><th></th><th>朴素</th><th>KV Cache</th></tr></thead>
+    <tbody>
+      <tr><td>每步计算量</td><td>O(N²)</td><td>O(N)</td></tr>
+      <tr><td>生成 N 个 token 总量</td><td>O(N³)</td><td>O(N²)</td></tr>
+      <tr><td>显存</td><td>O(N)</td><td>O(N)（需多存 K、V）</td></tr>
+    </tbody>
+  </table>
+
+  <h4>代码改造</h4>
+
+  <pre><code>def forward(self, x, kv_cache=None):
+    # 训练时 x 是整个序列；推理时 x 只有 1 个新 token
+    q = self.split_heads(self.q_linear(x))   # [B, H, S_new, D]
+    k = self.split_heads(self.k_linear(x))
+    v = self.split_heads(self.v_linear(v))
+
+    if kv_cache is not None:
+        past_k, past_v = kv_cache
+        k = torch.cat([past_k, k], dim=2)    # 沿 seq 维拼接
+        v = torch.cat([past_v, v], dim=2)
+    new_cache = (k, v)
+
+    # 推理 step 时 Q 长度=1，KV 长度=N，不需要 causal mask
+    attn = self.sdpa(q, k, v, mask=None)
+    return self.output_linear(self.combine_heads(attn)), new_cache
+</code></pre>
+
+  <h4>工业级延伸</h4>
+
+  <ul>
+    <li><strong>PagedAttention (vLLM)</strong>：像操作系统的虚拟内存一样管理 KV cache，解决长度不一的 batch 浪费。</li>
+    <li><strong>Sliding Window (Mistral)</strong>：只缓存最近 N 个 token，固定显存。</li>
+    <li><strong>GQA / MQA (LLaMA-2 70B / Falcon)</strong>：多个 Q head 共享 K、V，cache 大幅缩小。</li>
+    <li><strong>量化 KV cache</strong>：把 cache 存成 int8 / fp8，省一半显存。</li>
+    <li><strong>FlashAttention (2205.14135)</strong>：训练和推理 prefill 阶段的标准实现，避免落盘 N×N 矩阵。</li>
+  </ul>
+
+  <h3 id="dff">6. SwiGLU FFN 的 <code>d_ff</code> 应该取多少</h3>
+
+  <p>普通 FFN（2 个 Linear）的惯例：</p>
+  <pre><code>d_ff = 4 * d_model</code></pre>
+
+  <p>SwiGLU FFN 因为多了 <code>w_gate</code>，相同 <code>d_ff</code> 下参数量是普通 FFN 的 <strong>1.5 倍</strong>（3 个 Linear vs 2 个）。为对齐参数量，LLaMA 把 <code>d_ff</code> 缩成：</p>
+
+  <pre><code>d_ff = (2/3) * 4 * d_model = (8/3) * d_model ≈ 2.67 * d_model</code></pre>
+
+  <p>再向上取整到 GPU 友好的倍数（通常 256）：</p>
+
+  <pre><code>def swiglu_ff_dim(d_model, multiple_of=256):
+    d_ff = int(8 * d_model / 3)
+    d_ff = ((d_ff + multiple_of - 1) // multiple_of) * multiple_of
+    return d_ff
+</code></pre>
+
+  <h4>真实模型的取值参考</h4>
+
+  <table>
+    <thead><tr><th>模型</th><th>d_model</th><th>d_ff</th><th>比例</th></tr></thead>
+    <tbody>
+      <tr><td>LLaMA-1 7B</td><td>4096</td><td>11008</td><td>2.69×</td></tr>
+      <tr><td>LLaMA-2 7B</td><td>4096</td><td>11008</td><td>2.69×</td></tr>
+      <tr><td>LLaMA-2 70B</td><td>8192</td><td>28672</td><td>3.5×</td></tr>
+      <tr><td>LLaMA-3 8B</td><td>4096</td><td>14336</td><td>3.5×</td></tr>
+      <tr><td>Mistral 7B</td><td>4096</td><td>14336</td><td>3.5×</td></tr>
+      <tr><td>Qwen2 7B</td><td>3584</td><td>18944</td><td>5.29×</td></tr>
+    </tbody>
+  </table>
+
+  <p>趋势是<strong>比 2.67× 更大</strong>（3.5× 甚至 5×），稍宽的 FFN 收益更好。</p>
+
+  <section class="takeaway">
+    实战建议：
+    <ul>
+      <li>保守 / 对齐普通 FFN 参数量：<code>d_ff = round_to(8/3 * d_model, 256)</code></li>
+      <li>跟随现代 LLM：直接 <code>d_ff = 3.5 * d_model</code> 再 round 到 256 的倍数</li>
+      <li>练手：<code>d_ff = 4 * d_model</code> 也完全 OK，只是参数多一点点</li>
+    </ul>
+  </section>
+
+  <h3 id="full-layer-code">7. 最终可训练的 decoder-only layer（迭代结果）</h3>
+
+  <p>经过若干轮 review 与修复（<code>-1e9</code> → <code>-inf</code>、加 <code>self.eps</code>、<code>if not mask</code> → <code>if mask is None</code>、修正 mask 取反语义等），最终版本如下：</p>
+
+  <pre><code>import torch as T
+from torch import nn
+import torch.nn.functional as F
+
+
+class MultiHeadAttention(nn.Module):
+  def __init__(self, d_model, n_heads):
+    super().__init__()
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.head_dim = d_model // n_heads
+    assert self.head_dim * n_heads == d_model
+    self.q_linear = nn.Linear(d_model, d_model)
+    self.k_linear = nn.Linear(d_model, d_model)
+    self.v_linear = nn.Linear(d_model, d_model)
+    self.output_linear = nn.Linear(d_model, d_model)
+
+  def split_heads(self, x):
+    batch_size, seq_len, d_model = x.size()
+    return x.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+  def scaled_dot_product_attention(self, q, k, v, mask=None):
+    """mask: bool tensor broadcastable to [B, n_heads, S, S].
+       True = keep, False = mask out (filled with -inf)."""
+    attn_scores = T.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+    if mask is not None:
+      attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+    attn_probs = T.softmax(attn_scores, dim=-1)
+    return T.matmul(attn_probs, v)
+
+  def combine_heads(self, x):
+    batch_size, _, seq_len, head_dim = x.size()
+    return x.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+
+  def forward(self, q, k, v, mask=None):
+    q = self.split_heads(self.q_linear(q))
+    k = self.split_heads(self.k_linear(k))
+    v = self.split_heads(self.v_linear(v))
+    attn_output = self.scaled_dot_product_attention(q, k, v, mask)
+    return self.output_linear(self.combine_heads(attn_output))
+
+
+class SwiGLUFFN(nn.Module):
+  def __init__(self, d_model, d_ff):
+    super().__init__()
+    self.w_up = nn.Linear(d_model, d_ff)
+    self.w_down = nn.Linear(d_ff, d_model)
+    self.w_gate = nn.Linear(d_model, d_ff)
+
+  def forward(self, x):
+    return self.w_down(F.silu(self.w_up(x)) * self.w_gate(x))
+
+
+class RMSNorm(nn.Module):
+  def __init__(self, dim, eps=1e-6):
+    super().__init__()
+    self.weight = nn.Parameter(T.ones(dim))
+    self.eps = eps
+
+  def forward(self, x):
+    x = x * T.rsqrt(T.mean(x * x, dim=-1, keepdim=True) + self.eps)
+    return self.weight * x
+
+
+class TransformerDecoderOnlyLayer(nn.Module):
+  def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+    super().__init__()
+    self.self_attn = MultiHeadAttention(d_model, n_heads)
+    self.ffn = SwiGLUFFN(d_model, d_ff)
+    self.norm1 = RMSNorm(d_model)
+    self.norm2 = RMSNorm(d_model)
+    self.dropout1 = nn.Dropout(dropout)
+    self.dropout2 = nn.Dropout(dropout)
+
+  def forward(self, x, mask=None):
+    if mask is None:
+      seq_len = x.size(1)
+      mask = T.tril(T.ones(seq_len, seq_len, device=x.device, dtype=T.bool))
+      mask = mask.view(1, 1, seq_len, seq_len)
+    norm_x = self.norm1(x)
+    x = x + self.dropout1(self.self_attn(norm_x, norm_x, norm_x, mask))
+    norm_x = self.norm2(x)
+    x = x + self.dropout2(self.ffn(norm_x))
+    return x
+</code></pre>
+
+  <h4>迭代过程中踩过的坑总结</h4>
+
+  <table>
+    <thead><tr><th>问题</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>RMSNorm 没用 <code>eps</code>，全 0 输入会 NaN</td><td><code>+ self.eps</code></td></tr>
+      <tr><td>RMSNorm 用 <code>sqrt</code> 再除，慢且容易写错</td><td>用 <code>x * rsqrt(...)</code></td></tr>
+      <tr><td>mask 填 <code>-1e9</code>，fp16 溢出</td><td>填 <code>float('-inf')</code> 或 <code>finfo(dtype).min</code></td></tr>
+      <tr><td>外面调用者必须自备 causal mask，容易忘</td><td>layer 内部 <code>if mask is None</code> 自动生成 tril</td></tr>
+      <tr><td><code>if not mask:</code> 对 tensor 报 "Boolean value ambiguous"</td><td>改成 <code>if mask is None:</code></td></tr>
+      <tr><td>mask 语义反了：tril 给的是"保留位置"，但 <code>masked_fill(mask, -inf)</code> 把保留位置填掉</td><td><code>masked_fill(~mask, -inf)</code> 或改用 triu 生成"屏蔽位置"</td></tr>
+      <tr><td>缺少 <code>head_dim * n_heads == d_model</code> 校验</td><td>加 <code>assert</code></td></tr>
+    </tbody>
+  </table>
+
+  <h4>还差什么才是完整可上线的 decoder layer</h4>
+
+  <ul>
+    <li><strong>位置编码 / RoPE</strong>：当前实现对 token 顺序完全不敏感，必须在 embedding 层或 attention 内部加入。</li>
+    <li><strong>KV Cache 支持</strong>：推理必备（见 <a href="#kv-cache">KV Cache</a> 节）。</li>
+    <li><strong>多层堆叠 + Embedding + LM head</strong>：组成完整 model 的外层包装。</li>
+    <li><strong>用 <code>F.scaled_dot_product_attention</code> 替换手写 attention</strong>：PyTorch 2.0+ 自动使用 FlashAttention，更快更省显存。</li>
+  </ul>
+
+  <h3 id="rope">8. RotaryPositionEmbedding (RoPE) 实现</h3>
+
+  <h4>核心思想</h4>
+
+  <p>RoPE 不是"加"位置编码（不像 sinusoidal 那样 <code>x + PE</code>），而是<strong>对 Q 和 K 做旋转</strong>，把位置 <code>m</code> 编码成旋转角度。</p>
+
+  <p><strong>关键性质</strong>：旋转后的 <code>&lt;q_m, k_n&gt;</code> 内积只取决于<strong>相对位置 m - n</strong>，所以模型天然学到的是相对位置关系，而不是绝对位置。数学上：</p>
+
+  <pre><code>&lt;R_m · q,  R_n · k&gt;  =  q^T · R_m^T · R_n · k  =  q^T · R_{n-m} · k</code></pre>
+
+  <p>（旋转矩阵满足 <code>R_m^T · R_n = R_{n-m}</code>）</p>
+
+  <h4>数学公式</h4>
+
+  <p>把每个 head 的 d 维向量两两分组成 d/2 个二维向量。对位置 <code>m</code> 的第 <code>i</code> 组（i = 0, 1, ..., d/2-1），用角度 <code>θ_i = 10000^(-2i/d)</code>，旋转角度为 <code>m · θ_i</code>：</p>
+
+  <pre><code>[x'_{2i}  ]   [cos(mθ_i)  -sin(mθ_i)] [x_{2i}  ]
+[x'_{2i+1}] = [sin(mθ_i)   cos(mθ_i)] [x_{2i+1}]</code></pre>
+
+  <p>越靠后的维度（i 大）频率越低（θ_i 越小），形成多尺度的位置编码。</p>
+
+  <h4>两种 layout</h4>
+
+  <table>
+    <thead><tr><th>方式</th><th>配对</th><th>典型来源</th></tr></thead>
+    <tbody>
+      <tr><td>A：相邻配对</td><td>(x0, x1), (x2, x3), ...</td><td>RoFormer 原论文</td></tr>
+      <tr><td>B：前后半配对</td><td>(x_i, x_{i+d/2})</td><td>LLaMA 实际实现，PyTorch 友好</td></tr>
+    </tbody>
+  </table>
+
+  <p>两种数学等价，下面用 LLaMA 风格（方式 B）。</p>
+
+  <h4>实现代码</h4>
+
+  <pre><code>class RotaryPositionEmbedding(nn.Module):
+    """
+    head_dim 必须是偶数。
+    用法：
+        rope = RotaryPositionEmbedding(head_dim, max_seq_len=8192)
+        q, k = rope(q, k)   # q, k shape: [B, n_heads, S, head_dim]
+    """
+    def __init__(self, head_dim, max_seq_len=8192, base=10000.0):
+        super().__init__()
+        assert head_dim % 2 == 0
+        self.head_dim = head_dim
+
+        # 频率：θ_i = base^(-2i/d)
+        inv_freq = 1.0 / (base ** (T.arange(0, head_dim, 2).float() / head_dim))
+
+        # 预计算所有位置的 cos/sin
+        positions = T.arange(max_seq_len).float()
+        freqs = T.outer(positions, inv_freq)            # [max_seq_len, d/2]
+        emb = T.cat([freqs, freqs], dim=-1)             # [max_seq_len, d]
+        # 方式 B：前后半用同一组角度
+
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    @staticmethod
+    def _rotate_half(x):
+        """把后半段取负放到前面：[a, b] → [-b, a]"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return T.cat([-x2, x1], dim=-1)
+
+    def forward(self, q, k, offset=0):
+        """
+        q, k: [B, n_heads, S, head_dim]
+        offset: 推理用 KV cache 时，新 token 的位置 = past_len
+        """
+        seq_len = q.size(-2)
+        cos = self.cos_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
+        sin = self.sin_cached[offset : offset + seq_len].unsqueeze(0).unsqueeze(0)
+        q_rot = q * cos + self._rotate_half(q) * sin
+        k_rot = k * cos + self._rotate_half(k) * sin
+        return q_rot, k_rot
+</code></pre>
+
+  <h4>集成到 MultiHeadAttention</h4>
+
+  <pre><code>class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads, max_seq_len=8192):
+        super().__init__()
+        ...
+        self.rope = RotaryPositionEmbedding(self.head_dim, max_seq_len)
+
+    def forward(self, q, k, v, mask=None, pos_offset=0):
+        q = self.split_heads(self.q_linear(q))
+        k = self.split_heads(self.k_linear(k))
+        v = self.split_heads(self.v_linear(v))
+
+        # ← 在 split_heads 之后、attention 之前应用 RoPE
+        # 注意：只对 Q 和 K 做，V 不需要
+        q, k = self.rope(q, k, offset=pos_offset)
+
+        attn = self.scaled_dot_product_attention(q, k, v, mask)
+        return self.output_linear(self.combine_heads(attn))
+</code></pre>
+
+  <h4>关键细节</h4>
+
+  <ol>
+    <li><strong>为什么 <code>_rotate_half</code> 是 <code>[-x2, x1]</code></strong>？二维旋转矩阵展开后，前半 = <code>a·cos − b·sin</code>，后半 = <code>a·sin + b·cos</code>。写成向量形式就是 <code>q·cos + [−b, a]·sin</code>。</li>
+    <li><strong>应用时机</strong>：必须在 <code>split_heads</code> 之后、scaled dot product 之前，因为旋转是按 head_dim 内的成对维度做。</li>
+    <li><strong>KV cache 的 offset</strong>：推理时新 token 的位置 = 缓存里已有 token 数；否则会被当成位置 0，角度全错。</li>
+    <li><strong>dtype</strong>：cos/sin 用 fp32 算更精确，可在旋转前 <code>.float()</code>，旋转后 <code>.to(q.dtype)</code>。</li>
+  </ol>
+
+  <h4>长上下文扩展</h4>
+
+  <table>
+    <thead><tr><th>方法</th><th>做法</th></tr></thead>
+    <tbody>
+      <tr><td>Position Interpolation (PI)</td><td>把位置 <code>m</code> 缩放成 <code>m · L_train / L_target</code>，等于压缩角度</td></tr>
+      <tr><td>NTK-aware scaling</td><td>调大 <code>base</code>，让高频部分基本不变，低频被拉伸</td></tr>
+      <tr><td>YaRN</td><td>综合 PI + NTK 按维度分段处理，LLaMA-3、Qwen 主流方案</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="rope-when">9. RoPE 应在 linear 之前还是之后？只 apply 到 Q、K 吗？</h3>
+
+  <p><strong>结论</strong>：</p>
+  <ul>
+    <li>RoPE 应在 <code>q_linear / k_linear</code> <strong>之后</strong>、且在 <code>split_heads</code> <strong>之后</strong>、attention <strong>之前</strong> 应用。</li>
+    <li>只对 <strong>Q 和 K</strong> 做，<strong>不对 V</strong> 做（但 <code>v_linear</code> 还是必须有）。</li>
+  </ul>
+
+  <h4>处理顺序（每层 attention 内部）</h4>
+
+  <pre><code>x → q_linear / k_linear / v_linear
+  → split_heads
+  → RoPE（仅 Q、K）   ← 在这里
+  → scaled dot product attention
+  → combine_heads
+  → output_linear</code></pre>
+
+  <h4>为什么必须在 linear 之后？</h4>
+
+  <p>RoPE 旋转的对象是 <strong>Q、K 这两个 attention 中真正参与内积的向量</strong>。<code>q_linear / k_linear</code> 不只是改维度，更是学习"从 x 中提取什么作为 query / key"。RoPE 的相对位置魔法依赖：</p>
+
+  <pre><code>&lt;q_m, k_n&gt; ≈ 相对位置 (n - m) 的函数</code></pre>
+
+  <p>这里的 <code>q_m</code>、<code>k_n</code> 必须是 <strong><code>q_linear(x_m)</code> 和 <code>k_linear(x_n)</code> 之后的向量</strong>。如果在 linear 之前旋转 x，那线性变换会把旋转结构彻底打乱（旋转矩阵与任意矩阵不可交换），RoPE 就失效了。</p>
+
+  <h4>为什么必须在 split_heads 之后？</h4>
+
+  <p>RoPE 是按 <code>head_dim</code> 内的成对维度做 2D 旋转。必须"看到 head_dim"才能正确分组：每个 head 独立做旋转，不同 head 之间互不影响。如果在 split_heads 之前做，旋转分组会跨越 head 边界，破坏 multi-head 的独立性。</p>
+
+  <h4>为什么不旋转 V（但仍需 v_linear）</h4>
+
+  <p>见 <a href="#rope-no-v">为什么 V 不旋转</a>：V 在 attention 中是被加权求和，没有内积参与"相对位置抵消"的数学魔法。但 <code>v_linear(x)</code> 必须做 —— 它学习"从 x 中提取什么作为 value（被加权求和的内容）"。Q、K、V 三个投影是<strong>独立学习</strong>的，分别对应"用什么 query / 被 query / 输出什么内容"。</p>
+
+  <h4>各组件应不应该 apply 总览</h4>
+
+  <table>
+    <thead><tr><th></th><th>linear</th><th>split_heads</th><th>RoPE</th><th>attention</th></tr></thead>
+    <tbody>
+      <tr><td>Q</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+      <tr><td>K</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+      <tr><td>V</td><td>✅</td><td>✅</td><td>❌</td><td>✅</td></tr>
+    </tbody>
+  </table>
+
+  <section class="takeaway">
+    RoPE 是 attention 内部的"位置插件"：必须作用在已经投影、已经分头的 Q、K 上，V 完全不动。它与 q_linear/k_linear/v_linear 是协作关系，不是替代关系。
+  </section>
+
+  <h3 id="rope-per-layer">10. 为什么 RoPE 每层都要做（与原始加法式 PE 的区别）</h3>
+
+  <p>原始 Transformer 的 sinusoidal PE 只在输入层加一次（<code>x = embedding + PE</code>），位置信号跟着 residual 流过每一层。但 RoPE 必须<strong>每层 attention 都重新做</strong>，原因如下：</p>
+
+  <table>
+    <thead><tr><th></th><th>加法式 PE</th><th>RoPE</th></tr></thead>
+    <tbody>
+      <tr><td>应用对象</td><td>hidden state</td><td>Q、K（V 不变）</td></tr>
+      <tr><td>应用位置</td><td>embedding 之后</td><td>每层 attention 内部</td></tr>
+      <tr><td>信号传播</td><td>通过 residual 一直带下去</td><td>不存到 hidden state 里</td></tr>
+      <tr><td>每层都要重做？</td><td>否</td><td><strong>是</strong></td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>核心原因</strong>：RoPE 不修改 hidden state，它只修改 Q 和 K。Attention 计算完后，<code>output_linear(attn(Q_rot, K_rot, V))</code> 的结果已经不带旋转 —— 因为 attention 算完后 Q、K 不再出现，只剩下 V 的加权和。</p>
+
+  <ul>
+    <li>下一层拿到的 hidden state 里，<strong>没有任何"我是位置 m"的信号</strong>。</li>
+    <li>所以下一层算 attention 时，必须重新给 Q、K 应用 RoPE。</li>
+  </ul>
+
+  <h4>为什么不能像加法 PE 那样"加一次就够"？</h4>
+
+  <ol>
+    <li><strong>hidden state 是 V 的加权和</strong>，已经混合了不同位置的 token 信息，再去"旋转"它没有清晰的位置语义。</li>
+    <li><strong>后面的 Linear（FFN、output_linear）会破坏旋转</strong>：旋转矩阵和任意矩阵不可交换，过一个 FFN 后旋转角度就乱了。</li>
+  </ol>
+
+  <p>而加法式 PE 是"<code>x + PE</code>"，PE 像一个信号附加在向量上，经过线性变换后还能部分保留（虽然也会被稀释）。</p>
+
+  <section class="takeaway">
+    加法式 PE 把位置信息"写入" hidden state 跟着 residual 传；RoPE 只在 attention 算分时"临时"给 Q、K 添加位置感，不进入 hidden state，所以每层必须重做。这是设计哲学的差异，不是冗余，计算代价也很小（只是一次 element-wise 乘加）。
+  </section>
+
+  <h3 id="rope-kv-cache">11. KV cache 缓存的是 RoPE 之前还是之后的 K？</h3>
+
+  <p><strong>缓存的是 RoPE 之后的 K</strong>（V 没有 RoPE，原样缓存）。</p>
+
+  <h4>原因</h4>
+
+  <p>每个 token 在序列中的位置是<strong>固定的</strong>：位置 5 的 token 它的 K 旋转角度永远是 <code>5 · θ_i</code>。所以 RoPE 旋转后的 K 一旦算出来就不会变，缓存"已旋转的 K"完全合法。</p>
+
+  <p>反过来缓存"旋转前的 K"，每次生成新 token 都要把所有历史 K 重新旋转一遍 —— 浪费计算，违背 KV cache 初衷。</p>
+
+  <h4>正确流程（生成第 N+1 个 token）</h4>
+
+  <pre><code># 1. 新 token 过 linear 得到原始 Q、K、V（seq_len=1）
+q_new = q_linear(x_new)
+k_new = k_linear(x_new)
+v_new = v_linear(x_new)
+
+# split_heads → [B, n_heads, 1, head_dim]
+
+# 2. 对新 Q、新 K 应用 RoPE，offset = N
+q_new, k_new = rope(q_new, k_new, offset=N)
+
+# 3. 拼接到缓存（缓存里的 K 已经是旋转过的！）
+k_full = torch.cat([past_k_rotated, k_new], dim=2)  # [B, H, N+1, D]
+v_full = torch.cat([past_v, v_new], dim=2)
+
+# 4. attention：新 Q（已旋转，位置 N）vs 所有历史 K（已旋转，位置 0..N）
+out = attention(q_new, k_full, v_full)
+
+# 5. 更新缓存
+new_cache = (k_full, v_full)
+</code></pre>
+
+  <section class="takeaway">
+    一句话：位置固定 → 旋转结果固定 → 缓存旋转后的 K 一劳永逸。V 不需要 RoPE，原样缓存。Q 不缓存。
+  </section>
+
+  <h3 id="rope-no-v">12. 为什么 V 不一起旋转</h3>
+
+  <p>常见疑问：既然 Q、K 都旋转了，把 V 也旋转，attention 输出不就"带旋转"了吗？</p>
+
+  <p><strong>答案：不能旋转 V，因为 V 在 attention 中没有内积参与"相对位置抵消"的数学魔法，旋转它只会把绝对位置的角度噪声写进 hidden state，反而污染下一层。</strong></p>
+
+  <h4>RoPE 工作的关键：内积保相对位置</h4>
+
+  <p>RoPE 之所以工作，是因为旋转矩阵满足：</p>
+
+  <pre><code>&lt;R_m · q,  R_n · k&gt;  =  q^T · R_{n-m} · k</code></pre>
+
+  <p>也就是说 <strong>旋转后的 Q、K 做内积，自动得到只依赖相对位置 (n-m) 的 attention 分数</strong>。这是 RoPE 全部的"位置信号注入"机制。</p>
+
+  <h4>V 的角色完全不同</h4>
+
+  <p>attention 的最后一步：</p>
+
+  <pre><code>output_i = Σ_j  attn_weights[i, j] · v_j</code></pre>
+
+  <p>V 是<strong>被加权求和的内容</strong>，没有任何"内积 → 位置相对性"环节。</p>
+
+  <p>如果你把 V 也旋转：</p>
+
+  <pre><code>output_i = Σ_j  attn_weights[i, j] · (R_j · v_j)
+        = 一堆不同角度旋转过的 v 向量的加权和</code></pre>
+
+  <p>结果是一个<strong>混合了多个绝对位置旋转角度</strong>的向量。这个向量：</p>
+
+  <ul>
+    <li>不再具有 RoPE 的相对位置性质（内积里抵消的魔法不适用于求和）</li>
+    <li>把"绝对位置 j 的旋转"残留在了 hidden state 里</li>
+    <li>下一层拿到这个 hidden state 后再过 Linear，那些位置残留会被打乱</li>
+    <li>然后下一层又要再次 RoPE，<strong>两次旋转叠加，位置语义彻底崩坏</strong></li>
+  </ul>
+
+  <h4>加法式 PE 能"持续传"，为什么旋转不行？</h4>
+
+  <ul>
+    <li>加法 <code>x + PE</code> 是<strong>叠加</strong>：经过线性变换后 PE 部分还能在向量里保留近似信号。</li>
+    <li>旋转 <code>R · x</code> 是<strong>改变方向</strong>：经过任意 Linear 后旋转角度会被矩阵打乱。所以旋转不能"传"，只能"用一次就丢"。</li>
+  </ul>
+
+  <section class="takeaway">
+    RoPE 通过"Q、K 旋转后内积 = 相对位置函数"工作；V 没有内积参与这个魔法，旋转它只会破坏下一层。不旋转 V 恰好保证 hidden state 的"位置中立"，每层可以从零开始用 RoPE 重新注入位置。
   </section>
 
   <h2 id="mle-takeaways">MLE 需要掌握的要点</h2>

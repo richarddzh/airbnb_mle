@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文解读：FlashAttention</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.75; margin: 0; color: #172033; background: #f6f8fb; }
+    main { max-width: 980px; margin: 0 auto; padding: 32px 20px 56px; }
+    article { background: white; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17, 24, 39, 0.06); }
+    h1 { line-height: 1.25; margin-top: 0; font-size: 2rem; }
+    h2 { margin-top: 2.2rem; border-bottom: 1px solid #e6ebf2; padding-bottom: 0.35rem; }
+    h3 { margin-top: 1.6rem; }
+    a { color: #0969da; }
+    .meta, .takeaway, .tip, .warn { background: #f1f6ff; border-left: 4px solid #2f6feb; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { background: #f6fff1; border-left-color: #2da44e; }
+    .tip { background: #fff8e6; border-left-color: #e3b341; }
+    .warn { background: #fff1f1; border-left-color: #cf222e; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.96rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 4px; font-family: "Cascadia Code", Consolas, Menlo, monospace; }
+    pre { background: #f6f8fa; border: 1px solid #e1e7ef; border-radius: 8px; padding: 14px 16px; overflow-x: auto; font-size: 0.92rem; }
+    .small { color: #57606a; font-size: 0.92rem; }
+    .formula { background: #fafbfc; border: 1px dashed #d0d7de; padding: 10px 14px; border-radius: 8px; font-family: "Cambria Math", serif; }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>论文解读：FlashAttention — Fast and Memory-Efficient Exact Attention with IO-Awareness</h1>
+
+  <section class="meta">
+    <strong>论文信息</strong><br>
+    作者：Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré<br>
+    机构：Stanford University, University at Buffalo (SUNY)<br>
+    发表时间：2022 年 6 月（NeurIPS 2022）<br>
+    arXiv：<a href="https://arxiv.org/abs/2205.14135">2205.14135</a>，PDF：<a href="2205.14135.pdf">2205.14135.pdf</a><br>
+    主题：Transformer 加速、注意力机制、GPU IO 优化、CUDA kernel、长序列建模
+  </section>
+
+  <h2>一句话概括</h2>
+  <p class="takeaway"><strong>FlashAttention 把标准 attention 重写成一个"按块计算 + 不落盘中间矩阵"的融合 CUDA kernel，结果完全等价（不是近似！），但训练 Transformer 速度快 2–4 倍，显存占用从 O(N²) 降到 O(N)。</strong>它的核心思想不是减少 FLOPs，而是减少 GPU 显存（HBM）的读写次数 —— 即"<strong>IO-Aware</strong>"算法设计。</p>
+
+  <h2>为什么初学者要读这篇论文</h2>
+  <ul>
+    <li><strong>它是现代 LLM 训练/推理的事实标准</strong>：PyTorch 2.0 的 <code>F.scaled_dot_product_attention</code>、HuggingFace、vLLM、几乎所有大模型框架背后都在用 FlashAttention（及其后续版本 v2/v3）。</li>
+    <li><strong>它教你一个非常重要的工程思想</strong>：在 GPU 上跑得快不等于 FLOPs 少，而是 <strong>memory access 少</strong>。这条原则在很多场景下都适用。</li>
+    <li><strong>它的算法本身（online softmax + tiling）很优雅</strong>，理解之后你看 LLM 加速领域很多论文都会容易很多。</li>
+  </ul>
+
+  <h2>背景知识：你需要先理解什么</h2>
+
+  <h3>1. 标准 Attention 是怎么算的</h3>
+  <p>给定 Query、Key、Value 三个矩阵 Q、K、V ∈ ℝ<sup>N×d</sup>（N 是序列长度，d 是每个 head 的维度），标准的注意力计算分三步：</p>
+  <div class="formula">
+    S = Q K<sup>⊤</sup>   ∈ ℝ<sup>N×N</sup><br>
+    P = softmax(S)        ∈ ℝ<sup>N×N</sup><br>
+    O = P V                ∈ ℝ<sup>N×d</sup>
+  </div>
+  <p>问题在于：当 N 很大（比如 4096、16K、64K）时，<strong>S 和 P 这两个 N×N 的矩阵巨大无比</strong>。比如 N=16K，一个 fp16 的 P 矩阵就是 16K × 16K × 2 字节 = 512 MB —— 这还只是一个 head 一个 batch！</p>
+
+  <h3>2. GPU 显存的两个层级</h3>
+  <p>这是理解 FlashAttention 的关键。GPU 上有两种主要的"内存"：</p>
+  <table>
+    <thead><tr><th>层级</th><th>容量（A100 为例）</th><th>带宽</th><th>类比</th></tr></thead>
+    <tbody>
+      <tr><td><strong>HBM</strong>（High Bandwidth Memory，显存）</td><td>40–80 GB</td><td>~1.5 TB/s</td><td>大但慢，相当于"硬盘"</td></tr>
+      <tr><td><strong>SRAM</strong>（on-chip，每个 SM 的共享内存/寄存器）</td><td>≈ 192 KB / SM</td><td>~19 TB/s（10 倍以上）</td><td>小但快，相当于"CPU 缓存"</td></tr>
+    </tbody>
+  </table>
+  <p class="tip">💡 平时我们说"显存不够"指的是 HBM。但程序跑得快不快，往往取决于 <strong>从 HBM 搬数据到 SRAM 搬了多少次</strong>。这就是"memory-bound"（受内存带宽限制）的含义。在现代 GPU 上，计算速度远远快于 HBM 带宽，所以很多 op 的瓶颈是 IO 而不是算力。</p>
+
+  <h3>3. 标准实现的 IO 浪费</h3>
+  <p>PyTorch 的标准 attention 实现会：</p>
+  <ol>
+    <li>从 HBM 读取 Q、K → 算出 S，<strong>把 S 写回 HBM</strong>（N² 大小）。</li>
+    <li>从 HBM 读 S → 算 softmax 得到 P，<strong>把 P 写回 HBM</strong>（又一次 N²）。</li>
+    <li>从 HBM 读 P 和 V → 算 O，写回 HBM。</li>
+  </ol>
+  <p>每一步都要把巨大的 N×N 矩阵在 HBM 上读一遍、写一遍。HBM 访问总量是 <strong>O(N² + Nd)</strong>，绝大部分时间都在等内存。</p>
+
+  <h2>核心思想：能不能不把 N×N 矩阵写到 HBM？</h2>
+  <p>FlashAttention 的目标：<strong>S 和 P 这两个大矩阵，根本不要在 HBM 里出现</strong>，全程只在 SRAM 里以小块的形式存在。</p>
+  <p>这听起来很难，因为：</p>
+  <ul>
+    <li><strong>Softmax 需要看到整行</strong>。因为分母 ∑ⱼ exp(Sᵢⱼ) 是对一整行求和。如果按块处理，怎么算分母？</li>
+    <li><strong>Backward 需要 S 和 P</strong> 来算梯度。如果不存它们，反向怎么办？</li>
+  </ul>
+  <p>FlashAttention 用两个技巧分别解决：<strong>Tiling（分块计算 + online softmax）</strong> 和 <strong>Recomputation（反向重算）</strong>。</p>
+
+  <h2>技巧 1：Tiling 与 Online Softmax</h2>
+
+  <h3>从"数值稳定的 softmax"开始</h3>
+  <p>为了避免 exp 溢出，softmax 通常这样算（叫 safe softmax）：</p>
+  <div class="formula">
+    m(x) = max<sub>i</sub> x<sub>i</sub><br>
+    f(x)<sub>i</sub> = exp(x<sub>i</sub> − m(x))<br>
+    ℓ(x) = ∑<sub>i</sub> f(x)<sub>i</sub><br>
+    softmax(x)<sub>i</sub> = f(x)<sub>i</sub> / ℓ(x)
+  </div>
+
+  <h3>关键观察：softmax 可以"边算边合并"</h3>
+  <p>假设把向量 x 拆成两段 x<sup>(1)</sup>、x<sup>(2)</sup>。如果我们对每段先算出局部的 (m, ℓ)，能不能合并成整段的 (m, ℓ) ？答案是可以：</p>
+  <div class="formula">
+    m = max(m<sup>(1)</sup>, m<sup>(2)</sup>)<br>
+    ℓ = e<sup>m<sup>(1)</sup>−m</sup> · ℓ<sup>(1)</sup> + e<sup>m<sup>(2)</sup>−m</sup> · ℓ<sup>(2)</sup>
+  </div>
+  <p>意思是：发现一个新的更大的最大值 m 时，把之前累计的 ℓ 用一个修正因子 <code>e<sup>m_old − m_new</sup></code> rescale 一下，再加上新块的贡献。这就是 <strong>online softmax</strong>（最早来自 Milakov & Gimelshein 2018）。</p>
+
+  <h3>把这个思想推广到 Attention 的输出 O</h3>
+  <p>不仅 softmax 的归一化因子可以"边算边合并"，最终的输出 O = P·V 也可以。FlashAttention 在 SRAM 里维护三个东西：</p>
+  <ul>
+    <li><code>O<sub>i</sub></code>：当前累计的输出（每行 d 维）</li>
+    <li><code>m<sub>i</sub></code>：当前行已见过的最大值</li>
+    <li><code>ℓ<sub>i</sub></code>：当前行已累计的归一化分母</li>
+  </ul>
+  <p>每当处理新的一块 K<sub>j</sub>, V<sub>j</sub> 时，就更新这三个量。</p>
+
+  <h3>算法 1（简化版伪代码）</h3>
+  <pre>输入：Q, K, V 在 HBM 中，SRAM 大小 M
+块大小：B_c = M/(4d),  B_r = min(M/(4d), d)
+把 Q 切成 T_r 块，把 K、V 各切成 T_c 块
+在 HBM 初始化 O=0, ℓ=0, m=-∞
+
+for j = 1..T_c:                       # 外层：遍历 K, V 的块
+    把 K_j, V_j 从 HBM 加载到 SRAM
+    for i = 1..T_r:                   # 内层：遍历 Q 的块
+        把 Q_i, O_i, ℓ_i, m_i 加载到 SRAM
+        S_ij = Q_i · K_j^T            # 一小块 attention score (B_r × B_c)
+        m̃_ij = rowmax(S_ij)
+        P̃_ij = exp(S_ij − m̃_ij)
+        ℓ̃_ij = rowsum(P̃_ij)
+
+        # 用 online softmax 公式合并新旧统计量
+        m_new = max(m_i, m̃_ij)
+        ℓ_new = e^(m_i − m_new) · ℓ_i + e^(m̃_ij − m_new) · ℓ̃_ij
+
+        # 更新输出（也要 rescale 旧的 O_i）
+        O_i = diag(ℓ_new)^(-1) · (
+                diag(ℓ_i) · e^(m_i − m_new) · O_i
+                + e^(m̃_ij − m_new) · P̃_ij · V_j
+              )
+        把 O_i, ℓ_new, m_new 写回 HBM
+return O</pre>
+  <p class="tip">💡 直觉解读：外层循环遍历 K、V 的块（"对每一段 key 都看一次所有 query"）。每次见到新的 key 块时，更新所有受影响行的局部 max、局部分母 ℓ，并把之前累计的 O 用修正因子缩放后加上新贡献。整个过程 <strong>从来没有把 N×N 的 S 或 P 完整写到 HBM</strong>，只有 O（N×d）、ℓ（N）、m（N）这些"瘦"的东西在 HBM 来回搬。</p>
+
+  <h2>技巧 2：Backward 的 Recomputation</h2>
+  <p>反向传播需要 S 和 P 才能算梯度。直接存这两个矩阵会变回 O(N²) 显存，这就违背初衷了。</p>
+  <p>FlashAttention 的做法：<strong>只保存 O 和归一化统计量 (m, ℓ)（都是 O(N) 大小），反向时按需重新计算 S 和 P。</strong>由于重算的过程也是 tile-based 的，全程都在 SRAM 里，速度反而比从 HBM 读巨大的 P 还要快。</p>
+  <p class="tip">💡 这其实是"<strong>选择性 gradient checkpointing</strong>"的思想：用一点点额外的 FLOPs（重算）换大量的 HBM 读写减少。常规 gradient checkpointing 是省显存但变慢；FlashAttention 的 recomputation 是<strong>既省显存又变快</strong>，因为瓶颈本来就在 IO。</p>
+
+  <h2>IO 复杂度分析（理论亮点）</h2>
+  <table>
+    <thead><tr><th>实现</th><th>HBM 访问次数</th><th>额外显存</th></tr></thead>
+    <tbody>
+      <tr><td>标准 attention</td><td>Θ(Nd + N²)</td><td>O(N²)</td></tr>
+      <tr><td>FlashAttention</td><td>Θ(N² d² / M)</td><td>O(N)</td></tr>
+    </tbody>
+  </table>
+  <p>典型 d=64–128，M ≈ 100 KB，所以 d² / M 远小于 1，等于说 FlashAttention 的 HBM 访问比标准实现少了好多倍（论文实测最多 9×）。论文还证明了这是 <strong>渐进意义上最优的</strong>：在某个 M 范围内，没有任何精确 attention 算法能进一步降低 HBM 访问数量。</p>
+
+  <h2>Block-Sparse FlashAttention（顺带的扩展）</h2>
+  <p>把 FlashAttention 和 <strong>分块稀疏 mask</strong> 结合：mask 为 0 的块直接跳过不算。如果稀疏率是 s，HBM 访问大约下降到原来的 s 倍。论文用这个跑通了 64K 序列长度。</p>
+
+  <h2>实验结果亮点</h2>
+  <h3>训练速度</h3>
+  <ul>
+    <li><strong>BERT-large</strong>：比 MLPerf 1.1 训练记录快 15%。</li>
+    <li><strong>GPT-2 small/medium</strong>：相比 HuggingFace 实现快 <strong>3×</strong>，相比 Megatron-LM 快 1.7×。</li>
+    <li><strong>Long-Range Arena</strong>：比 vanilla Transformer 快 2.4×。</li>
+  </ul>
+
+  <h3>长序列能力</h3>
+  <ul>
+    <li>GPT-2 上下文从 1K 扩到 4K，速度仍比 Megatron 1K 上下文快 30%，困惑度（PPL）还更好 0.7 个点。</li>
+    <li><strong>首次让 Transformer 在 Path-X（序列长 16K）上做到非随机性能</strong>（61.4% 准确率），block-sparse 版本进一步攻克 Path-256（64K）。</li>
+  </ul>
+
+  <h3>注意力本身的 benchmark</h3>
+  <ul>
+    <li>Forward + Backward 比 PyTorch 快最多 <strong>3×</strong>。</li>
+    <li>显存占用最多省 <strong>20×</strong>，且随 N 线性增长（不是 N²）。</li>
+  </ul>
+
+  <h2>实战中怎么用 FlashAttention</h2>
+  <p>对于普通用户，不需要写 CUDA。下列方式都自动用到了 FlashAttention（或它的后续版本）：</p>
+  <pre>import torch.nn.functional as F
+
+# PyTorch 2.0+ 自动选择 FlashAttention 实现
+out = F.scaled_dot_product_attention(q, k, v, is_causal=True)</pre>
+  <ul>
+    <li><strong>PyTorch ≥ 2.0</strong>：<code>F.scaled_dot_product_attention</code> 在合适条件下自动用 FlashAttention。</li>
+    <li><strong>HuggingFace Transformers</strong>：在加载模型时传 <code>attn_implementation="flash_attention_2"</code>。</li>
+    <li><strong>vLLM、TensorRT-LLM、SGLang</strong> 等推理框架默认就是 FlashAttention。</li>
+    <li><strong>独立库</strong>：<code>pip install flash-attn</code>（Tri Dao 维护的官方仓库）。</li>
+  </ul>
+  <p class="warn">⚠️ 要求：FlashAttention 对 GPU 架构有要求（一般需要 Ampere / Ada / Hopper，即 A100、RTX 30/40 系、H100），且 dtype 通常是 fp16 或 bf16。fp32 下用不上。</p>
+
+  <h2>常见疑问 Q&amp;A</h2>
+
+  <h3>Q1：FlashAttention 是近似算法吗？</h3>
+  <p><strong>不是</strong>。它是 <em>exact attention</em>，输出和标准实现完全一致（在浮点误差范围内）。它只是改变了计算顺序和内存访问模式。</p>
+
+  <h3>Q2：FLOPs 没变，为什么会更快？</h3>
+  <p>因为现代 GPU 的瓶颈是<strong>内存带宽</strong>，不是算力。FLOPs 甚至增加了一点（因为反向重算），但 HBM 读写少了很多倍，所以整体快很多。</p>
+
+  <h3>Q3：和"线性 attention"（如 Performer、Linformer）什么关系？</h3>
+  <p>线性 attention 是<strong>近似</strong>方法，把复杂度从 O(N²) 降到 O(N)，但效果会损失，而且在中等长度下经常比标准 attention 还慢（因为常数大）。FlashAttention 是<strong>精确</strong>方法，FLOPs 仍然是 O(N²)，但常数极低，wall-clock 速度反而比大多数近似方法都快，效果还完全一致。</p>
+
+  <h3>Q4：FlashAttention v1 / v2 / v3 有什么区别？</h3>
+  <p>这篇是 v1。后续：<strong>v2</strong>（2023）优化了 work partitioning，比 v1 再快 2×；<strong>v3</strong>（2024，针对 H100）利用了 Hopper 架构的异步 TMA 和 FP8，再快 1.5–2×。核心思想没变，都是 tiling + online softmax + recomputation。</p>
+
+  <h3>Q5：算法里 e<sup>m_old − m_new</sup> 这个 rescale 是什么意思？</h3>
+  <p>之前累积 ℓ 和 O 时，是基于"局部最大值 m_old"减去过的。现在出现了一个更大的 m_new，相当于所有之前的 exp 项都要乘上 <code>exp(m_old − m_new)</code> 才能跟新块的指标对齐。这个修正因子保证了无论分多少块、按什么顺序处理，最终结果和一次性算 softmax 完全一致。</p>
+
+  <h2>FlashAttention 留下的工程启示</h2>
+  <ol>
+    <li><strong>"FLOP 少 ≠ 跑得快"</strong>。在 GPU 上设计算法，必须考虑 memory hierarchy。</li>
+    <li><strong>融合 kernel（kernel fusion）的威力</strong>。把"matmul + mask + softmax + dropout + matmul"合成一个 CUDA kernel，避免中间结果落盘，这种思路可以推广到很多其他 op（layer norm + dropout + 残差等）。</li>
+    <li><strong>Recomputation 不一定慢</strong>。当瓶颈是 IO 时，"多算一点、少存一点"反而更快。</li>
+    <li><strong>新的硬件抽象层</strong>。FlashAttention 之后催生了 Triton、CUTLASS、ThunderKittens 等让用户更容易写 IO-aware kernel 的工具。</li>
+  </ol>
+
+  <h2>延伸阅读</h2>
+  <ul>
+    <li><a href="https://arxiv.org/abs/2307.08691">FlashAttention-2 (Tri Dao, 2023)</a></li>
+    <li><a href="https://arxiv.org/abs/2407.08608">FlashAttention-3 (Hopper, 2024)</a></li>
+    <li><a href="https://arxiv.org/abs/1805.02867">Online normalizer calculation for softmax (Milakov &amp; Gimelshein, 2018)</a> — online softmax 的原始来源</li>
+    <li><a href="https://github.com/Dao-AILab/flash-attention">官方代码仓库</a></li>
+  </ul>
+
+  <p class="small">本解读为帮助初学者入门而作，重点放在直觉和算法核心，省略了部分证明细节。若需深入研究，请参考论文附录 B（反向传播完整推导）和附录 C（IO 复杂度证明）。</p>
+</article>
+</main>
+</body>
+</html>

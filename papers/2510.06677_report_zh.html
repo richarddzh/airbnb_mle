@@ -47,6 +47,80 @@
   <p>系统在每次出现新消息、电话摘要或上下文变化时触发。LLM 根据任务指令、case 元数据、客户/坐席信息、完整交互历史，以及此前已经生成并被接受的 bullets，判断是否有新信息。如果有，就生成新的 bullet；如果没有，就返回空结果。</p>
   <p>关键点在于：每轮提示都会带上以前的 bullets，且包含坐席编辑后的版本。这避免了“重新总结全历史”覆盖掉人工修正的问题，也让坐席 edits 立即影响后续摘要。</p>
 
+  <h4>触发时机（Figure 2）</h4>
+  <p>系统是<strong>事件驱动</strong>，触发条件是"对话流上出现新内容"，具体三类输入：</p>
+  <table>
+    <thead><tr><th>触发源</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Chat Message</td><td>客户或坐席发送一条新聊天消息。</td></tr>
+      <tr><td>Phone Summary</td><td>一通电话结束后生成的通话摘要。</td></tr>
+      <tr><td>Contextual Data 更新</td><td>case 元数据、客户/坐席档案变化。</td></tr>
+    </tbody>
+  </table>
+  <p>也就是说，<strong>只要对话流上有新增内容，就触发一次 LLM 调用</strong>，不是按固定时间间隔，也不是按 token 数切块。</p>
+
+  <h4>LLM 何时生成 vs 不生成</h4>
+  <p>LLM 自己判断"是否有新信息"：有则输出一条或多条新 bullet；没有（例如客户只回"thank you"）则输出特殊标记 <code>&lt;EMPTY&gt;</code>，前端跳过本轮更新。</p>
+  <p>⚠️ 关键：<strong>LLM 只 append 新 bullet，不会修改已有 bullet</strong>。已有 bullet 的修改只通过坐席手动 edit 实现，编辑后的版本会替换原 bullet 回填到下一次 prompt 的前缀里。新 bullet 之后还要经过 DeBERTa bullet classifier 二次过滤（只保留五类高价值 utterance），不合格则 discard。整个流程：</p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.9rem;">新输入 → LLM "有新信息?" → (是) 生成 bullet → DeBERTa "有意义?"
+                                            → (是) 显示给坐席 → 坐席可编辑
+        ↓ (否)                              ↓ (否)
+      &lt;EMPTY&gt;                            Discard</pre>
+
+  <h4>Prompt 结构（附录 C.1 / C.2）</h4>
+  <p>采用 <strong>prefix prompting + in-context continuation</strong> 技巧：把"已生成并被坐席确认/编辑过的 bullets"放在 <code>[/INST]</code> <strong>之后</strong>，作为模型回复的前缀，让模型从这里<strong>继续生成</strong>——所以模型只会写新的增量 bullet，而不会重写历史。</p>
+
+  <p><strong>第一轮（还没有历史 bullet）：</strong></p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.88rem;">&lt;s&gt;[INST] Summarize the following case conversations
+Guest Name: Tom
+Agent Name: Jack
+guest(messaging): i want to refund, i cannot find the host. [/INST]</pre>
+  <p>Output：<code>Guest Tom expressed his desire to request a refund but mentioned he cannot find the host</code></p>
+
+  <p><strong>第二轮（带历史 bullet 作为前缀）：</strong></p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.88rem;">&lt;s&gt;[INST] Summarize the following case conversations
+Guest Name: Tom
+Agent Name: Jack
+guest(messaging): i want to refund, i cannot find the host.
+agent(messaging): i'll help you find the host. [/INST]
+Guest Tom expressed his desire to request a refund but mentioned he cannot find the host.</pre>
+  <p>Output：<code>Agent Jack offered to help Tom find the host.</code>（只生成新 bullet，旧 bullet 不重复）</p>
+
+  <p><strong>第三轮（无新信息）：</strong>对话只多了一句 <code>guest: thank you</code>，Output：<code>&lt;EMPTY&gt;</code>。</p>
+
+  <p><strong>体现坐席编辑（C.2）：</strong>假设坐席把第一条 bullet 改成 <code>Guest Tom <strong>wanted to</strong> refund but he cannot find the host</code>，那第二轮 prompt 里前缀就用坐席编辑后的版本：</p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.88rem;">... [/INST]
+Guest Tom wanted to refund but he cannot find the host</pre>
+  <p>这样坐席的修正在后续所有轮次中<strong>持久生效</strong>，模型不会再覆盖它。</p>
+
+  <p><strong>Prompt 各部分组成（Section 3.1.1）：</strong></p>
+  <table>
+    <thead><tr><th>部分</th><th>内容</th></tr></thead>
+    <tbody>
+      <tr><td>任务指令</td><td><code>Summarize the following case conversations</code></td></tr>
+      <tr><td>Contextual Data</td><td>Guest Name / Agent Name / case 元数据 / 用户档案</td></tr>
+      <tr><td>Full Interaction History</td><td>全量 chat / 通话摘要 / 邮件，带 <code>guest(messaging)</code> / <code>agent(messaging)</code> 等角色与渠道标签</td></tr>
+      <tr><td>Previous Bullets（前缀）</td><td>放在 <code>[/INST]</code> 之后，<strong>用 agent-edited 后的版本</strong></td></tr>
+    </tbody>
+  </table>
+
+  <h4>Response 解析</h4>
+  <table>
+    <thead><tr><th>输出</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td><code>&lt;EMPTY&gt;</code></td><td>Skip update，不动 UI。</td></tr>
+      <tr><td>一段文本（一条或多条新 bullet）</td><td>1. 交给 DeBERTa 分类器二分类（保留 / 过滤）；2. 通过的 bullet 追加显示到坐席 UI；3. 记录 before-edit 原文，等待坐席可能的 edit；4. 若坐席编辑，保存 after-edit，立即替换下一轮 prompt 前缀里对应的 bullet，离线进入 (before, after) preference pair 池。</td></tr>
+    </tbody>
+  </table>
+
+  <h4>为什么这样设计</h4>
+  <ul>
+    <li><strong>Prefix prompting 而非"重新总结全历史"：</strong>保留坐席 edits，不被覆盖（论文 3.1.1 明确强调）。</li>
+    <li><strong><code>&lt;EMPTY&gt;</code> 信号：</strong>让 LLM 自己识别"没新信息"，避免硬塞冗余 bullet，比 chunk-based 切块方法干净。</li>
+    <li><strong>生成 + 过滤双模块：</strong>LLM 倾向于"宁多写"，分类器负责"砍冗余"，两个模块目标解耦。</li>
+    <li><strong>In-flight 增量：</strong>每条新消息只增量 prompt 一次，配合 KV cache 复用，延迟才能压到 p50 600ms。</li>
+  </ul>
+
   <h3>2. Bullet Relevance Classifier</h3>
   <p>为了减少废话和冗余，作者训练了一个 DeBERTa-based classifier，用来过滤普通寒暄、重复陈述、无关更新。生产中保留五类高价值 utterance：</p>
   <table>
@@ -61,6 +135,94 @@
   </table>
   <p>分类器总体表现：ROC AUC 0.96、macro F1 0.801、micro F1 0.845；作为二分类器用于保留/过滤时，F1 为 0.895。附录说明训练数据来自 70,000 条生产 LLM summary bullets，并由多个 LLM 进行多数投票标注。</p>
 
+  <h4>DeBERTa 是什么？是 BERT 吗？</h4>
+  <p>DeBERTa = <strong>De</strong>coding-enhanced <strong>BERT</strong> with <strong>D</strong>isentangled <strong>A</strong>ttention，微软 2020 年提出（He et al., ICLR 2021），是 BERT/RoBERTa 的升级版。论文用的是 DeBERTa v3。关键改进相对于原版 BERT：</p>
+  <table>
+    <thead><tr><th>改进</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Disentangled Attention</td><td>把 token 的"内容向量"和"相对位置向量"拆开做 attention（原 BERT 是绝对位置加在 embedding 上）。</td></tr>
+      <tr><td>Enhanced Mask Decoder</td><td>MLM 预测时再注入绝对位置信息，弥补相对位置的不足。</td></tr>
+      <tr><td>v3 引入 ELECTRA 式 RTD 预训练</td><td>Replaced Token Detection，比 MLM 训练效率更高。</td></tr>
+    </tbody>
+  </table>
+  <p>效果：在 GLUE / SuperGLUE 上，DeBERTa-large 用更少参数就超过了 BERT-large、RoBERTa-large。</p>
+
+  <h4>规模</h4>
+  <p>论文没明确说用的是哪个 size，但根据"工业生产级、A10G 单卡部署、p50 20ms / p95 40ms"反推，几乎可以确定是 <strong>DeBERTa-v3-base（约 86M）</strong>或 <strong>DeBERTa-v3-large（约 304M）</strong>。</p>
+  <table>
+    <thead><tr><th>模型</th><th>参数量</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>DeBERTa-v3-xsmall</td><td>22M</td><td>太小，工业一般不用</td></tr>
+      <tr><td>DeBERTa-v3-small</td><td>44M</td><td></td></tr>
+      <tr><td><strong>DeBERTa-v3-base</strong></td><td>86M backbone</td><td>最常见生产选择</td></tr>
+      <tr><td><strong>DeBERTa-v3-large</strong></td><td>304M backbone</td><td>精度更高，A10G 也跑得动</td></tr>
+    </tbody>
+  </table>
+  <p>对比 LLM 几十 B 参数，分类器只有几百 M，所以才能在 A10G 上 20ms 出结果——<strong>这正是"用小模型干小事"的工程哲学</strong>。</p>
+
+  <h4>是否需要预训练？</h4>
+  <p>论文确实重新做了一次<strong>领域自适应预训练（domain-adaptive pretraining, DAPT）</strong>，不是直接 fine-tune 公开 checkpoint：</p>
+  <blockquote style="border-left:4px solid #ccc; padding-left:12px; color:#555; margin:8px 0;">"The DeBERTa classifier was <strong>first pre-trained with 500G domain specific corpus mixed with CCNet dataset</strong>, then fine-tuned on 70,000 bullets…"</blockquote>
+  <p>完整流程：</p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.9rem;">公开 DeBERTa-v3 权重
+   ↓ 用 500GB 客服领域语料 + CCNet 混合数据继续预训练（MLM/RTD 自监督）
+领域自适应后的 DeBERTa
+   ↓ 用 70k 标注数据 fine-tune（带 prediction head）
+Bullet Classifier</pre>
+  <p><strong>为什么要 DAPT？</strong></p>
+  <ul>
+    <li>客服对话用语和通用网页语料分布差异大（缩写、产品术语、内部代号、口语化表达）。</li>
+    <li>500GB 领域语料数据规模够，再做一遍预训练能显著提升下游分类精度。</li>
+    <li>混入 CCNet 是为了保留通用语言能力，防止灾难性遗忘（Catastrophic Forgetting）。</li>
+  </ul>
+  <p>如果不在意最后 1–2% 精度，直接 fine-tune 公开 DeBERTa-v3 也能跑——但作者在 production 环境为了拿到 macro F1 0.801、二分类 F1 0.895，多做了一步 DAPT。</p>
+
+  <h4>Fine-tuning 数据规模</h4>
+  <table>
+    <thead><tr><th>项目</th><th>数值</th></tr></thead>
+    <tbody>
+      <tr><td>数据量</td><td><strong>70,000 条 bullets</strong>（来自生产 LLM summary log）</td></tr>
+      <tr><td>标注方式</td><td><strong>LLM ensemble + majority vote</strong>（Qwen-2.5、QwQ-32B 等多个 LLM 投票），按类别定义指导</td></tr>
+      <tr><td>划分</td><td>80 : 10 : 10 = train : val : test</td></tr>
+      <tr><td>损失函数</td><td>标准 cross-entropy</td></tr>
+      <tr><td>类别数</td><td>6 类（5 个高价值类 + <code>other</code>）</td></tr>
+    </tbody>
+  </table>
+  <p>⚠️ "<strong>LLM 标注 + 多数投票</strong>"是个非常实用的工业 trick：7 万条人工标注成本太高（按 $0.5/条 也要 $35k+，还慢）；多 LLM 投票可以缓解单模型偏差，质量虽不如专家审计但成本低 10–100 倍。</p>
+
+  <h4>需要 prediction head 吗？</h4>
+  <p><strong>需要</strong>。这是 BERT 类模型做下游分类的标准做法：</p>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.9rem;">输入：[CLS] bullet text [SEP]
+   ↓
+DeBERTa Encoder（86M / 304M）
+   ↓
+取 [CLS] token 的最终隐藏向量 h_cls ∈ R^d  (d=768 或 1024)
+   ↓
+Prediction Head：Linear(d → 6) + Softmax       ← 新加的，从随机初始化
+   ↓
+6 个类别概率
+   ↓
+推理时：保留五类 → 通过；判为 other → discard（二分类视角 F1 = 0.895）</pre>
+  <ul>
+    <li>Hugging Face 里就是 <code>DebertaV2ForSequenceClassification</code>，它在 backbone 上自动接一个 <code>nn.Linear(hidden_size, num_labels)</code>（有些实现中间还会加 pooler / dropout）。</li>
+    <li>Head 从零训练，backbone 参数一起 fine-tune（通常全参数微调，70k 条数据 + 几百 M 参数单 GPU 几小时跑完）。</li>
+    <li>部署时整个模型（backbone + head）转成 ONNX 或 TensorRT engine，A10G 单卡 p50 20ms。</li>
+  </ul>
+
+  <h4>LLM vs Classifier 心智模型</h4>
+  <table>
+    <thead><tr><th>维度</th><th>LLM 生成（Mixtral-8x7B）</th><th>分类器（DeBERTa）</th></tr></thead>
+    <tbody>
+      <tr><td>任务</td><td>生成新 bullet</td><td>判断 bullet 是否有价值（5 类 + other）</td></tr>
+      <tr><td>参数</td><td>45B（13B 激活）</td><td>几百 M</td></tr>
+      <tr><td>硬件</td><td>2× A100</td><td>1× A10G</td></tr>
+      <tr><td>延迟</td><td>p50 600ms / p95 2s</td><td>p50 20ms / p95 40ms</td></tr>
+      <tr><td>训练</td><td>SFT + ORPO</td><td>DAPT + 监督 fine-tune</td></tr>
+      <tr><td>标注</td><td>坐席 edits（8k pairs）</td><td>LLM ensemble 投票（70k）</td></tr>
+      <tr><td>角色</td><td>"宁多写"</td><td>"砍冗余"</td></tr>
+    </tbody>
+  </table>
+
   <h3>3. Agent Edits Learning Framework</h3>
   <p>坐席编辑是系统闭环的核心，分为在线和离线两条路径：</p>
   <ol>
@@ -70,17 +232,39 @@
 
   <h2>评估指标</h2>
   <table>
-    <thead><tr><th>类型</th><th>指标</th><th>说明</th></tr></thead>
+    <thead><tr><th>类型</th><th>指标</th><th>说明</th><th>数值类型</th><th>取值范围</th><th>优化方向</th></tr></thead>
     <tbody>
-      <tr><td>离线质量</td><td>Conciseness</td><td>摘要 token 相对原始对话的压缩比例。</td></tr>
-      <tr><td>离线质量</td><td>Completeness</td><td>是否覆盖客户问题、坐席承诺、坐席解决方案等关键元素。</td></tr>
-      <tr><td>离线质量</td><td>Truthfulness</td><td>摘要是否忠实于原对话，包括客户问题、坐席承诺和其他动作。</td></tr>
-      <tr><td>在线业务</td><td>Agent Satisfaction</td><td>上线后坐席五级 Likert 问卷。</td></tr>
-      <tr><td>在线业务</td><td>Agent Working Time</td><td>case handling 总时长。</td></tr>
-      <tr><td>在线业务</td><td>Customer NPS</td><td>上线后客户满意度是否受到负面影响。</td></tr>
+      <tr><td>离线质量</td><td>Conciseness</td><td>压缩比 = 1 − T<sub>output</sub>/T<sub>input</sub>。</td><td>连续比例</td><td>[0, 1]</td><td>极大化</td></tr>
+      <tr><td>离线质量</td><td>Completeness</td><td>是否覆盖客户问题、坐席承诺、坐席解决方案；3 个 yes/no 子项取均值。</td><td>二分类均值</td><td>[0, 1]</td><td>极大化</td></tr>
+      <tr><td>离线质量</td><td>Truthfulness</td><td>客户问题、坐席承诺、其他动作的事实准确性；3 个 yes/no 子项取均值。</td><td>二分类均值</td><td>[0, 1]</td><td>极大化</td></tr>
+      <tr><td>在线业务</td><td>Agent Satisfaction</td><td>上线后坐席五级 Likert 问卷（"非常不满意"~"非常满意"），通常报告 % 满意+非常满意。</td><td>Likert / 百分比</td><td>1–5 或 [0%, 100%]</td><td>极大化</td></tr>
+      <tr><td>在线业务</td><td>Agent Working Time</td><td>从首次客户交互到 case 解决的处理总时长。</td><td>连续（分钟）</td><td>[0, +∞)</td><td><strong>极小化</strong></td></tr>
+      <tr><td>在线业务</td><td>Customer NPS</td><td>case 解决后 14 天问卷的净推荐值，详见下方说明。</td><td>百分点差值</td><td>[−100, +100]</td><td>极大化（论文仅作"无负向影响"护栏）</td></tr>
     </tbody>
   </table>
+
+  <h3>Customer NPS（Net Promoter Score）</h3>
+  <p>NPS 是衡量客户忠诚度和推荐意愿的标准指标，论文附录 I 定义：</p>
+  <p style="text-align:center; font-size:1.05rem;"><code>NPS = %Promoters − %Detractors</code></p>
+  <p>客户在 case 解决后 14 天内收到一份 0–10 分的问卷"你有多大可能向他人推荐这家公司？"，按打分分为三类：</p>
+  <ul>
+    <li><strong>Promoters（9–10 分）：</strong>忠诚推荐者，可能主动推荐公司。</li>
+    <li><strong>Passives（7–8 分）：</strong>满意但不会主动推荐，也不会主动黑公司。</li>
+    <li><strong>Detractors（0–6 分）：</strong>不满，可能带来负面口碑。</li>
+  </ul>
+  <p>NPS 的取值范围是 −100 到 +100。论文中 NPS 主要作为<strong>护栏指标</strong>使用——上线增量摘要功能后 NPS 在各语言均"保持中性"，即没有观察到对客户满意度的负面影响（不要求显著上升）。</p>
+
+  <h3>LLM Judge vs 人工标注</h3>
   <p>论文比较 GPT-4o LLM judge 与人工标注者，发现 LLM judge 在多个二分类 rubric 上更接近专家审计 gold label，并且吞吐约为人工的 15 倍。因此主评估主要使用 LLM-judge，BERTScore 只作为补充参考。</p>
+
+  <h3>多目标训练如何处理</h3>
+  <p>Completeness、Truthfulness、Conciseness 三个目标常常互相冲突（越完整往往越长，越压缩可能损失事实）。论文没有显式写加权 loss，而是用<strong>模块解耦 + 偏好学习</strong>间接处理：</p>
+  <ol>
+    <li><strong>任务拆分：</strong>"完整 + 真实"交给 LLM 生成（SFT 用标准交叉熵学高质量 chosen 目标），"简洁"交给 DeBERTa bullet classifier 过滤——两个目标解耦在不同模块，避免单一 loss 互相拉扯。</li>
+    <li><strong>偏好对齐（ORPO/DPO）：</strong>从坐席编辑里抽取 <code>(prompt, chosen=after-edit, rejected=before-edit)</code> pair。"chosen"本身已经被人工同时按完整、真实、简洁三个标准修正过，因此多目标偏好被<strong>隐式编码到 chosen vs rejected 的对比里</strong>，模型通过偏好损失学到综合权衡。</li>
+    <li><strong>训练数据质量门：</strong>并非所有 agent edit 都进入训练集——用 LLM 评估 + 抽样人审检查 correctness/completeness，必要时用 strong LLM 重写，<strong>只保留确实改进的 pair</strong>，相当于"按多目标筛过的样本"。</li>
+    <li><strong>训练流程：</strong>Mixtral-Base → Mixtral-NF（30k 样本，1 轮 SFT + 1 轮 ORPO）→ Mixtral-FB（8k 反馈样本，1 轮 ORPO）。</li>
+  </ol>
 
   <h2>离线实验</h2>
   <h3>模型迭代收益</h3>
@@ -126,11 +310,186 @@
     </tbody>
   </table>
 
+  <h2>为什么选择私有化部署 Mixtral，而不是直接调 GPT-4o / Gemini / Claude？</h2>
+  <p>论文附录 B（Table 7）给出明确对比，基准为 1 QPS、4k 输入 token、512 输出 token：</p>
+  <table>
+    <thead><tr><th>模型</th><th>规模</th><th>年成本</th><th>p95 延迟</th></tr></thead>
+    <tbody>
+      <tr><td>GPT-4o</td><td>&gt;100B</td><td>$475k/年</td><td>4s</td></tr>
+      <tr><td>Gemini</td><td>&gt;100B</td><td>$475k/年</td><td>17s</td></tr>
+      <tr><td>Claude</td><td>&gt;100B</td><td>$618k/年</td><td>4s</td></tr>
+      <tr><td><strong>Mixtral-8x7B（自部署）</strong></td><td>45B</td><td><strong>$100k/年</strong></td><td>5s</td></tr>
+    </tbody>
+  </table>
+  <p>结合论文 5.2.1 和 6.1 节，作者把这个选择归纳为五个核心原因：</p>
+  <ol>
+    <li><strong>数据隐私 / 合规（最关键）：</strong>客服对话包含大量 PII——客户姓名、邮箱、电话、住址、订单金额、退款、投诉、安全事件等。调第三方 LLM API 意味着数据离开 Airbnb 内网，触发 GDPR / CCPA、跨境数据传输、第三方 DPA 审计等合规风险。自部署 Mixtral 让所有数据停留在 Airbnb 自己的 VPC 内，从根本上规避这些问题。</li>
+    <li><strong>成本结构差 4–6 倍：</strong>闭源 API 按 token 计费，在客服 24×7 高 QPS、长 prompt（4k token）场景下成本线性爆炸；自部署是固定 GPU 成本（2× A100），QPS 上升边际成本几乎为零。年节省 $375k–$518k，而处理时长降低带来的多百万美元收益只有在 LLM 成本可控时才成立。</li>
+    <li><strong>可微调，可吸收 agent 反馈（方法论核心）：</strong>Mixtral 开源权重支持 SFT + ORPO，能把坐席 before/after edit 转成训练信号；GPT-4o / Claude 只能做 prompt engineering 或有限的厂商 fine-tune API，<strong>无法做 ORPO/DPO 这类基于偏好对的训练</strong>，agent feedback loop 闭合不了。结果 Mixtral-FB（0.885）反超 GPT-4o（0.876），证明"微调过的 45B 自部署模型 &gt; 通用 100B+ 闭源模型"在垂直任务上完全成立。</li>
+    <li><strong>延迟可控：</strong>自部署 + TensorRT-LLM + BF16 + 2× A100 可把 p50 压到 600ms、p95 压到 2s。Gemini p95 17s 在"边对话边出 bullet"的实时场景根本不可用；第三方 API 还会受公网抖动、限流、厂商侧故障影响，不可控因素多。</li>
+    <li><strong>任务复杂度不需要 100B+ 模型：</strong>GPT-4o 只在 completeness 上略胜，但 conciseness 反而更差，整体没有压倒性优势。客服摘要是受约束、可结构化、领域窄的任务，45B MoE 经过领域微调后已经够用——为这种任务调用 100B+ 通用模型属于"杀鸡用牛刀"。</li>
+  </ol>
+  <p class="takeaway">一句话总结：Airbnb 选 Mixtral 不是因为它更聪明，而是因为这是<strong>隐私合规 + 成本可控 + 可微调 + 延迟可控</strong>四者唯一同时成立的方案，而在垂直微调后效果还能反超闭源大模型。这是当前工业界"自部署开源 MoE + 业务反馈微调"路线的典型代表案例。</p>
+
+  <h2>关于 TensorRT-LLM</h2>
+  <p><strong>TensorRT-LLM</strong> 是 NVIDIA 推出的开源 LLM 推理优化库，基于底层推理引擎 TensorRT 构建，专门用于在 NVIDIA GPU（A100 / H100 / L40S 等）上把 LLM 推理性能压到极致。论文中作者把推理框架从 vLLM 切到 TensorRT-LLM 后，p50 / p90 延迟降低约 20%。</p>
+  <h3>关键优化技术</h3>
+  <ul>
+    <li><strong>Kernel 融合 + 算子优化：</strong>把 attention、LayerNorm、GEMM 等手写成高度优化的 CUDA kernel（如 FlashAttention、fused MLP）。</li>
+    <li><strong>In-flight / Continuous batching：</strong>不同 request 的 prefill 和 decode 阶段可以混在同一个 batch 里执行，相对静态 batching 显著提升吞吐。</li>
+    <li><strong>Paged KV Cache：</strong>类似 vLLM 的 PagedAttention，避免长序列 KV cache 的内存碎片。</li>
+    <li><strong>量化支持：</strong>INT8（SmoothQuant）、INT4（AWQ、GPTQ）、FP8（H100 原生）。论文里 8-bit 量化可把 GPU 从 2 张 A100 降到 1 张，延迟相近但 completeness/truthfulness 下降约 1%，作为效率 fallback。</li>
+    <li><strong>并行策略：</strong>原生支持 Tensor Parallel、Pipeline Parallel、Expert Parallel（对 MoE 友好）。</li>
+    <li><strong>MoE 专门优化：</strong>对 Mixtral / DeepSeek 等 SMoE 模型有专门的 expert routing kernel，正好对应论文场景。</li>
+  </ul>
+  <h3>与同类方案对比</h3>
+  <table>
+    <thead><tr><th>框架</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><strong>TensorRT-LLM</strong></td><td>NVIDIA 官方栈，单 GPU/单机吞吐和延迟通常最强，但编译期长、只支持 NVIDIA 卡。</td></tr>
+      <tr><td>vLLM</td><td>易用性最好，PagedAttention 首创者，跨硬件更友好。</td></tr>
+      <tr><td>SGLang</td><td>调度和结构化输出更强。</td></tr>
+      <tr><td>Hugging Face TGI</td><td>部署集成简单。</td></tr>
+    </tbody>
+  </table>
+  <p>典型升级路径：<strong>vLLM 用于快速验证 → TensorRT-LLM 用于生产期榨性能</strong>，论文的演进路线正是如此。最终部署栈：BF16 + TensorRT-LLM + Triton Inference Server + 2× A100，p50 600ms / p95 2s。</p>
+
+  <h2>训练方法学：DAPT / SFT / DPO / ORPO 详解</h2>
+  <p>论文覆盖了完整的"预训练 → 监督微调 → 偏好对齐"链路。下面按"先 BERT 类小模型用 → 再 LLM 用"的顺序介绍四种方法。</p>
+
+  <h3>1. DAPT —— Domain-Adaptive Pre-Training（领域自适应预训练）</h3>
+  <p><strong>用在哪：</strong>DeBERTa bullet classifier。<br>
+  <strong>缩写来源：</strong>Gururangan et al., ACL 2020 "Don't Stop Pretraining: Adapt Language Models to Domains and Tasks"。同篇论文还提出配套概念 TAPT (Task-Adaptive Pre-Training)。</p>
+  <p><strong>是什么：</strong>在公开预训练模型基础上，<strong>继续用领域语料做一次自监督预训练</strong>（任务和原始预训练一致，如 MLM 或 RTD），再去做下游 fine-tune。</p>
+  <p><strong>训练目标（以 MLM 为例）：</strong>随机 mask 15% token，让模型预测被 mask 的词：</p>
+  <pre style="background:#f3f4f6; padding:10px; border-radius:6px; font-size:0.9rem;">L_MLM = -Σ log P(x_i | x_{\i})    （只在 masked 位置计算）</pre>
+  <p>DeBERTa-v3 用的是 ELECTRA-style <strong>RTD（Replaced Token Detection）</strong>：判别每个 token 是不是被另一个生成器替换过的，比 MLM 训练效率高。</p>
+  <p><strong>数据：</strong>无监督，不需要标签。论文用 500GB 客服领域语料 + CCNet 通用语料混合，混入通用语料是为了防止<strong>灾难性遗忘</strong>。</p>
+
+  <h4>DAPT vs 普通预训练</h4>
+  <p>任务和损失函数完全一样，差别在于起点、数据、规模、目标：</p>
+  <table>
+    <thead><tr><th>维度</th><th>普通预训练</th><th>DAPT</th></tr></thead>
+    <tbody>
+      <tr><td>起点权重</td><td>随机初始化</td><td>已有公开预训练模型（如 DeBERTa-v3）</td></tr>
+      <tr><td>数据来源</td><td>通用大规模语料（CommonCrawl、Wikipedia、Books）</td><td>领域特定语料（客服对话、医学论文…）</td></tr>
+      <tr><td>数据规模</td><td>TB 级，几百 B~T token</td><td>GB ~ 数百 GB</td></tr>
+      <tr><td>训练时长</td><td>几周到几个月，几百~几千 GPU</td><td>几小时到几天，1~8 张卡</td></tr>
+      <tr><td>目标</td><td>学会通用语言能力</td><td>微调通用模型适应领域分布</td></tr>
+      <tr><td>是否混入通用语料</td><td>不需要</td><td>通常会混入防止灾难性遗忘</td></tr>
+      <tr><td>学习率</td><td>较大（~1e-4）</td><td>较小（~1e-5），保留已有能力</td></tr>
+    </tbody>
+  </table>
+  <p><strong>一句话：</strong>普通预训练 = 从零教模型说人话；DAPT = 教已会说人话的模型说"客服行话"。</p>
+
+  <h4>DAPT vs Task SFT</h4>
+  <p>两者经常在同一条 pipeline 里前后衔接，但目标和监督信号完全不同：</p>
+  <table>
+    <thead><tr><th>维度</th><th>DAPT</th><th>Task SFT</th></tr></thead>
+    <tbody>
+      <tr><td>是否需要标注</td><td>❌ 不需要（自监督）</td><td>✅ 需要</td></tr>
+      <tr><td>数据形式</td><td>纯文本</td><td>(input, label) 或 (prompt, target) 对</td></tr>
+      <tr><td>训练任务</td><td>MLM / RTD / Next-token</td><td>分类 / 生成 / 抽取等具体任务</td></tr>
+      <tr><td>模型结构</td><td>只有 backbone</td><td>backbone + <strong>prediction head</strong></td></tr>
+      <tr><td>数据规模</td><td>GB 级（论文 500GB）</td><td>几 k ~ 几十万样本（论文 70k / 30k）</td></tr>
+      <tr><td>学到什么</td><td>领域语言分布、术语、句式</td><td>具体任务的输入→输出映射</td></tr>
+      <tr><td>能否直接推理</td><td>❌ 只是更适合做下游任务的 backbone</td><td>✅ 这才是最终交付模型</td></tr>
+    </tbody>
+  </table>
+  <p><strong>能否互相替代？</strong>省掉 DAPT 只做 SFT ✅ 可以（绝大多数情况就这样做，下游精度低 1–3%）；省掉 SFT 只做 DAPT ❌ 不行（DAPT 后的模型不会做任何具体任务）。</p>
+
+  <h3>2. SFT —— Supervised Fine-Tuning（监督微调）</h3>
+  <p><strong>用在哪：</strong>Mixtral-Base → Mixtral-NF 的第一步（30k 样本，1 轮 SFT）。</p>
+  <p><strong>是什么：</strong>最经典的做法，给定 (prompt, target) 对，让模型用交叉熵损失学习生成 target。对 LLM 就是逐 token 的下一词预测。</p>
+  <pre style="background:#f3f4f6; padding:10px; border-radius:6px; font-size:0.9rem;">L_SFT = -Σ_t log P_θ(y_t | x, y_{&lt;t})</pre>
+  <p><strong>数据：</strong>(prompt, chosen) 单边正样本，不需要 rejected。论文用 30k 高质量 after-edit bullet 作为 target。</p>
+  <p><strong>优缺点：</strong>实现简单、训练稳定、收敛快；但只学"什么是好答案"，<strong>没学"什么是不好的答案"</strong>，容易在分布外答案上自信地胡说。</p>
+  <p><strong>一句话：</strong>SFT 是"教模型说人话"的初始化步骤。</p>
+
+  <h3>3. DPO —— Direct Preference Optimization（直接偏好优化）</h3>
+  <p><strong>用在哪：</strong>论文提及作为可选项（实际采用 ORPO）。</p>
+  <p><strong>背景：</strong>传统 RLHF 三步（SFT → 训 Reward Model → PPO 强化学习）流程复杂、训练不稳、显存吃紧。DPO（Rafailov et al., 2024）把"训 RM + 跑 PPO"两步<strong>直接合并成一个分类损失</strong>，绕过显式奖励建模和强化学习。</p>
+  <p><strong>训练目标：</strong>给定偏好对 (x, y_w, y_l)，y_w=chosen，y_l=rejected：</p>
+  <pre style="background:#f3f4f6; padding:10px; border-radius:6px; font-size:0.88rem;">L_DPO = -log σ( β·log[π_θ(y_w|x) / π_ref(y_w|x)]
+              - β·log[π_θ(y_l|x) / π_ref(y_l|x)] )</pre>
+  <ul>
+    <li>π_θ 是当前训练的模型，π_ref 是冻结的 SFT 参考模型</li>
+    <li>推高 chosen 的相对概率，压低 rejected 的相对概率</li>
+    <li>β 控制偏离参考模型的强度（KL 正则化系数）</li>
+  </ul>
+  <p><strong>优缺点：</strong>不需要训 RM、不需要采样 rollout，训练成本接近 SFT，比 PPO 稳定；但需要保留 reference model（多一份显存），需要先做 SFT 才能有可用的 reference。</p>
+  <p><strong>一句话：</strong>DPO 是"教模型分辨好和更好"，是 RLHF 的轻量替代。</p>
+
+  <h3>4. ORPO —— Odds Ratio Preference Optimization（赔率比偏好优化）</h3>
+  <p><strong>用在哪：</strong>论文实际采用——Mixtral-Base→NF 的第二轮、NF→FB 的唯一一轮都是 ORPO。</p>
+  <p><strong>是什么：</strong>ORPO（Hong et al., 2024）是 DPO 的进化版，<strong>把 SFT 和偏好学习合并成一个 loss，不需要 reference model</strong>。</p>
+  <pre style="background:#f3f4f6; padding:10px; border-radius:6px; font-size:0.88rem;">L_ORPO = L_SFT(y_w) + λ · L_OR
+
+L_OR = -log σ( log[odds_θ(y_w|x) / odds_θ(y_l|x)] )
+
+odds_θ(y|x) = P_θ(y|x) / (1 - P_θ(y|x))</pre>
+  <ul>
+    <li>前半项 = 标准 SFT loss（学好答案）</li>
+    <li>后半项 = 拉大 chosen vs rejected 的赔率比</li>
+    <li>不需要 π_ref —— 当前模型自己跟自己比</li>
+  </ul>
+  <p><strong>优缺点：</strong>不需要 reference model 省一半显存；不需要单独 SFT 阶段一步到位；多个 benchmark 上略胜 DPO。缺点是比 DPO 新、工程经验积累较少。</p>
+  <p><strong>一句话：</strong>ORPO 是"SFT + 偏好对齐 二合一"，是 2024 后开源社区的主流新选择。</p>
+
+  <h4>ORPO 是强化学习方法吗？</h4>
+  <p><strong>不是。</strong>ORPO 是<strong>纯监督学习 / 离线偏好学习</strong>方法，跟 DPO 一样属于"RL-free 偏好对齐"流派。</p>
+  <table>
+    <thead><tr><th>维度</th><th>ORPO / DPO（非 RL）</th><th>PPO / RLHF（真 RL）</th></tr></thead>
+    <tbody>
+      <tr><td>是否采样 rollout</td><td>❌</td><td>✅ 在线生成轨迹</td></tr>
+      <tr><td>是否有 reward model</td><td>❌ 直接对偏好对算 loss</td><td>✅ 显式训 RM 打分</td></tr>
+      <tr><td>是否有策略梯度 / 价值函数</td><td>❌</td><td>✅</td></tr>
+      <tr><td>训练循环</td><td>一轮前向 + 反向（像 SFT）</td><td>采样 → 打分 → 策略更新</td></tr>
+      <tr><td>数据形式</td><td>静态离线偏好对</td><td>在线轨迹 + 奖励信号</td></tr>
+    </tbody>
+  </table>
+  <p>整个过程没有任何"智能体 / 环境 / 奖励 / 探索"，所以严格意义上不算 RL。它只是借用了 RLHF 想解决的同一个问题（人类偏好对齐），但用纯监督方式绕过了 RL。社区有时把 DPO/ORPO 笼统叫"RLHF 系列"，是因为它们的目标函数可以从 KL-约束的 RL 目标推导出来（DPO 论文做了数学等价证明）——是"等价表达"，不是"在用 RL"。</p>
+
+  <h3>四者对比一览</h3>
+  <table>
+    <thead><tr><th>方法</th><th>阶段</th><th>数据形式</th><th>Loss</th><th>需要 ref model</th><th>论文里用法</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DAPT</strong></td><td>预训练延续</td><td>无标注领域语料</td><td>MLM / RTD</td><td>❌</td><td>DeBERTa 分类器，500GB 客服+CCNet</td></tr>
+      <tr><td><strong>SFT</strong></td><td>监督微调</td><td>(prompt, chosen)</td><td>Cross-entropy</td><td>❌</td><td>Mixtral-NF 第一步，30k 样本</td></tr>
+      <tr><td><strong>DPO</strong></td><td>偏好对齐</td><td>(prompt, chosen, rejected)</td><td>对比损失（log ratio）</td><td>✅</td><td>论文提及但未采用</td></tr>
+      <tr><td><strong>ORPO</strong></td><td>SFT+偏好 二合一</td><td>(prompt, chosen, rejected)</td><td>SFT + odds ratio</td><td>❌</td><td><strong>实际采用</strong>：Mixtral-NF & FB 各 1 轮</td></tr>
+    </tbody>
+  </table>
+
+  <h3>论文完整训练管线</h3>
+  <pre style="background:#f3f4f6; padding:12px; border-radius:6px; overflow-x:auto; font-size:0.9rem;">DeBERTa classifier:
+  公开 DeBERTa-v3
+    └─[DAPT, 500GB 无标注]─→ 领域 DeBERTa
+        └─[SFT 风格的监督分类微调, 70k 标注]─→ Bullet Classifier
+
+Mixtral generator:
+  公开 Mixtral-8x7B-Base
+    └─[SFT, 30k]──┐
+                  ├─→ Mixtral-NF
+    └─[ORPO, 30k]─┘
+                      └─[ORPO, 8k agent-edit pairs]─→ Mixtral-FB</pre>
+
+  <h3>选择思路总结</h3>
+  <table>
+    <thead><tr><th>你有什么数据</th><th>该用什么</th></tr></thead>
+    <tbody>
+      <tr><td>大量无标注领域文本</td><td>DAPT</td></tr>
+      <tr><td>(prompt, 单边好答案)</td><td>SFT</td></tr>
+      <tr><td>(prompt, 好答案, 坏答案)，有充足显存</td><td>DPO</td></tr>
+      <tr><td>(prompt, 好答案, 坏答案)，想省显存或不想分两步</td><td>ORPO</td></tr>
+    </tbody>
+  </table>
+
   <h2>工程经验</h2>
   <ol>
     <li><strong>服务栈选择：</strong>最终采用 BF16 + TensorRT-LLM。8-bit 量化可把 GPU 从两张 A100 降到一张，但 completeness/truthfulness 约下降 1%，因此作为效率 fallback。</li>
     <li><strong>推理框架：</strong>从 vLLM 切换到 TensorRT-LLM 后，p50 和 p90 延迟降低约 20%。</li>
-    <li><strong>基础模型选择：</strong>附录比较 GPT-4、Gemini、Claude 和 Mixtral-8x7B，Mixtral 在成本、隐私和延迟上更适合内部生产部署。</li>
+    <li><strong>基础模型选择：</strong>附录比较 GPT-4、Gemini、Claude 和 Mixtral-8x7B，Mixtral 在成本、隐私和延迟上更适合内部生产部署。Mixtral-8x7B（Mixtral of Experts, Jiang et al., 2024）本身是一个<strong>稀疏混合专家模型（Sparse Mixture of Experts, SMoE）</strong>：每层有 8 个专家 FFN，token 级路由器为每个 token 选择 Top-2 专家激活，总参数约 45B 但每个 token 只激活约 13B，因此推理成本接近 13B 模型而效果接近更大的稠密模型——这正是论文选它做生产部署的关键原因（论文 Table 7：~$100k/年、~5s 延迟，远低于 GPT-4/Gemini/Claude）。</li>
     <li><strong>微调数据规模：</strong>Mixtral-Base 到 Mixtral-NF 使用 30k 样本，1 轮 SFT + 1 轮 ORPO；Mixtral-NF 到 Mixtral-FB 使用 8k agent-edit 样本，1 轮 ORPO。</li>
     <li><strong>多语言问题：</strong>法语数词结构导致 truthfulness 挑战，西语动词变位和被动表达影响 solution capture completeness。</li>
   </ol>
