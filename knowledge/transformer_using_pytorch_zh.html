@@ -1532,6 +1532,115 @@ new_cache = (k_full, v_full)
     RoPE 通过"Q、K 旋转后内积 = 相对位置函数"工作；V 没有内积参与这个魔法，旋转它只会破坏下一层。不旋转 V 恰好保证 hidden state 的"位置中立"，每层可以从零开始用 RoPE 重新注入位置。
   </section>
 
+  <h3 id="long-context-pe">13. 1M context 的位置编码方案（PI / NTK / YaRN）</h3>
+
+  <p>直接用预训练时的 RoPE（如 LLaMA-2 训了 4K，base=10000）跑 1M token 会严重退化，原因有两点：</p>
+
+  <ol>
+    <li><strong>未见过的位置</strong>：训练时模型只见过位置 0–4K，旋转角度在某范围内；推理到 100K 时角度跑到完全没见过的区域，attention 失控。</li>
+    <li><strong>低频维度区分度不足</strong>：head_dim=64 时最低频组在 4K 内只转 31°，到了 1M 已经转 21 圈，wrap-around 失去单调性。</li>
+  </ol>
+
+  <h4>方案 1：Position Interpolation (PI) —— 最早</h4>
+
+  <p>Meta 2023。把推理位置 <code>m</code> 缩放到训练范围内：</p>
+
+  <pre><code># 训练 4K → 扩到 32K，缩放因子 s = 8
+positions = torch.arange(L_target) / s    # 把 0..32K 压缩到 0..4K
+freqs = torch.outer(positions, inv_freq)
+</code></pre>
+
+  <ul>
+    <li>✅ 实现简单，几行代码。</li>
+    <li>❌ 所有维度同等压缩，<strong>高频细节丢失严重</strong>（相邻 token 的角度差变小）。需少量长文本数据微调才能恢复性能。</li>
+  </ul>
+
+  <h4>方案 2：NTK-aware Scaling —— 不需要微调</h4>
+
+  <p>社区用户 bloc97 2023。观察到 PI 牺牲高频细节，反过来：<strong>只拉伸低频，保留高频</strong>。做法是<strong>调大 base</strong>：</p>
+
+  <pre><code># 缩放因子 s = L_target / L_train
+new_base = base * (s ** (d / (d - 2)))
+inv_freq = 1.0 / (new_base ** (torch.arange(0, d, 2) / d))
+</code></pre>
+
+  <p>直觉：调大 base 后高频维度（小 i）的 θ 基本不变，低频维度（大 i）的 θ 被拉得更小，相当于只在长距离方向上"压缩"角度。</p>
+
+  <ul>
+    <li>✅ 不微调就能扩展几倍，相邻 token 的高频信号保留好。</li>
+    <li>❌ 扩展倍数太大（10×+）效果还是会掉。</li>
+  </ul>
+
+  <h4>方案 3：YaRN（Yet another RoPE extensioN）—— 当前主流</h4>
+
+  <p>Peng et al. 2023。综合 PI + NTK 思想，按<strong>维度分段处理</strong>：</p>
+
+  <ul>
+    <li><strong>高频维度（波长 &lt; 训练长度）</strong>：基本不动 —— 训练时本来就转了很多圈，已经"见过"所有角度。</li>
+    <li><strong>低频维度（波长 &gt;&gt; 训练长度）</strong>：用 PI 风格压缩 —— 训练时只见过小角度范围，必须缩放。</li>
+    <li><strong>中间维度</strong>：用 ramp function 平滑过渡。</li>
+  </ul>
+
+  <p>YaRN 还加了 <strong>temperature 修正</strong>：拉长上下文后 attention 分布过平，YaRN 把 logits 乘 <code>1/t</code>（t&gt;1）锐化分布。</p>
+
+  <p>实际效果：4K → 128K 少量微调即可，质量很好。<strong>LLaMA-3、Qwen2、DeepSeek 都用 YaRN 或其变种</strong>。</p>
+
+  <h4>方案 4：直接用更大的 base 训练 —— 现代大模型的真做法</h4>
+
+  <p>不要等推理时再扩展，预训练时就用大 base + 长序列：</p>
+
+  <table>
+    <thead><tr><th>模型</th><th>head_dim</th><th>base</th><th>训练上下文</th></tr></thead>
+    <tbody>
+      <tr><td>LLaMA-2</td><td>128</td><td>10,000</td><td>4K</td></tr>
+      <tr><td>LLaMA-3</td><td>128</td><td><strong>500,000</strong></td><td>8K（用 YaRN 扩到 128K）</td></tr>
+      <tr><td>LLaMA-3.1</td><td>128</td><td><strong>500,000</strong></td><td>128K</td></tr>
+      <tr><td>Qwen2-72B</td><td>128</td><td><strong>1,000,000</strong></td><td>128K</td></tr>
+      <tr><td>DeepSeek-V2</td><td>128</td><td>10,000 + YaRN</td><td>128K</td></tr>
+    </tbody>
+  </table>
+
+  <p>base = 500K 时，最低频维度的周期 ≈ 320K tokens，1M 内还能保持单调（虽然只有 3 圈）。</p>
+
+  <h4>方案 5：Sliding Window Attention（架构层面）</h4>
+
+  <p>Mistral 7B / Phi：不解决 PE 问题，<strong>限制每个 token 只看最近 W 个 token</strong>（比如 W=4K）。位置永远在窗口内，RoPE 不需要扩展。</p>
+
+  <ul>
+    <li>✅ 显存和计算都是 O(N·W)，线性 scale。</li>
+    <li>❌ 硬性限制信息传播距离，对全局推理任务不友好。LLaMA 系列早就不再用 SWA。</li>
+  </ul>
+
+  <h4>方案 6：ALiBi（Attention with Linear Biases）—— 另一条路线</h4>
+
+  <p>Press et al. 2022。不在 Q、K 上动手脚，而是在 attention score 上<strong>加一个线性距离偏置</strong>：</p>
+
+  <pre><code>score[i, j] = q_i · k_j  -  λ · |i - j|</code></pre>
+
+  <p>不同 head 用不同斜率 λ。</p>
+
+  <ul>
+    <li>✅ 天然支持任意长度外推，不用任何修改。</li>
+    <li>❌ 生成质量稍逊于 RoPE，主流大模型未采用。BLOOM、MPT 用过。</li>
+  </ul>
+
+  <h4>现代 1M context 模型的实际组合拳</h4>
+
+  <p>以 Qwen2-72B-128K、LLaMA-3.1-128K、Gemini 1.5 为例，通常是：</p>
+
+  <ol>
+    <li><strong>大 base（500K~1M）的 RoPE</strong> —— 基础保证</li>
+    <li><strong>预训练用长序列</strong>（128K 甚至更长） —— 让模型见过大位置</li>
+    <li><strong>YaRN 微调</strong> —— 进一步扩展到目标长度</li>
+    <li><strong>FlashAttention</strong> —— 让 O(N²) 在 1M 下还能算得动</li>
+    <li><strong>PagedAttention + KV cache 量化</strong> —— 让 1M token cache 装得下显存</li>
+    <li><strong>GQA / MQA</strong> —— 缩小 KV cache 显存占用</li>
+  </ol>
+
+  <section class="takeaway">
+    1M context 不是单靠位置编码能解决的，需要 RoPE 改进（YaRN/大 base）+ 注意力近似（sparse/sliding window）+ 系统优化（FlashAttention/PagedAttention/GQA）的组合拳。位置编码层目前主流答案是：<strong>大 base RoPE 预训练 + YaRN 长上下文微调</strong>。
+  </section>
+
   <h2 id="mle-takeaways">MLE 需要掌握的要点</h2>
 
   <table>
