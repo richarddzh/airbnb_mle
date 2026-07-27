@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>esp32-ai 深度解读 · 在 8 美元单片机上运行 28.9M 参数 LLM</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="menu-toggle" aria-label="目录">☰ 目录</button>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><a href="index.html">← 报告合集</a></div>
+    <div class="subtitle">esp32-ai 深度解读</div>
+    <ul class="toc"></ul>
+  </aside>
+
+  <main class="content">
+    <h1>esp32-ai：在 8 美元单片机上运行 28.9M 参数 LLM</h1>
+    <p class="lead">项目地址：<a href="https://github.com/slvDev/esp32-ai/" target="_blank">github.com/slvDev/esp32-ai</a>　
+    这是一个把 <b>2890 万参数</b>的语言模型完整运行在 <b>ESP32-S3</b>（约 8 美元）单片机上的开源项目。
+    模型完全在芯片上离线运行，以约 <b>9.5 tokens/秒</b>的速度把故事一个词一个词地写到小屏幕上。</p>
+
+    <div class="kpi">
+      <div class="box"><div class="v">28.9M</div><div class="k">存储参数量（25M 在 flash 查表）</div></div>
+      <div class="box"><div class="v">9.5 tok/s</div><div class="k">端到端速度（纯计算 9.72）</div></div>
+      <div class="box"><div class="v">14.9 MB</div><div class="k">4-bit 模型体积</div></div>
+      <div class="box"><div class="v">512 KB</div><div class="k">ESP32-S3 内部 SRAM</div></div>
+      <div class="box"><div class="v">~450 B</div><div class="k">每个 token 从 flash 读取的量</div></div>
+    </div>
+
+    <h2>1. 项目要解决的核心问题</h2>
+    <p>单片机（MCU）最大的限制是"快内存"极少。ESP32-S3 只有 <b>512 KB 内部 SRAM</b>。
+    按常规做法，整个模型都必须能从 SRAM 访问，这就把模型规模死死限制住了——这也是为什么此前同类芯片上跑的模型只有 26 万参数。</p>
+
+    <p>作者的破局思路：<b>不再把整个模型放进快内存</b>。语言模型的绝大部分参数其实在"嵌入表（embedding table）"里，
+    模型对它是<b>查表读取</b>而非参与稠密计算。于是可以把这张 2500 万行的大表留在慢速但巨大的 flash 里，
+    每个 token 只按需取出用到的那几行（约 450 字节），而真正做"思考"的那一小部分参数留在快内存中。</p>
+
+    <div class="callout tip">
+      <p><span class="label">一句话总结：</span>让"占体积但不常算"的参数住在慢而大的 flash，让"占计算但体积小"的参数住在快而小的 SRAM。
+      这正是 Google Gemma 3n/4 的 <b>Per-Layer Embeddings（PLE，逐层嵌入）</b>思想，本项目首次把它落到单片机这一量级的内存层级上。</p>
+    </div>
+
+    <div class="mermaid">
+flowchart TB
+    subgraph MCU["ESP32-S3 三级存储"]
+      SRAM["SRAM（快·极小 512KB）<br/>『思考』核心 core<br/>每个 token 都要用"]
+      PSRAM["PSRAM（中速 8MB）<br/>输出头 head + KV缓存 + 临时缓冲"]
+      FLASH["FLASH（巨大·慢 16MB）<br/>25M 参数查表<br/>每 token 只读约 6 行 ≈ 450B"]
+    end
+    T["当前 token"] --> SRAM
+    T --> FLASH
+    SRAM --> PSRAM
+    PSRAM --> OUT["下一个 token 的概率分布 logits"]
+    style SRAM fill:#eaf6ec,stroke:#a3d9a5
+    style PSRAM fill:#eaf1fb,stroke:#2563c9
+    style FLASH fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 1-1　按"访问模式"而非单纯速度划分的三级存储</p>
+
+    <div class="callout warn">
+      <p><span class="label">能力边界：</span>模型在 <b>TinyStories</b> 上训练，只会写简单连贯的小故事。
+      它<b>不会</b>回答问题、遵循指令、写代码或掌握事实知识。这个上限由"做推理的那一小部分核心参数"决定，
+      内存技巧并不改变它。项目真正有趣的是<b>架构</b>——把大模型塞进小芯片，而非这个 28.9M 模型能说什么。</p>
+    </div>
+
+    <h2>2. 代码构成（仓库结构）</h2>
+    <p>仓库分为四大块：Python 侧的训练/量化/导出（<code>src/</code>、<code>data/</code>）、实验脚本（<code>experiments/</code>）、
+    可移植 C 推理与固件（<code>firmware/</code>）、以及方法与实测记录（<code>RESULTS.md</code>）。</p>
+
+    <table>
+      <thead><tr><th>路径</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>src/model.py</code></td><td>核心：定义 <code>TinyLM</code> 解码器 Transformer 与 5 种消融"实验臂（arm）"，含 PLE 实现与三级参数记账</td></tr>
+        <tr><td><code>src/train.py</code></td><td>训练单个实验臂，在"核心参数预算对齐"的前提下报告验证损失/困惑度</td></tr>
+        <tr><td><code>data/prepare.py</code></td><td>下载 TinyStories 切片，训练 BPE 分词器，产出 <code>uint16</code> 的 token 二进制文件</td></tr>
+        <tr><td><code>src/quantize.py</code></td><td>4-bit 训练后量化（PTQ）检查：验证 PLE 的收益在 4-bit 下是否保留</td></tr>
+        <tr><td><code>src/export.py</code></td><td>把训练好的模型导出为 C 可 mmap 的扁平二进制 <code>model.bin</code>，并生成"金标准" logits 用于校验</td></tr>
+        <tr><td><code>src/budget.py</code></td><td>三级内存记账工具（只做"报告"，与 model.py 的预算解耦）</td></tr>
+        <tr><td><code>src/sample.py</code> / <code>analyze.py</code> / <code>gen_assets.py</code></td><td>采样生成、结果分析、资源生成</td></tr>
+        <tr><td><code>firmware/common/llm.h</code></td><td><b>单头文件</b>可移植推理：host 校验和 ESP32 上跑的是同一份 C 代码</td></tr>
+        <tr><td><code>firmware/esp32_llm/esp32_llm.ino</code></td><td>Arduino 固件：mmap flash、PSRAM 暂存输出头、双核并行、int8 头</td></tr>
+        <tr><td><code>firmware/esp32_llm/partitions.csv</code></td><td>自定义 flash 分区表（为模型划出专用分区）</td></tr>
+        <tr><td><code>firmware/host_verify/verify.c</code> / <code>ppl.c</code></td><td>在 PC 上把 C 推理结果对齐 PyTorch 金标准 / 校验困惑度</td></tr>
+        <tr><td><code>firmware/bandwidth_bench/</code></td><td>在真实芯片上用 Xtensa 周期计数器测 SRAM/PSRAM/flash 带宽</td></tr>
+        <tr><td><code>experiments/*.sh</code></td><td>消融、PLE 维度扫描、随机种子复现等批量脚本</td></tr>
+        <tr><td><code>RESULTS.md</code></td><td>完整方法、消融结论、片上实测数据（本报告数值主要来源）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="mermaid">
+flowchart LR
+    subgraph PY["Python 训练侧"]
+      D["data/prepare.py<br/>TinyStories → token.bin + BPE"]
+      M["src/model.py<br/>TinyLM 定义"]
+      TR["src/train.py<br/>训练 + 验证"]
+      Q["src/quantize.py<br/>4-bit PTQ 检查"]
+      E["src/export.py<br/>导出 model.bin + golden"]
+      D --> TR
+      M --> TR
+      TR --> Q
+      TR --> E
+    end
+    subgraph C["C 推理侧"]
+      H["firmware/common/llm.h<br/>可移植前向"]
+      V["host_verify/verify.c<br/>对齐 PyTorch"]
+      INO["esp32_llm.ino<br/>片上运行"]
+      H --> V
+      H --> INO
+    end
+    E -->|model.bin| V
+    E -->|model.bin| INO
+    E -->|golden.txt| V
+    style PY fill:#eaf1fb,stroke:#2563c9
+    style C fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 2-1　从训练到片上运行的完整数据流与模块关系</p>
+
+    <h2>3. 模型架构：TinyLM 与五种实验臂</h2>
+    <p><code>model.py</code> 定义了一个标准的<b>仅解码器（decoder-only）</b>Transformer，
+    并用一个 <code>arm</code> 字段切换五种不同的"参数花法"，以做严谨的对照实验。它们共享同一个"核心（core）"参数预算，
+    区别只在于"额外参数"花在哪里。</p>
+
+    <table>
+      <thead><tr><th>实验臂 arm</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td><code>baseline</code></td><td>完全没有查表参数，就是"今天典型的小语言模型"长什么样</td></tr>
+        <tr><td><code>ple</code> ⭐</td><td>忠实复刻 Gemma-4 的 PLE：逐层输入 = <code>(RMSNorm(proj(embed)) + table) / √2</code>，逐层门控注入残差流</td></tr>
+        <tr><td><code>ple_notable</code></td><td>有全部逐层"管路"，但<b>没有查表</b>。用于隔离：收益到底来自查表，还是来自逐层管路本身？</td></tr>
+        <tr><td><code>fatembed</code></td><td>和 ple 花同样的查表预算，但用一个宽输入嵌入在底部一次性降维。检验"逐层"是否比"底部一次性"更值</td></tr>
+        <tr><td><code>bigcore</code></td><td>把查表预算改花在"更宽的核心"上。作为"薄核心到底损失多少"的参照</td></tr>
+      </tbody>
+    </table>
+
+    <h3>3.1 部署配置的确切超参</h3>
+    <p>最终烧进芯片的可部署配置（headline config），来自 <code>RESULTS.md</code> 与固件启动日志：</p>
+    <table>
+      <thead><tr><th>元参数</th><th>值</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>vocab_size 词表</td><td class="num">32768</td><td>大词表让查表"又大又便宜"，是 PLE 最有利的场景（实际训练词表 25353）</td></tr>
+        <tr><td>d_model 隐藏维</td><td class="num">96</td><td>核心很薄，才能塞进 512KB SRAM</td></tr>
+        <tr><td>n_layers 层数</td><td class="num">6</td><td></td></tr>
+        <tr><td>n_heads 头数</td><td class="num">4</td><td>head_dim = 96/4 = 24</td></tr>
+        <tr><td>ffn_hidden 前馈宽</td><td class="num">66</td><td>由"核心预算对齐"求解器解出（固件日志 F=66）</td></tr>
+        <tr><td>ple_dim 逐层维</td><td class="num">128</td><td>每层每 token 的逐层输入维度</td></tr>
+        <tr><td>seq_len 上下文</td><td class="num">512</td><td></td></tr>
+        <tr><td>rope_theta</td><td class="num">10000</td><td>RoPE 旋转位置编码基频</td></tr>
+      </tbody>
+    </table>
+
+    <h3>3.2 参数如何分成三层（核心记账思想）</h3>
+    <p>项目最关键的洞见之一：<b>参数不该按"总量"记账，而该按"访问模式"记账</b>。<code>model.py</code> 的 <code>param_budget()</code>
+    把参数分成三类，精确对应 ESP32 的三级存储：</p>
+
+    <table>
+      <thead><tr><th>层级</th><th>访问模式</th><th>归宿</th><th>部署配置下的量</th></tr></thead>
+      <tbody>
+        <tr><td><b>core 核心</b></td><td>稠密、随机、每个 token 都算</td><td>必须常驻 SRAM（真正稀缺的预算）</td><td class="num">~559 K<br/><span style="font-weight:400">（推导见 3.3-C）</span></td></tr>
+        <tr><td><b>stream 流式</b></td><td>输出头：稠密，但每 token 顺序扫一遍</td><td>耗带宽而非 SRAM 容量，可放片外</td><td class="num">~3.1 M</td></tr>
+        <tr><td><b>table 查表</b></td><td>稀疏：每 token 只读一行</td><td>理想的内存映射 flash 对象</td><td class="num">25 M</td></tr>
+        <tr><td colspan="3"><b>total 合计</b></td><td class="num">28.9 M</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout note">
+      <p><span class="label">为什么 core 故意不含输出头？</span>把输出头（head）算进 core，会让"大词表"看起来贵得离谱——
+      而实际上它只是"慢"（要顺序扫一遍），不是"占快内存"。把它单独记为 stream，才让"用大词表换便宜查表"这一整套设计得以成立。</p>
+    </div>
+
+    <h3>3.3 从参数量到内存字节：FLASH 查表 &amp; PSRAM 明细</h3>
+    <p>上面按<b>参数量</b>分了三层，这里把它们换算成<b>真实字节数</b>，看清楚每层如何落进 16MB flash / 8MB PSRAM。
+    以下全部基于部署固件的开机诊断（<code>V=32768 D=96 L=6 H=4 F=66 P=128</code>）与 <code>esp32_llm.ino</code> 的实际分配代码，4-bit 量化、group-128。</p>
+
+    <h4>(A) FLASH：25M 查表，每 token 只读一行</h4>
+    <p>逐层嵌入表 <code>ple_table</code> 的形状是 <code>[V, L·P]</code>（<code>llm.h</code> 里 <code>bind_q(&amp;ple_table, V, L*P)</code>）：</p>
+    <table>
+      <thead><tr><th>项目</th><th>算式</th><th class="num">结果</th></tr></thead>
+      <tbody>
+        <tr><td>表参数量</td><td><code>V × (L·P) = 32768 × (6×128) = 32768 × 768</code></td><td class="num">25,165,824 ≈ <b>25.2M</b></td></tr>
+        <tr><td>4-bit 存储</td><td><code>25,165,824 × 0.5 B</code></td><td class="num">≈ 12.0 MB（住 flash）</td></tr>
+        <tr><td>每 token 读取</td><td><code>deq_row(ple_table, token)</code> 取 <code>L·P = 768</code> 个 int4</td><td class="num">768 × 0.5 B = 384 B</td></tr>
+        <tr><td>+ fp16 分组缩放</td><td>group-128 → 6 组 × 2 B（每组一个 scale）</td><td class="num">+12 B ≈ <b>396 B</b></td></tr>
+      </tbody>
+    </table>
+    <div class="callout note">
+      <p><span class="label">"6 行 ≈ 450B" 是怎么来的：</span>一个 token 的整行是 <code>L·P=768</code> 个值，正好是 group-128 下的
+      <b>6 个分组（对应 6 层，README 说的"6 rows"）</b>；每组 128×4bit(64B) + 1 个 fp16 scale(2B)=66B，6×66 = <b>396 B</b>。
+      官方 README 取整说成 <b>"约 450 字节"</b>（含行字节对齐等余量）。<code>budget.py</code> 只算 int4 载荷则为 <code>6×128×0.5 = 384 B</code>。
+      三者说的是同一件事，量级 ~400 B。</p>
+    </div>
+
+    <h4>(B) PSRAM：输出头 + KV 缓存 + 临时缓冲</h4>
+    <p><code>esp32_llm.ino</code> 在 <code>setup()</code> 里用 <code>heap_caps_malloc(..., MALLOC_CAP_SPIRAM)</code> 逐个分配三类对象：</p>
+    <table>
+      <thead><tr><th>对象</th><th>算式（来自 .ino / llm.h）</th><th class="num">大小</th></tr></thead>
+      <tbody>
+        <tr><td><b>① 输出头 head</b><br/>（与输入嵌入 tied 的 <code>tok_emb [V,D]</code>）</td>
+            <td>完整参数 <code>V×D = 32768×96</code>；<br/>部署时把行数裁到实际训练词表 <code>VOCAB_N=25,353</code>（padding 行永采样不到），<br/>再从 int4 解包成 int8 常驻 PSRAM：<br/>
+            <code>head_w8 = 25353×96 B</code> + <code>head_scale8 = 25353×4 B</code></td>
+            <td class="num">参数 ≈ 3.1M<br/>2,433,888 + 101,412<br/>= 2,535,300 B<br/><b>≈ 2.53 MB</b></td></tr>
+        <tr><td><b>② KV 缓存</b><br/>（fp32，<code>s.kcache/s.vcache = L·S·D</code>）</td>
+            <td><code>2(K+V) × L × S × D × 4 B = 2×6×S×96×4</code></td>
+            <td class="num"><b>4,608 B / 每位置</b><br/>（≈ 4.5 KB/token）<br/>S=256→1.13MB<br/>S=512→2.25MB</td></tr>
+        <tr><td><b>③ 临时缓冲 scratch</b></td>
+            <td><code>logits[V] = 32768×4</code>（最大一块）<br/>+ 逐层缓冲 x/h/qkv/att/gate/up/ple/tmpP/trow<br/>+ <code>scores[S] = S×4</code></td>
+            <td class="num">128 KB<br/>+ ~15 KB<br/>+ S×4 B</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note">
+      <p><span class="label">对照实测：</span>开机诊断打印 <code>head staged int8: 2.53 MB</code>（正好等于上式 ②... 的 ① 项）与
+      <code>PSRAM free after alloc: ~5100 KB</code>——8MB PSRAM 分配完仍余约 5MB。KV 缓存是随上下文长度 <code>S</code>
+      线性增长的那部分，每多缓存一个位置就多 <b>2·L·D = 1,152 个 float = 4,608 B</b>。<code>S</code> 取自 model.bin 头部的 <code>seq_len</code>。</p>
+    </div>
+
+    <h4>(C) SRAM：core 核心的 ~559K 从哪来</h4>
+    <p>core 是<b>唯一必须常驻 SRAM</b> 的一层，也是整个设计的硬约束。它的定义是
+    <b>「模型全部参数 − 输出头(stream) − 查表(table)」</b>（<code>model.py</code> 的 <code>param_budget()</code>：<code>core = total − stream − table</code>）。
+    逐项数一遍（部署 <code>ple</code> 臂：<code>D=96, L=6, F=66, P=128</code>）：</p>
+    <table>
+      <thead><tr><th>组件（每个 Block）</th><th>形状</th><th class="num">参数</th></tr></thead>
+      <tbody>
+        <tr><td>attn_norm</td><td><code>D</code></td><td class="num">96</td></tr>
+        <tr><td>qkv（Q/K/V 合一）</td><td><code>3D×D = 288×96</code></td><td class="num">27,648</td></tr>
+        <tr><td>attn.proj</td><td><code>D×D = 96×96</code></td><td class="num">9,216</td></tr>
+        <tr><td>ffn_norm</td><td><code>D</code></td><td class="num">96</td></tr>
+        <tr><td>ffn.gate</td><td><code>F×D = 66×96</code></td><td class="num">6,336</td></tr>
+        <tr><td>ffn.up</td><td><code>F×D = 66×96</code></td><td class="num">6,336</td></tr>
+        <tr><td>ffn.down</td><td><code>D×F = 96×66</code></td><td class="num">6,336</td></tr>
+        <tr><td>ple_gate</td><td><code>P×D = 128×96</code></td><td class="num">12,288</td></tr>
+        <tr><td>ple_proj</td><td><code>D×P = 96×128</code></td><td class="num">12,288</td></tr>
+        <tr><td>ple_norm</td><td><code>D</code></td><td class="num">96</td></tr>
+        <tr><td><b>单层小计</b></td><td></td><td class="num"><b>80,736</b></td></tr>
+        <tr><td><b>× 6 层</b></td><td></td><td class="num"><b>484,416</b></td></tr>
+        <tr><td colspan="3" style="background:#f4f6f8"><b>模型级（非逐层，只算一次）</b></td></tr>
+        <tr><td>ple_model_proj</td><td><code>D×(L·P) = 96×768</code></td><td class="num">73,728</td></tr>
+        <tr><td>ple_proj_norm</td><td><code>P</code></td><td class="num">128</td></tr>
+        <tr><td>out_norm</td><td><code>D</code></td><td class="num">96</td></tr>
+        <tr><td><b>core 合计</b></td><td><code>484,416 + 73,952</code></td><td class="num"><b>558,368 ≈ 558K</b></td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip">
+      <p><span class="label">几个要点：</span></p>
+      <ul>
+        <li>core <b>不含</b> <code>tok_emb</code>（=stream 输出头，3.1M）和 <code>ple_table</code>（=table，25M）——它们分别顺序扫、按行查，不占宝贵 SRAM。</li>
+        <li>RESULTS 里 <code>baseline=559K</code>、<code>ple=558K</code>、<code>fatembed=559K</code>，都是靠 <code>make_model()</code> <b>二分搜索 <code>ffn_hidden</code></b> 对齐到同一个 <b>~559K 目标</b>，这样对照实验才公平（否则赢家只会是"谁的 FFN 更肥"）。</li>
+        <li><b>换算成 SRAM 字节：</b><code>559K × 0.5 B（4-bit）÷ 1024 ≈ 273 KB</code>，即 RESULTS 原文的 <b>"273KB at 4-bit"</b>——稳稳落进 512KB 内部 SRAM。<b>正是这个 273KB 约束，反过来把模型压到了 <code>d_model=96</code> 这么薄。</b></li>
+        <li><code>budget.py</code> 的简化式 <code>442,368 + 1728·F = 556,416</code> 与精确值差 <b>1,952</b>，正好是所有 fp32 归一化向量之和（<code>6×(96+96+96) + 128 + 96</code>）——简化式忽略了这些小 norm。</li>
+      </ul>
+    </div>
+
+    <h3>3.4 Transformer 代码构成逐块拆解</h3>
+    <p>模型采用了一套现代 LLM 的标准组件（与 Llama/Gemma 同源），全部在 <code>model.py</code> 中：</p>
+    <ul>
+      <li><b>RMSNorm</b>：<code>weight · x · rsqrt(mean(x²)+eps)</code>，比 LayerNorm 更省、更稳，eps=1e-6</li>
+      <li><b>RoPE 旋转位置编码</b>：<code>build_rope</code> 预计算 cos/sin，<code>apply_rope</code> 用"前后半分块（split-half）"方式旋转 Q/K</li>
+      <li><b>Attention 注意力</b>：一个 <code>qkv</code> 线性层同时产出 Q/K/V，因果自注意力用 PyTorch 的
+        <code>scaled_dot_product_attention(is_causal=True)</code></li>
+      <li><b>SwiGLU 前馈</b>：<code>down(silu(gate(x)) · up(x))</code>，比普通 MLP 表达力更强</li>
+      <li><b>Block 层</b>：<code>x += attn(norm(x))</code> → <code>x += ffn(norm(x))</code> →（若启用 PLE）<code>x += ple_norm(ple_proj(gelu(ple_gate(x)) · ple))</code></li>
+      <li><b>权重绑定（weight tying）</b>：输入嵌入 <code>tok_emb</code> 与输出头 <code>head</code> 共享同一张权重矩阵，省下一大块参数</li>
+    </ul>
+
+    <div class="mermaid">
+flowchart TB
+    IN["token id"] --> EMB["tok_emb 查表<br/>得到 d_model=96 向量 x"]
+    EMB --> PLEIN["构造逐层输入 ple<br/>(见 3.5)"]
+    EMB --> B0
+    subgraph BLK["每个 Block（共 6 层）"]
+      B0["x += Attention(RMSNorm(x)) 含RoPE"] --> B1["x += SwiGLU(RMSNorm(x))"]
+      B1 --> B2["x += RMSNorm(ple_proj( gelu(ple_gate(x)) · ple_l ))<br/>← PLE 逐层门控注入"]
+    end
+    PLEIN -. 第 l 层的 ple .-> B2
+    B2 --> ON["out_norm(RMSNorm)"]
+    ON --> HEAD["head = tok_emb 转置<br/>得到 vocab=32768 维 logits"]
+    style B2 fill:#fff7e6,stroke:#ffd591
+    style PLEIN fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 3-1　TinyLM 前向网络结构（PLE 部分高亮）</p>
+
+    <h3>3.5 PLE（Per-Layer Embeddings）到底做了什么</h3>
+    <p>这是全项目的技术核心。普通 Transformer 只在<b>底部</b>把 token 嵌入一次；PLE 则为<b>每一层</b>准备一份专属的"逐层输入"，
+    在每层残差流上做<b>门控注入</b>。逐层输入由两半构成：</p>
+    <ol>
+      <li><b>上下文感知的一半</b>：把当前 token 嵌入 <code>x</code> 经一个投影 <code>ple_model_proj</code> 得到 <code>L×ple_dim</code>，
+        除以 <code>√d_model</code>，再按层切片做 RMSNorm。</li>
+      <li><b>查表的一半</b>：从巨大的 <code>ple_table</code>（vocab × L×ple_dim = <b>25M 参数</b>）按 token 取一行，乘以 <code>√ple_dim</code>。</li>
+    </ol>
+    <p>两半相加再除以 <code>√2</code>，得到每层的逐层输入 <code>ple[l]</code>。层内注入用的是<b>逐元素相乘</b>门控
+    <code>gelu(ple_gate(x)) · ple[l]</code>——这使它成为"条件调制"而非简单偏置：任一因子都能压制另一因子。</p>
+
+    <pre><code># model.py forward（简化）
+ple = ple_model_proj(x) * d_model**-0.5
+ple = ple_proj_norm(ple.view(B,T,L,ple_dim))
+table = ple_table(idx).view(B,T,L,ple_dim)      # ← 这一行的 25M 参数住在 flash
+ple = (ple + table * ple_dim**0.5) * 2**-0.5    # embed_scale=√ple_dim
+# 每层：x += ple_norm( ple_proj( gelu(ple_gate(x)) * ple[:,:,l] ) )</code></pre>
+
+    <div class="callout tip">
+      <p><span class="label">初始化巧思：</span>逐层分支末尾的 RMSNorm 增益被<b>初始化为 0</b>，
+      让该分支起始时是一个精确的"恒等空操作（no-op）"。这样每个实验臂都从同一个函数出发，
+      对照实验测的是"学习能力"而非"初始化运气"。</p>
+    </div>
+
+    <h2>4. 如何训练这个小 LLM</h2>
+    <h3>4.1 数据准备（data/prepare.py）</h3>
+    <ul>
+      <li><b>数据源</b>：从 HuggingFace 下载 TinyStories 训练集的前 <b>300 MB</b> 切片（约 7500 万 token）。</li>
+      <li><b>分词器</b>：用 <code>tokenizers</code> 训练一个 <b>字节级 BPE</b>，默认词表 <b>4096</b>（<code>--vocab</code> 可覆盖，部署用 32768）。
+        用前 40MB 文本训练合并表即可。</li>
+      <li><b>输出</b>：把全部 token 编码为 <code>uint16</code> 数组，按 <code>train/val</code>（验证占 0.5%）切分，
+        写成 <code>train.bin</code> / <code>val.bin</code>。词表固定，是为了让不同实验臂的交叉熵可比。</li>
+    </ul>
+
+    <div class="mermaid">
+flowchart LR
+    A["TinyStories-train.txt<br/>下载前 300MB"] --> B["训练字节级 BPE<br/>vocab=4096 或 32768"]
+    B --> C["encode 全部文本"]
+    C --> D["uint16 token 数组"]
+    D --> E["train.bin (99.5%)"]
+    D --> F["val.bin (0.5%)"]
+    style A fill:#eaf1fb,stroke:#2563c9
+    </div>
+    <p class="figcap">图 4-1　数据准备流水线</p>
+
+    <h3>4.2 训练循环（src/train.py）</h3>
+    <p>训练脚本的精髓是<b>"核心参数预算对齐"</b>：<code>make_model()</code> 用二分搜索自动调 <code>ffn_hidden</code>，
+    让每个实验臂命中相同的 core 参数量。否则对照实验毫无意义——赢家只会是"谁的 FFN 更肥"。</p>
+
+    <table>
+      <thead><tr><th>训练元参数</th><th>默认值</th></tr></thead>
+      <tbody>
+        <tr><td>优化器</td><td>AdamW，betas=(0.9, 0.95)</td></tr>
+        <tr><td>学习率 lr / warmup</td><td class="num">1e-3 / 200 步</td></tr>
+        <tr><td>学习率调度</td><td>线性 warmup + 余弦退火（衰减到峰值的 10%）</td></tr>
+        <tr><td>权重衰减 weight_decay</td><td class="num">0.1（一维参数/norm/查表/嵌入不衰减）</td></tr>
+        <tr><td>batch_size / seq_len</td><td class="num">32 / 512</td></tr>
+        <tr><td>训练步数 steps</td><td class="num">4000（消融）</td></tr>
+        <tr><td>梯度裁剪</td><td class="num">clip_grad_norm = 1.0</td></tr>
+        <tr><td>随机批采样</td><td>用 memmap 随机切窗口，验证集固定种子 1234 保证各臂同批</td></tr>
+        <tr><td><b>计算精度</b></td><td><b>fp32 全程</b>（无 AMP / autocast / 半精度；权重、梯度、AdamW 状态皆 fp32）</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note">
+      <p><span class="label">训练用什么精度？</span><code>train.py</code> 里没有任何混合精度设置——<b>训练自始至终是 fp32</b>。
+      4-bit 只在<b>训练结束后</b>由 <code>export.py</code> 做<b>训练后量化（PTQ, Post-Training Quantization）</b>，训练过程本身从不接触低精度，
+      也<b>没有做量化感知训练（QAT）</b>。这也是为什么"4-bit 收益完整保留"值得强调（见 5.2）。</p>
+    </div>
+    <p>数据集约 7500 万 token 足以把 1M 级核心"过训练"到远超计算最优点——这正是项目关心的场景（用海量数据把小核心榨干）。</p>
+
+    <h3>4.3 消融与扫描（experiments/）</h3>
+    <p><code>experiments/*.sh</code> 批量跑不同实验臂 × 不同随机种子 × 不同 <code>ple_dim</code>，用来回答三个问题：
+    ① PLE 是否真的赢 baseline？② 收益来自查表还是管路？③ 加宽行 vs 加多行，哪个更有效？</p>
+
+    <h2>5. 关键结论（RESULTS.md 实测数据）</h2>
+    <h3>5.1 质量：PLE 确实赢</h3>
+    <p>在词表 32768、各臂核心对齐到 ~559K 参数、两个随机种子下：</p>
+    <table>
+      <thead><tr><th>arm</th><th class="num">core</th><th class="num">total</th><th class="num">困惑度 ppl</th><th>相对 baseline</th></tr></thead>
+      <tbody>
+        <tr><td><code>baseline</code></td><td class="num">559K</td><td class="num">3.7M</td><td class="num">12.58</td><td>—</td></tr>
+        <tr><td><b><code>ple</code></b></td><td class="num">558K</td><td class="num"><b>28.9M</b></td><td class="num"><b>11.41</b></td><td><b>+0.098 nats / ppl↓9.3%</b></td></tr>
+        <tr><td><code>fatembed</code></td><td class="num">559K</td><td class="num">28.9M</td><td class="num">11.94</td><td>+0.052 nats</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>PLE 以<b>同样的核心、同样能塞进 SRAM</b>的前提，比 baseline 好 0.098 nats（≈种子噪声的 16 倍）。</li>
+      <li>"逐层注入"比"底部一次性注入"（fatembed）好 0.046 nats——注入的<b>位置</b>很重要。</li>
+      <li>控制实验 <code>ple_notable</code>（有管路无查表）在小词表下甚至<b>比 baseline 差</b>：证明收益的全部来源是<b>那张 flash 查表</b>，
+        这正是 ESP32 方案需要的结论。</li>
+      <li><b>词表越大，PLE 优势越大</b>：vocab 4096 时优势仅 +0.025，vocab 32768 时 +0.098（4 倍）。</li>
+    </ul>
+
+    <h3>5.2 4-bit 量化：收益完整保留</h3>
+    <p>用分组对称 int4 PTQ（group 128，GGUF-Q4 风格；见 <code>export.py</code> 的 <code>GROUP=128</code>）把包括 25M 查表在内的所有大权重量化后，
+    PLE 相对 baseline 的优势 <b>fp32 +0.101 → 4-bit +0.125，保留 124~128%</b>。原因：
+    带分组缩放的大冗余查表天生比"每个权重都关键"的小稠密模型更抗量化。<b>headline 无需 QAT</b>。</p>
+
+    <h2>6. LLM 推理的实现（纯 C）</h2>
+    <p>推理核心是单头文件 <code>firmware/common/llm.h</code>。同一份代码既能在 PC 上对齐 PyTorch 金标准，
+    也能编译进 ESP32。它按 <code>model.bin</code> 头部动态读取维度，逐算子复刻 <code>model.py</code>。</p>
+
+    <h3>6.1 前向单步 llm_forward</h3>
+    <p>每步输入"当前 token + 位置 pos"，输出 <code>logits[V]</code>；KV 缓存跨步保留。流程：</p>
+    <div class="mermaid">
+flowchart TB
+    S1["deq_row(tok_emb, token) → x<br/>解量化嵌入行"] --> S2["构造 ple：MATVEC(ple_model_proj)/√D → RMSNorm<br/>+ deq_row(ple_table,token)·√P，再 /√2"]
+    S2 --> S3["预计算本 token 的 RoPE cos/sin"]
+    S3 --> L
+    subgraph L["逐层循环 l = 0..5"]
+      A1["RMSNorm → MATVEC(qkv) → 拆 Q/K/V"] --> A2["对 Q/K 施加 split-half RoPE"]
+      A2 --> A3["写入 KV cache，因果注意力(0..pos)<br/>两遍稳定 softmax"]
+      A3 --> A4["MATVEC(attn_proj)，残差相加"]
+      A4 --> F1["RMSNorm → MATVEC(gate/up) → SiLU-SwiGLU → MATVEC(down)，残差"]
+      F1 --> P1["MATVEC(ple_gate)→gelu·ple → MATVEC(ple_proj)→RMSNorm，残差"]
+    end
+    L --> O1["out_norm"] --> O2["输出头 MATVEC(tok_emb) → logits[32768]"]
+    style S2 fill:#fff7e6,stroke:#ffd591
+    style P1 fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 6-1　llm.h 中 llm_forward 单步推理时序</p>
+
+    <h3>6.2 量化权重的读取与矩阵向量乘</h3>
+    <p>权重以<b>分组对称 int4</b>存储：每行按 group 分组，每组一个 fp16 缩放系数，nibble（半字节）存 <code>值+8</code>（0~15）。
+    关键函数：</p>
+    <ul>
+      <li><code>deq_row()</code>：把某一行 int4 解量化成 fp32（用于嵌入行、查表行）。</li>
+      <li><code>matvec_q()</code>：<code>y = W·x</code>，边解 nibble 边乘加，按组乘缩放。<code>matvec_q_range()</code> 支持行区间切分，
+        以便把巨大的输出头拆到两个核上并行。</li>
+      <li><code>matvec_q8()</code>：<b>int8 激活路径</b>。先把激活量化到 int8，再做 <code>int8×int8→int32</code> 组内点积。
+        这段 int32 累加正是 ESP32-S3 的 SIMD int8 点积指令的产物，因此设备 SIMD 核与该标量参考在数值上完全一致——只是更快。</li>
+    </ul>
+
+    <div class="callout tip">
+      <p><span class="label">关键：4-bit 是「存储」格式，不是「计算」格式。</span>没有任何 CPU/MCU 能直接做 4-bit 浮点乘法。
+      int4 只是把权重压小的<b>编码</b>；一旦要参与计算，必须先<b>解回更高精度</b>。反量化公式很简单：
+      <code>w ≈ (nibble − 8) × scale<sub>fp16</sub></code>，其中每 128 个连续权重（group=128）共享一个 fp16 缩放系数，
+      <code>scale = max(|w<sub>组内</sub>|) / 7</code>（对称量化，量化值范围 −7…+7，存成 nibble 即 <code>值+8</code> → 1…15）。
+      一维的 norm 向量根本不量化，始终 fp32。</p>
+    </div>
+
+    <p>llm.h 用 <code>#define MATVEC</code> 一键切换两条计算路径，它们<b>共用同一份 int4 权重</b>，只是激活的精度不同：</p>
+    <table>
+      <thead><tr><th>对比项</th><th><code>matvec_q</code>（默认 / fp32 激活）</th><th><code>matvec_q8</code>（int8 激活，设备端用）</th></tr></thead>
+      <tbody>
+        <tr><td>激活精度</td><td>fp32 原样</td><td><b>每 token 动态量化到 int8</b>：<code>x_scale=max(|x|)/127</code></td></tr>
+        <tr><td>权重</td><td>int4 nibble 边读边解 <code>(code−8)</code></td><td>int4 nibble 解成小整数 <code>(code−8)</code></td></tr>
+        <tr><td>组内乘加</td><td><code>(code−8)×x[j]</code> 累加为 <b>fp32</b>，再乘 fp16 组缩放</td><td><code>(code−8)×xq[j]</code> 累加为 <b>int32</b>，再乘 (fp16 组缩放 × x_scale)</td></tr>
+        <tr><td>累加精度</td><td>fp32</td><td>int32 → 末尾才转 fp32</td></tr>
+        <tr><td>硬件适配</td><td>任意 CPU，<code>-O3</code> 自动向量化</td><td>ESP32-S3 的 Xtensa LX7 向量 int8 点积指令</td></tr>
+      </tbody>
+    </table>
+    <p><b>无论走哪条路，累加始终在更高精度里做（fp32 或 int32），绝不会"纯 4-bit 相乘再累加"。</b>
+    区别只在于激活是保留 fp32 还是压成 int8：前者精度最高、用于 PC 对齐金标准；后者把乘加换成整数 MAC，
+    好让 SIMD 一次算多个——这就是"直接以 4-bit 计算"这个直觉的真相：<b>权重永远要临时解量化，只是解到 int8/fp32 后立刻参与高精度累加</b>。
+    int8 路径的激活量化是<b>动态</b>的——每个 token 现算一次 <code>x_scale</code>，不需要预先用校准数据集标定。</p>
+
+    <div class="callout note">
+      <p><span class="label">同一份 C 如何同时适配 ESP32 与普通 CPU？</span>
+      llm.h 是<b>可移植标量 C</b>，两端编译同一份代码：
+      ① <b>普通 CPU / PC</b>：编译成标量循环，靠 <code>-O3</code> 自动向量化；用来把全部 32768 个 logit 对齐 PyTorch 金标准（误差仅 1e-5）。
+      ② <b>ESP32-S3</b>：int8 组点积映射到 LX7 的向量 int8 MAC 指令；每 token 全量扫描的输出头在开机时一次性从 int4 解包成 int8 常驻 PSRAM（见 6.3），省掉每步的 nibble 解包；
+      并把行区间拆到两核并行。fp16 缩放系数在<b>两端都用软件 <code>half2float</code> 位运算</b>还原——ESP32 没有 fp16 硬件，普通 CPU 也不必有。</p>
+    </div>
+
+    <div class="callout note">
+      <p><span class="label">正确性保证：</span><code>export.py</code> 会生成一份"金标准 logits"（4-bit 模型对固定 prompt 的输出）。
+      C 移植版在真机之前，先在 PC 上把全部 32768 个 logit 对齐 PyTorch，最大绝对误差仅 <b>0.00001</b>。</p>
+    </div>
+
+    <h3>6.3 片上固件（esp32_llm.ino）的平台优化</h3>
+    <ul>
+      <li><b>flash 内存映射</b>：用 <code>esp_partition_mmap</code> 把 <code>model</code> 分区映射进地址空间，
+        25M 查表<b>始终留在 flash</b>，每 token 只随机读几行。</li>
+      <li><b>输出头暂存为 int8</b>：开机时把 tied 输出头（1.64MB）一次性从 int4 解包成 int8 放进 PSRAM，
+        之后每 token 无需再解 nibble，直接 <code>int8×int8→int32</code> 点积。头体积 2.53MB。</li>
+      <li><b>双核并行</b>：输出头的行区间拆到两个 LX7 核（<code>head_worker</code> 任务 + 主任务各算一半）。</li>
+      <li><b>只算有效词表</b>：分词器实际只学了 25353 项，填充的行永远不会被采样，直接跳过不算不暂存。</li>
+      <li><b>喂看门狗</b>：每约 8 个 token <code>delay(0)</code> 一次，避免任务看门狗复位。</li>
+      <li>采样用贪心 argmax；prompt 为 "Once upon a time"，生成 200 token。</li>
+    </ul>
+
+    <h3>6.4 4-bit 量化原理：分组对称 int4 PTQ（GGUF-Q4 风格）到底是什么</h3>
+    <p>5.2 里那句"分组对称 int4 PTQ（group 128，GGUF-Q4 风格）"其实是四个词拼起来的，逐个拆开就一目了然：</p>
+    <table>
+      <thead><tr><th>词</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td><b>PTQ<br/>（训练后量化）</b></td><td>Post-Training Quantization：训练用 fp32 跑完，<b>训练结束后</b>再一次性把权重压成 4-bit。不重训、<b>不做量化感知训练（QAT）</b>。见 <code>export.py</code> / <code>quantize.py</code>。</td></tr>
+        <tr><td><b>int4</b></td><td>每个权重只用 <b>4 bit</b> → 16 种取值。这里实际取 <b>−7…+7</b>（对称），存成 nibble = <code>值+8</code> → 1…15，两个 nibble 打包进 1 字节。</td></tr>
+        <tr><td><b>对称<br/>（symmetric）</b></td><td>量化区间关于 0 <b>对称</b>，<b>没有零点偏移（zero-point）</b>。反量化就是一句 <code>w ≈ q×scale</code>，不用减偏移。适合近似以 0 为中心的权重分布，也让 int8 路径的整数点积更省事。</td></tr>
+        <tr><td><b>分组<br/>（group-wise）</b></td><td>不是整张矩阵或整行共用一个 scale，而是把<b>每行切成每 G 个连续权重一组</b>（部署 <b>G=128</b>，消融曾用 64），<b>每组一个独立 fp16 缩放</b>。局部定标 → 精度远高于 per-tensor。</td></tr>
+        <tr><td><b>GGUF-Q4<br/>风格</b></td><td>沿用 llama.cpp 的 GGUF <b>Q4 块量化</b>思路：块内对称 int4 + 每块一个 fp16 scale、无零点。本项目只是把"块"设成 group=128、并允许最后一组不足 128 的<b>不补零（ragged）</b>打包。</td></tr>
+      </tbody>
+    </table>
+
+    <p>量化换算（<code>export.py</code> 的 <code>quant_pack</code>，逐组进行）：</p>
+    <pre><code>for gi in range(n_groups):
+    a, b = gi*group, min((gi+1)*group, cols)
+    seg = x[:, a:b]                                  # 本组的一段权重
+    sc  = (seg.abs().amax(dim=1, keepdim=True) / 7).clamp_min(1e-8)
+    sc  = sc.half().float()                          # 缩放先 round 到 fp16
+    qi  = torch.clamp(torch.round(seg / sc), -7, 7)  # 量化成整数 -7..7
+    dq[:, a:b] = qi * sc                             # 反量化重建（golden 用）
+codes = (q.to(int16) + 8).to(uint8)                  # 存成 nibble 0..15，两两打包</code></pre>
+    <p>要点：<b>缩放 <code>scale = max(|本组权重|) / 7</code></b>（7 = int4 对称的最大幅值），并<b>先 round 到 fp16</b> 再算反量化，
+    这样 PyTorch 端和 C 端逐位一致，才能用"金标准 logits"证明 C 移植零误差。一维的 norm 向量<b>不量化</b>，保持 fp32（总量极小）。</p>
+
+    <p><b>为什么 fp16 scale + group=128 能把 28.9M 参数塞进 &lt; 16MB flash？</b>看"有效位宽"（每个权重平均占多少 bit）：</p>
+    <table>
+      <thead><tr><th>方案</th><th>权重码</th><th>缩放摊到每权重</th><th class="num">有效位宽</th><th class="num">28.9M 体积</th></tr></thead>
+      <tbody>
+        <tr><td>per-tensor int4（一个 scale）</td><td class="num">4 bit</td><td class="num">≈0</td><td class="num">~4.0 bit</td><td class="num">~14.5 MB</td></tr>
+        <tr><td><b>group=128 + fp16 scale（本项目部署）</b></td><td class="num">4 bit</td><td class="num">16/128 = 0.125 bit</td><td class="num"><b>4.125 bit</b></td><td class="num"><b>~14.9 MB ✓</b></td></tr>
+        <tr><td>group=64（消融）</td><td class="num">4 bit</td><td class="num">16/64 = 0.25 bit</td><td class="num">4.25 bit</td><td class="num">~15.3 MB</td></tr>
+        <tr><td>GGUF Q4_0（block=32）</td><td class="num">4 bit</td><td class="num">16/32 = 0.5 bit</td><td class="num">4.5 bit</td><td class="num">~16.3 MB</td></tr>
+      </tbody>
+    </table>
+    <p><b>group 越小越精细，但每组的 fp16 scale 开销越大。</b>项目选 128，正好在精度与"整包 &lt; 16MB flash"之间取平衡
+    （<code>export.py</code> 注释：<i>"fp16 scales + ragged packing keep the 28.9M model &lt; 16MB"</i>）。
+    至于<b>为什么 4-bit 后精度几乎不掉</b>——见 5.2：大而冗余的查表天生比小稠密核心更抗量化，PLE 优势在 4-bit 下反而保留 124~128%。</p>
+
+    <h3>6.5 临时解量化的内存开销 &amp; 同一份 C 如何两端通用（附代码）</h3>
+    <div class="callout tip">
+      <p><span class="label">临时解量化几乎不占内存。</span>关键在于两条 matvec 路径都是<b>"边读 nibble、边解、边乘加"</b>，
+      解出来的浮点值只活在<b>寄存器/几个局部变量</b>里（<code>scale</code> / <code>group_acc</code> / <code>acc</code> / <code>g</code>），
+      <b>从不把整块权重展开成 fp32 落地到内存</b>。所以额外开销与模型大小<b>无关</b>。</p>
+    </div>
+    <table>
+      <thead><tr><th>额外开销来源</th><th>随权重大小增长？</th><th class="num">实际大小</th></tr></thead>
+      <tbody>
+        <tr><td>权重解量化 buffer</td><td>否</td><td class="num"><b>0 字节</b>（逐权重在寄存器里完成）</td></tr>
+        <tr><td>int8 激活 scratch <code>xq[1024]</code></td><td>否</td><td class="num">1 KB（静态复用，比 fp32 激活更小）</td></tr>
+        <tr><td>栈上临时标量 <code>acc/g/scale</code></td><td>否</td><td class="num">几十字节</td></tr>
+        <tr><td><code>deq_row</code> 目标（嵌入行/查表行）</td><td>否</td><td class="num">写进本就存在的 scratch（<code>x</code> 384B、<code>trow</code> 3KB）</td></tr>
+        <tr><td style="background:#fff7e6"><b>对照：若整块解回 fp32 常驻</b></td><td style="background:#fff7e6"><b>是</b></td><td class="num" style="background:#fff7e6"><b>输出头 12.5MB、查表 100MB</b></td></tr>
+      </tbody>
+    </table>
+
+    <p><b>① fp32-激活路径 <code>matvec_q</code></b>（默认；边解量化边乘加，不落地任何 fp32 权重。为清晰略去了不足一字节的 ragged 边界处理）：</p>
+    <pre><code>static inline void matvec_q_range(const QT *t, const float *x, float *y,
+                                  int row_begin, int row_end) {
+  for (int r = row_begin; r &lt; row_end; r++) {
+    const uint8_t  *row = t-&gt;codes  + (size_t)r * t-&gt;row_bytes;
+    const uint16_t *sc  = t-&gt;scales + (size_t)r * t-&gt;n_groups;
+    float acc = 0.f;
+    for (int gi = 0; gi &lt; t-&gt;n_groups; gi++) {          // 逐组
+      int begin = gi * t-&gt;group, end = begin + t-&gt;group;
+      if (end &gt; t-&gt;cols) end = t-&gt;cols;
+      float scale = half2float(sc[gi]);                  // 软件 fp16→fp32（两端通用）
+      float group_acc = 0.f;
+      for (int j = begin; j + 1 &lt; end; j += 2) {
+        uint8_t byte = row[j &gt;&gt; 1];                       // 一字节含两个 nibble
+        group_acc += (float)((byte &amp; 0xF) - 8) * x[j];    // 低 nibble：(code-8)
+        group_acc += (float)((byte &gt;&gt; 4)  - 8) * x[j+1];  // 高 nibble
+      }
+      acc += group_acc * scale;                          // 每组只乘一次缩放
+    }
+    y[r] = acc;                                          // fp32 结果，无中间缓冲
+  }
+}</code></pre>
+
+    <p><b>② int8-激活路径 <code>matvec_q8</code></b>（SIMD 友好；激活一次量化成 int8，权重 int4 解成小整数，做 <code>int8×int8→int32</code> 整数点积）：</p>
+    <pre><code>// 每 token 动态把激活量化成 int8（唯一的“额外” buffer 是复用的 1KB xq）
+static void quantize_act(const float *x, int n, int8_t *xq, float *x_scale) {
+  float xmax = 1e-8f;
+  for (int j = 0; j &lt; n; j++) { float a = fabsf(x[j]); if (a &gt; xmax) xmax = a; }
+  float inv = 127.f / xmax;
+  for (int j = 0; j &lt; n; j++) {
+    int q = (int)lrintf(x[j] * inv);
+    xq[j] = (int8_t)(q &gt; 127 ? 127 : (q &lt; -127 ? -127 : q));
+  }
+  *x_scale = xmax / 127.f;
+}
+
+static void matvec_q8_range(const QT *t, const int8_t *xq, float x_scale,
+                            float *y, int row_begin, int row_end) {
+  for (int r = row_begin; r &lt; row_end; r++) {
+    const uint8_t  *row = t-&gt;codes  + (size_t)r * t-&gt;row_bytes;
+    const uint16_t *sc  = t-&gt;scales + (size_t)r * t-&gt;n_groups;
+    float acc = 0.f;
+    for (int gi = 0; gi &lt; t-&gt;n_groups; gi++) {
+      int begin = gi*t-&gt;group, end = begin + t-&gt;group;
+      if (end &gt; t-&gt;cols) end = t-&gt;cols;
+      int32_t g = 0;                                     // ← 整数累加器
+      for (int j = begin; j &lt; end; j++) {
+        uint8_t byte = row[j &gt;&gt; 1];
+        int code = (j &amp; 1) ? (byte &gt;&gt; 4) : (byte &amp; 0xF);
+        g += (code - 8) * (int)xq[j];                    // int4 × int8 → int32
+      }
+      acc += (float)g * half2float(sc[gi]);              // 乘组缩放
+    }
+    y[r] = acc * x_scale;                                // 末尾再乘激活缩放
+  }
+}
+
+static void matvec_q8(const QT *t, const float *x, float *y) {
+  static int8_t xq[1024];       // 全模型最大输入维 128，1KB 足够，且复用
+  float xs;
+  quantize_act(x, t-&gt;cols, xq, &amp;xs);
+  matvec_q8_range(t, xq, xs, y, 0, t-&gt;rows);
+}</code></pre>
+
+    <p><b>③ 一个宏切换整张网络 + 平台可覆盖输出头</b>——这就是"同一份 C 两端通用"的全部机关：</p>
+    <pre><code>// 默认 fp32 激活；编译时加 -DLLM_INT8_ACT 即整张网络走整数路径
+#ifdef LLM_INT8_ACT
+#define MATVEC matvec_q8
+#else
+#define MATVEC matvec_q
+#endif
+
+// llm_forward 里每个矩阵乘都写成 MATVEC(...)，因此两端零改动：
+MATVEC(&amp;m-&gt;qkv[l], s-&gt;h, s-&gt;qkv);
+...
+// 输出头留了一个函数指针给平台覆盖（ESP32 用 int8 常驻 + 双核 range 拆分）
+if (m-&gt;head_matvec) m-&gt;head_matvec(&amp;m-&gt;tok_emb, s-&gt;x, s-&gt;logits);
+else                MATVEC(&amp;m-&gt;tok_emb, s-&gt;x, s-&gt;logits);</code></pre>
+    <ul>
+      <li><b>普通 CPU / PC</b>：什么都不定义，走 <code>matvec_q</code> 标量循环，靠 <code>-O3</code> 自动向量化；用于对齐 PyTorch 金标准（误差 1e-5）。</li>
+      <li><b>ESP32-S3</b>：编译加 <code>-DLLM_INT8_ACT</code>，<code>matvec_q8_range</code> 的 int8 点积映射到 LX7 向量 int8 MAC 指令；
+        再用 <code>head_matvec</code> 覆盖点把输出头开机解包成 int8 常驻 PSRAM、并用 <code>row_begin/row_end</code> 把行区间拆到两核并行。</li>
+      <li>两端的 fp16 缩放都用软件 <code>half2float</code> 位运算还原——谁都不需要 fp16 硬件。</li>
+    </ul>
+
+    <h2>7. 内存如何优化（本项目的灵魂）</h2>
+    <p>内存优化不是"某个技巧"，而是贯穿全程的<b>按访问模式分层</b>思想。<code>budget.py</code> 把三级参数与三级硬件对上号。</p>
+
+    <div class="mermaid">
+flowchart LR
+    subgraph P["参数（按访问模式）"]
+      C1["core 559K<br/>随机·每token"]
+      S1["stream 3.1M<br/>顺序扫一遍"]
+      T1["table 25M<br/>每token一行"]
+    end
+    subgraph HW["ESP32-S3 硬件"]
+      SR["SRAM 512KB<br/>快·随机好"]
+      PS["PSRAM 8MB<br/>顺序 60.7MB/s"]
+      FL["FLASH 16MB<br/>随机读 20.3µs/512B"]
+    end
+    C1 -->|常驻| SR
+    S1 -->|暂存 int8| PS
+    T1 -->|mmap 不搬运| FL
+    style C1 fill:#eaf6ec,stroke:#a3d9a5
+    style S1 fill:#eaf1fb,stroke:#2563c9
+    style T1 fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 7-1　三级参数 ↔ 三级硬件的映射</p>
+
+    <h3>7.1 片上实测带宽（N16R8）</h3>
+    <table>
+      <thead><tr><th>测量项</th><th class="num">数值</th></tr></thead>
+      <tbody>
+        <tr><td>PSRAM 顺序读</td><td class="num">60.7 MB/s</td></tr>
+        <tr><td>内部 SRAM 顺序读</td><td class="num">240 MB/s</td></tr>
+        <tr><td>flash 随机读（512B 行）</td><td class="num">20.3 µs</td></tr>
+        <tr><td><b>每 token 查表代价</b>（读 6 行随机）</td><td class="num"><b>~0.12 ms</b></td></tr>
+        <tr><td><b>每 token 输出头代价</b>（扫 1.5MB PSRAM）</td><td class="num"><b>~17.3 ms</b></td></tr>
+        <tr><td>纯带宽 tok/s 上限</td><td class="num">~58 tok/s</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip">
+      <p><span class="label">核心赌注被硅片证实：</span>那张 25M 参数的 flash 查表，只占每 token 内存时间的约 <b>0.7%</b>——几乎免费，完全如设计预期。
+      真正占内存流量的是<b>输出头</b>（baseline 同样要付这笔钱）。</p>
+    </div>
+
+    <h3>7.2 片上运行的内存布局与逐步提速</h3>
+    <p>导出模型 <b>14,912,332 字节</b>，装进自定义的 15,597,568 字节 flash 分区（余 685,236 字节）。
+    运行时：1.64MB 的 tied 嵌入/输出头开机拷进 PSRAM，25M 查表留在 flash，临时缓冲与 KV 缓存放 PSRAM，
+    分配完 PSRAM 仍余约 5100 KB。</p>
+
+    <table>
+      <thead><tr><th>实现阶段</th><th class="num">200-token 端到端</th><th class="num">每步耗时</th></tr></thead>
+      <tbody>
+        <tr><td>首个正确可移植版</td><td class="num">0.57 tok/s</td><td class="num">1757.2 ms</td></tr>
+        <tr><td>PSRAM 头 + 标量清理</td><td class="num">4.61–4.77 tok/s</td><td class="num">193.9 ms</td></tr>
+        <tr><td>双核精确 fp32 头</td><td class="num">5.67–6.22 tok/s</td><td class="num">139.4 ms</td></tr>
+        <tr><td><b>int8 头 + int8 激活（当前）</b></td><td class="num"><b>~9.5 tok/s</b></td><td class="num"><b>102.9 ms</b></td></tr>
+      </tbody>
+    </table>
+    <p>当前逐段耗时（ms/token，双核墙钟）：<b>输出头 57.6 | 注意力 25.6 | PLE 8.5 | FFN 6.9 | 输入 4.4</b>。
+    此时输出头已是 <b>PSRAM 带宽受限</b>而非算力受限——每 token 读 2.43MB int8 权重，在 60.7MB/s 下约 40ms 是硬地板。
+    继续提速的大杠杆是"减少读取字节数"（int4 头 + SIMD 解包）或"更小/分解的输出头"，而非继续堆标量优化。</p>
+
+    <div class="callout warn">
+      <p><span class="label">当前局限：</span>① ESP32-S3 的 SIMD 指令尚未启用（只用标量点积），头是带宽受限，SIMD 单独只能再省约 15%；
+      ② 领域仅限 TinyStories，缺乏世界知识/算术/多步推理，这个上限由稠密核心决定，查表改变不了；
+      ③ 58 tok/s 只是带宽天花板，非实测吞吐。</p>
+    </div>
+
+    <h2>8. 给初学者的总结</h2>
+    <ul>
+      <li><b>它是什么</b>：一个 28.9M 参数、只会写 TinyStories 风格小故事的模型，完整跑在 8 美元单片机上，约 9.5 tok/s。</li>
+      <li><b>为什么能塞进去</b>：把 25M 参数的嵌入查表留在 flash（每 token 只读约 450 字节），只让 559K 的核心占用宝贵的 SRAM。</li>
+      <li><b>关键思想</b>：Google Gemma 的 Per-Layer Embeddings + "按访问模式而非总量给参数记账"。</li>
+      <li><b>可信度</b>：两个随机种子、4-bit 量化后收益仍在、C 与 PyTorch 对齐到 1e-5、真机带宽实测——层层验证。</li>
+      <li><b>它不是什么</b>："28.9M 参数"指的是"通过内存层级拆分而常驻的存储参数量"，不代表能力翻倍；它仍是个玩具领域模型。</li>
+    </ul>
+
+    <p style="color:var(--muted);font-size:.85rem;margin-top:36px">
+    数据来源：项目 <code>RESULTS.md</code>、<code>src/model.py</code>、<code>src/train.py</code>、<code>src/budget.py</code>、
+    <code>firmware/common/llm.h</code>、<code>firmware/esp32_llm/esp32_llm.ino</code> 及 <code>firmware/esp32_llm/README.md</code>。</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="assets/common.js"></script>
+</body>
+</html>

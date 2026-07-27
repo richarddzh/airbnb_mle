@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>微型 LLM 与端侧推理 · 分析报告合集</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="menu-toggle" aria-label="目录">☰ 目录</button>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><a href="index.html">微型 LLM 分析报告</a></div>
+    <div class="subtitle">端侧大模型 · 训练 · 推理 · 内存优化</div>
+    <ul class="toc"></ul>
+  </aside>
+
+  <main class="content">
+    <h1>微型 LLM 与端侧推理：分析报告合集</h1>
+    <p class="lead">本合集针对三份材料做详细、面向初学者的中文解读：一个把 2890 万参数模型塞进 8 美元单片机的开源项目、
+    奠定"微型语言模型也能说流利英语"这一论断的 TinyStories 论文、以及 Karpathy 用一个 C 文件跑 Llama 2 的经典项目 llama2.c。
+    并额外补充一份 <a href="gemma-ple.html">Per-Layer Embeddings（PLE）</a> 专题，解读 esp32-ai 所依赖的 Google Gemma 3n 内存技术。</p>
+
+    <div class="callout note">
+      <p><span class="label">阅读建议：</span>三份报告彼此独立又相互关联。如果你是完全的初学者，建议按
+      <b>TinyStories 论文 → llama2.c → esp32-ai</b> 的顺序阅读：先理解"为什么小模型能工作"，
+      再理解"如何用最简单的代码训练和推理一个小模型"，最后理解"如何把它压进单片机"。</p>
+    </div>
+
+    <h2>报告导航</h2>
+    <div class="cards">
+      <a class="card" href="esp32-ai.html">
+        <h3>① esp32-ai 项目解读</h3>
+        <p>在 8 美元的 ESP32-S3 单片机上运行 28.9M 参数 LLM。涵盖代码构成、训练流程、
+        Transformer 与 PLE 架构、纯 C 推理实现，以及三级存储的内存优化。</p>
+        <span class="tag">代码 · 架构 · 内存优化</span>
+      </a>
+      <a class="card" href="tinystories-paper.html">
+        <h3>② TinyStories 论文解读</h3>
+        <p>arXiv:2305.07759。微软研究院提出用"三四岁小孩词汇量"的合成故事数据集，
+        让 1M~35M 参数的小模型也能生成连贯英文，并提出用 GPT-4 打分的评测范式。</p>
+        <span class="tag">论文 · 数据集 · 评测</span>
+      </a>
+      <a class="card" href="llama2c.html">
+        <h3>③ llama2.c 项目解读</h3>
+        <p>Andrej Karpathy 的极简项目：用 700 行纯 C（run.c）推理 Llama 2 架构，
+        配套 PyTorch 训练。涵盖模型定义、训练、导出格式与 int8 量化。</p>
+        <span class="tag">纯 C 推理 · 训练 · 量化</span>
+      </a>
+      <a class="card" href="gemma-ple.html">
+        <h3>④ Per-Layer Embeddings 解读</h3>
+        <p>esp32-ai 依赖的另一半核心：Google Gemma 3n 的逐层嵌入（PLE）。
+        含"它有没有论文"的诚实说明、原理、代码级实现，及它如何被 esp32-ai 复刻。</p>
+        <span class="tag">Gemma 3n · 内存优化 · 溯源</span>
+      </a>
+    </div>
+
+    <h2>三者的关系</h2>
+    <p>这三份材料构成一条清晰的技术脉络：<b>TinyStories</b> 证明了"窄领域 + 小模型"的可行性；
+    <b>llama2.c</b> 把这套思路做成最小可运行的训练/推理栈，并用 TinyStories 数据训练了一批 baby Llama；
+    <b>esp32-ai</b> 则在此基础上，借助 Google Gemma 的 Per-Layer Embeddings（PLE）思想，把模型进一步压进单片机。</p>
+
+    <div class="mermaid">
+flowchart LR
+    A["TinyStories 论文<br/>arXiv:2305.07759<br/>微软研究院 2023"] -->|证明:窄领域小模型可行| B["llama2.c<br/>Karpathy<br/>纯C推理 + PyTorch训练"]
+    A -->|提供训练数据集| B
+    B -->|启发:小模型可用纯C运行| C["esp32-ai<br/>slvDev<br/>28.9M 参数跑在单片机"]
+    D["Google Gemma 3n<br/>Per-Layer Embeddings<br/>(报告④)"] -->|提供内存分层思想| C
+    A -->|提供训练数据集| C
+    style A fill:#eaf1fb,stroke:#2563c9
+    style B fill:#eaf6ec,stroke:#a3d9a5
+    style C fill:#fff7e6,stroke:#ffd591
+    style D fill:#f4f6f8,stroke:#6b7785
+    </div>
+    <p class="figcap">图 0-1　四份报告之间的传承与依赖关系（PLE 见报告④）</p>
+
+    <div class="callout warn">
+      <p><span class="label">关于"独立工作"的说明：</span>esp32-ai 作者在 <code>RESULTS.md</code> 中明确声明，其项目在<b>代码与方法上</b>
+      并不派生自 llama2.c，真正的依赖是 TinyStories 数据集与 Google 公开的 PLE 设计；llama2.c 仅作为"精神启发"和对比参照出现。
+      本图中的箭头表达的是思想脉络与数据依赖，而非代码复用。</p>
+    </div>
+
+    <h2>核心数据速览</h2>
+    <div class="kpi">
+      <div class="box"><div class="v">28.9M</div><div class="k">esp32-ai 存储参数量</div></div>
+      <div class="box"><div class="v">~9.5 tok/s</div><div class="k">ESP32-S3 端到端速度</div></div>
+      <div class="box"><div class="v">14.9 MB</div><div class="k">4-bit 模型体积</div></div>
+      <div class="box"><div class="v">&lt;10M</div><div class="k">TinyStories 可连贯生成的最小规模</div></div>
+      <div class="box"><div class="v">700 行</div><div class="k">llama2.c 的 run.c 代码量</div></div>
+      <div class="box"><div class="v">15M</div><div class="k">llama2.c 示范模型参数量</div></div>
+    </div>
+
+    <p style="color:var(--muted);font-size:.85rem;margin-top:40px">
+    本报告由代码与论文原文分析生成，正文中的关键数值均尽量还原自原始仓库
+    （<code>RESULTS.md</code>、<code>src/</code>、<code>firmware/</code>）与论文 PDF 原文。图示采用 Mermaid 渲染。</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="assets/common.js"></script>
+</body>
+</html>

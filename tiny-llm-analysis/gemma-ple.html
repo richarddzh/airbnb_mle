@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Per-Layer Embeddings (PLE) 解读 · Gemma 3n 的端侧内存黑科技</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="menu-toggle" aria-label="目录">☰ 目录</button>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><a href="index.html">← 报告合集</a></div>
+    <div class="subtitle">Per-Layer Embeddings 解读</div>
+    <ul class="toc"></ul>
+  </aside>
+
+  <main class="content">
+    <h1>Per-Layer Embeddings（PLE）：Gemma 3n 的端侧内存黑科技</h1>
+    <p class="lead">这是 <a href="esp32-ai.html">esp32-ai</a> 项目"把大模型塞进单片机"所依赖的另一半核心思想。
+    本报告先如实回答"PLE 有没有一篇论文"，再详解它的原理、代码级实现，以及它如何被 esp32-ai 复刻到单片机上。</p>
+
+    <h2>0. 先回答你的问题：PLE 有"论文"吗？</h2>
+    <div class="callout warn">
+      <p><span class="label">诚实结论：</span>截至目前，<b>并没有一篇专门讲 Per-Layer Embeddings 的独立学术论文</b>。
+      PLE 是 Google DeepMind 在 <b>Gemma 3n</b> 中引入的一项架构创新，它的权威出处分散在下面几处，而不是一篇单独的 arXiv 论文。</p>
+    </div>
+
+    <table>
+      <thead><tr><th>权威来源</th><th>类型</th><th>它讲了什么</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://ai.google.dev/gemma/docs/gemma-3n" target="_blank">Gemma 3n 官方文档</a></td><td>Google 官方文档</td><td>PLE caching 的定义、有效参数 vs 原始参数、MatFormer、条件加载</td></tr>
+        <tr><td><a href="https://developers.googleblog.com/en/introducing-gemma-3n/" target="_blank">Introducing Gemma 3n（开发者博客）</a></td><td>Google 官方博客</td><td>PLE 显著降低 RAM 的核心主张、5B/8B → 2GB/3GB 内存</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2503.19786" target="_blank">Gemma 3 Technical Report（arXiv:2503.19786）</a></td><td>正式技术报告</td><td>把 PLE 作为端侧优化的<b>组件之一</b>提及，与 AltUp、LAuReL 并列（非专章）</td></tr>
+        <tr><td><a href="https://arxiv.org/abs/2310.07707" target="_blank">MatFormer（arXiv:2310.07707）</a></td><td>正式论文</td><td>与 PLE 配套的"套娃 Transformer"嵌套子模型思想（Google 官方引用）</td></tr>
+        <tr><td><a href="https://deepwiki.com/antimatter15/reverse-engineering-gemma-3n" target="_blank">reverse-engineering-gemma-3n</a></td><td>社区逆向工程</td><td>代码级还原 <code>PerLayerEmbedder</code> 的最细粒度实现（非同行评议）</td></tr>
+      </tbody>
+    </table>
+
+    <p>Google 在 Gemma 3n 预览博客中也写道"更多研究细节将在<b>即将发布的技术报告</b>中公布"——也就是说，
+    在预览发布时，PLE 尚无正式论文级描述。因此本报告的数据主要取自上述官方文档/博客与社区逆向工程实现。</p>
+
+    <div class="kpi">
+      <div class="box"><div class="v">5B → 2GB</div><div class="k">E2B：原始参数 → 内存占用</div></div>
+      <div class="box"><div class="v">8B → 3GB</div><div class="k">E4B：原始参数 → 内存占用</div></div>
+      <div class="box"><div class="v">262,144</div><div class="k">词表大小</div></div>
+      <div class="box"><div class="v">~4 KB</div><div class="k">每 token 每层只需加载的 PLE 数据</div></div>
+    </div>
+
+    <h2>1. 背景：Gemma 3n 为什么需要 PLE</h2>
+    <p><b>Gemma 3n</b> 是 Google 面向手机/平板/笔记本等"日常设备"优化的生成式模型（与下一代 Gemini Nano 共享架构），
+    支持文本、图像、<b>音频</b>多模态输入、32K 上下文、140+ 语言。要在移动设备上跑好大模型，最大的敌人还是<b>内存（RAM）</b>。</p>
+
+    <p>Gemma 3n 用一整套技术压缩内存，PLE 是其中最关键的一环：</p>
+    <ul>
+      <li><b>PLE caching（逐层嵌入缓存）</b>——把大量嵌入参数移出 RAM，缓存到快速本地存储，按需取用。</li>
+      <li><b>MatFormer（套娃 Transformer）</b>——一个大模型里嵌套小模型，可按需只激活核心子模型。</li>
+      <li><b>Conditional parameter loading（条件参数加载）</b>——纯文本任务时跳过视觉/音频参数不加载。</li>
+      <li>此外还有 <b>KVC sharing</b>（KV 缓存共享）与<b>激活量化</b>。</li>
+    </ul>
+
+    <h2>2. 关键数据：有效参数 vs 原始参数</h2>
+    <p>Gemma 3n 的命名很特别：<code>E2B</code>、<code>E4B</code> 里的 <b>E 表示 Effective（有效）</b>参数，
+    它比模型实际包含的总参数量<b>小</b>。参数被分为四组：<b>文本、视觉、音频、PLE</b>。</p>
+
+    <table>
+      <thead><tr><th>型号</th><th class="num">原始参数（Raw）</th><th class="num">有效参数 / 内存</th><th>关键手段</th></tr></thead>
+      <tbody>
+        <tr><td><b>E2B</b></td><td class="num">&gt; 5B</td><td class="num">≈ 1.91B / ~2 GB</td><td rowspan="2">PLE 缓存 + 参数跳过 + MatFormer 选择性激活</td></tr>
+        <tr><td><b>E4B</b></td><td class="num">8B</td><td class="num">≈ 4B / ~3 GB</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout note">
+      <p><span class="label">核心主张：</span>虽然原始参数是 5B/8B，但借助 PLE，模型能以"相当于 2B/4B 模型"的内存开销运行，
+      从而在手机上跑起本该跑不动的大模型。相比 Gemma 3 4B，Gemma 3n 首字响应约<b>快 1.5 倍</b>、质量更好、内存更小。</p>
+    </div>
+
+    <div class="mermaid">
+flowchart LR
+    subgraph RAW["E2B 原始 > 5B 参数（4 组）"]
+      TXT["文本参数"]
+      VIS["视觉参数"]
+      AUD["音频参数"]
+      PLE["PLE 参数（最大的一块）"]
+    end
+    TXT --> RAM["常驻 RAM 的有效参数<br/>≈ 1.91B（~2GB）"]
+    VIS -. 条件加载:纯文本时跳过 .-> SKIP["不加载"]
+    AUD -. 条件加载:纯文本时跳过 .-> SKIP
+    PLE -->|移出 RAM, 缓存到快存储<br/>按需逐层取用| FLASH["快速本地存储 (flash)"]
+    FLASH -. 每 token 每层取 ~4KB .-> RAM
+    style PLE fill:#fff7e6,stroke:#ffd591
+    style FLASH fill:#fff7e6,stroke:#ffd591
+    style RAM fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 2-1　把 PLE 与视觉/音频参数移出 RAM，是"有效参数远小于原始参数"的关键</p>
+
+    <h2>3. PLE 到底是什么、怎么工作</h2>
+    <p>传统 LLM 在网络<b>最底部</b>有<b>一张</b>巨大的 token 嵌入表，每个 token 只在这里<b>查一次</b>，
+    得到第一层的输入向量；此后各层靠注意力/FFN 不断更新残差流，<b>不再有逐层的专属嵌入</b>。
+    <b>PLE 的做法不是替换这张底部嵌入表</b>——它<b>保留</b>底部嵌入，然后<b>额外</b>为<b>每一层</b>再准备一份专属的"逐层嵌入"，
+    在每层计算的末尾<b>叠加注入</b>进残差流。</p>
+
+    <div class="callout note">
+      <p><span class="label">官方原文依据：</span>Google 文档 <code>ai.google.dev/gemma/docs/gemma-3n</code> 的 "PLE caching" 一节写道：
+      "PLE parameters … are used during model execution to create data that <b>enhances the performance of each model layer</b> …
+      cached to fast storage, and then <b>added to the model inference process as each layer runs</b>."
+      （即"提升<b>每一层</b>的表现"、"随<b>每层运行</b>加入推理过程"。）而"传统只在底部查一次"是标准 Transformer 常识，用作对照，非 Gemma 原文。</p>
+    </div>
+
+    <div class="mermaid">
+flowchart TB
+    subgraph CLASSIC["传统做法"]
+      C1["1 张大嵌入表<br/>vocab × d_model"] -->|底部查一次| C2["隐藏状态 h"]
+      C2 --> C3["Layer 1"] --> C4["Layer 2"] --> C5["... Layer N"]
+    end
+    subgraph PLEW["PLE 做法"]
+      P0["主嵌入表（小）"] --> H["隐藏状态 h"]
+      T["逐层嵌入表<br/>每层 vocab × 256<br/>（住在 flash）"]
+      H --> PL1["Layer 1 + 逐层嵌入[1]"]
+      PL1 --> PL2["Layer 2 + 逐层嵌入[2]"]
+      PL2 --> PLN["... Layer N + 逐层嵌入[N]"]
+      T -. 按 token 取第 l 层那一行 .-> PL1
+      T -.-> PL2
+      T -.-> PLN
+    end
+    CLASSIC ~~~ PLEW
+    style T fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 3-1　传统"底部一次嵌入" vs PLE"逐层注入嵌入"</p>
+
+    <p>为什么这样能省内存？因为这些逐层嵌入表加起来参数量巨大（占了原始参数的一大块），
+    但它们是<b>查表读取</b>的：每个 token 在某一层只需要表里的<b>一行</b>。于是可以把整张表放到<b>快速本地存储（flash）</b>，
+    每步只取用当前 token 当前层需要的一行（约 4KB），而不必把整张表塞进 RAM。这就是官方说的 <b>"PLE caching"</b>。</p>
+
+    <h3>3.1 主嵌入表 vs PLE：维度与参数量（叠加而非取代）</h3>
+    <p>很多人会以为 PLE 是"把底部那张大嵌入表换成小的"，其实相反：<b>PLE 是额外叠加的，而且是四组参数里最大的一块。</b>
+    以逆向工程参考实现的数值（<code>vocab=262144</code>、主隐藏维 <code>2048</code>、<code>ple_dim=256</code>、<code>30</code> 层）算一笔账：</p>
+
+    <table>
+      <thead><tr><th>矩阵</th><th>维度</th><th class="num">参数量</th><th>作用/位置</th></tr></thead>
+      <tbody>
+        <tr><td><b>主嵌入表</b>（底部查一次）</td><td><code>262144 × 2048</code></td><td class="num">≈ 0.537B</td><td>token→首层输入，常驻</td></tr>
+        <tr><td><b>PLE 逐层表</b>（单层）</td><td><code>262144 × 256</code></td><td class="num">≈ 67.1M</td><td>该层专属，住 flash</td></tr>
+        <tr><td><b>PLE 逐层表</b>（30 层合计）</td><td><code>262144 × 256 × 30</code></td><td class="num"><b>≈ 2.01B</b></td><td>按 token 逐层查一行</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip">
+      <p><span class="label">所以"变小了多少"？——并没有变小。</span>PLE 总量（~2.01B）约是主嵌入表（~0.537B）的 <b>3.7 倍</b>，
+      也正是 E2B "原始参数 &gt; 5B" 的主要来源。<b>省的是运行内存，不是参数量：</b>这 ~2B 参数被挪到 flash，
+      每步每层只取一行（256 维）。账正好对上——原始 &gt;5B 里减掉 PLE（~2B，移到 flash）+ 视觉/音频（纯文本时跳过），
+      常驻 RAM 的有效参数就落到 ≈1.91B（~2GB）。</p>
+    </div>
+
+    <h2>4. 代码级实现（逆向工程还原）</h2>
+    <p>社区逆向工程项目 <code>reverse-engineering-gemma-3n</code> 还原了 <code>PerLayerEmbedder</code> 的实现，
+    数据非常具体（以某一实现为准）：</p>
+
+    <table>
+      <thead><tr><th>组件</th><th>数值 / 类型</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>vocab_size</code></td><td class="num">262144</td><td>Gemma 3n 完整词表</td></tr>
+        <tr><td><code>embedding_dim</code></td><td class="num">256</td><td>每层逐层表示的维度</td></tr>
+        <tr><td><code>num_layers</code></td><td class="num">30</td><td>Transformer 层数（即 30 张逐层表）</td></tr>
+        <tr><td><code>embeddings</code></td><td><code>nn.ModuleList</code></td><td>装 30 张逐层嵌入表的容器</td></tr>
+        <tr><td>主隐藏维</td><td class="num">2048</td><td>模型主干隐藏状态维度（该实现）</td></tr>
+        <tr><td>边界保护</td><td><code>torch.clamp(ids,0,262143)</code></td><td>查表前把 token id 夹在合法范围</td></tr>
+      </tbody>
+    </table>
+
+    <p>每一层在<b>末尾</b>通过一个<b>门控（gating）</b>机制把逐层嵌入注入残差流，五个步骤：</p>
+    <ol>
+      <li><b>门控计算</b>：<code>F.gelu(per_layer_gate(hidden))</code> 把当前隐藏状态投影到 256 维。</li>
+      <li><b>选择性激活</b>：与该层专属的逐层嵌入切片做<b>逐元素相乘</b>。</li>
+      <li><b>投影</b>：<code>per_layer_proj()</code> 从 256 维扩回 2048 维。</li>
+      <li><b>归一化</b>：<code>per_layer_norm()</code>。</li>
+      <li><b>残差相加</b>：加回该层主计算路径的输出。</li>
+    </ol>
+
+    <div class="mermaid">
+flowchart TB
+    TOK["token id"] -->|clamp 0..262143| LK["查第 l 层逐层表<br/>取 256 维向量 ple_l<br/>（来自 flash，~4KB）"]
+    H["本层隐藏状态 hidden"] --> G["per_layer_gate<br/>→ 256 维"]
+    G --> GE["GELU"]
+    GE --> MUL["逐元素相乘 ×"]
+    LK --> MUL
+    MUL --> PR["per_layer_proj<br/>256 → 2048"]
+    PR --> NM["per_layer_norm"]
+    NM --> ADD["残差相加 回主路径"]
+    H --> ADD
+    style LK fill:#fff7e6,stroke:#ffd591
+    style MUL fill:#eaf1fb,stroke:#2563c9
+    </div>
+    <p class="figcap">图 4-1　单层内 PLE 门控注入的数据流（gate → ×嵌入 → proj → norm → 残差）</p>
+
+    <div class="callout tip">
+      <p><span class="label">为什么用"相乘"而不是"相加"？</span>逐元素相乘是一种<b>条件调制（gating）</b>：
+      门控向量与逐层嵌入互为"开关"，任一方为 0 都能压制另一方。这比简单地加一个"逐 token 偏置"表达力更强——
+      它让逐层嵌入的作用<b>取决于当前上下文</b>。</p>
+    </div>
+
+    <h3>4.1 设计辨析：分层"静态注入"会不会限制模型能力？</h3>
+    <p>这是一个很自然的疑问：<b>PLE 查出来的向量 <code>ple_l[token]</code> 只由 token id 决定，是静态的</b>；
+    可是到了很深的层，残差流里的隐藏状态早已是高度上下文化、综合了整句信息的表示。
+    在深层还往里塞一份"只认 token 本身"的静态向量，会不会拖累模型、限制它的能力？下面分三点回答。</p>
+
+    <p><b>① 内容静态，但"用多少"是上下文决定的。</b>回看注入公式：
+    <code>inject = norm( proj( gelu(gate(hidden)) ⊙ ple_l[token] ) )</code>。
+    <code>ple_l[token]</code> 确实是静态源，但门控 <code>gate(hidden)</code> 是<b>从当前上下文化的隐藏状态算出来的</b>。
+    逐元素相乘 <code>⊙</code> 让最终注入 = <b>静态源 × 动态门控</b>——<b>取哪张卡</b>是静态的，但<b>这一层实际用它的哪些维度、用多强</b>由上下文决定，
+    所以注入信号本身是上下文相关的，并非"硬塞一个死向量"。</p>
+
+    <p><b>② 它是"叠加"而非"替代"，因此不会降低能力上限。</b>注意力 + FFN 这条上下文计算主干<b>原封不动</b>，
+    PLE 只是往残差流里<b>额外加</b>一项。极端情况下若这份静态注入有害，门控只要学成 0，就退化回普通 Transformer。</p>
+
+    <div class="callout note">
+      <p><span class="label">关键结论：</span>从表达力看，PLE 的最坏情况 = <b>恒等（被门控关掉）</b>。
+      所以它<b>只能帮忙或被忽略，不会让模型比没有它更弱</b>。你担心的"静态注入限制能力"，
+      只有在它<b>替代</b>上下文主干时才会发生——而 PLE 没有替代主干。</p>
+    </div>
+
+    <p><b>③ 它换来的是什么。</b>一张底部嵌入表要用同一个向量服务所有层，而深浅层需要的 token 级特征其实不同
+    （浅层偏表层/构词，深层偏语义）。PLE 相当于给<b>每一层一份专属、按 token 索引的"特征备忘录"</b>：
+    深层不必再靠残差流费力地把"原始 token 是谁"一路保留下来，从而<b>腾出主干容量去做上下文综合</b>；
+    而这些静态特征存在 flash 里几乎不占 RAM。本质上是把一部分"token 级记忆"从<b>必须常驻 RAM 的稠密权重</b>，
+    挪成了<b>可缓存到 flash 的查表</b>——这是一次<b>参数效率</b>的取舍，而不是能力上限的取舍。</p>
+
+    <div class="callout warn">
+      <p><span class="label">诚实的边界：</span>你说的"静态"局限<b>理论上确实存在</b>——一张查表无法表达"这个 token 在这个具体上下文里意味着什么"，
+      这部分本就该由注意力/FFN 承担，PLE 只做互补的静态记忆。更重要的是，<b>PLE 没有公开论文，也没有公开的消融实验</b>
+      单独衡量"有 PLE vs 没 PLE"对能力的影响；Google 只给了定性结论。因此"到底帮多少、有没有隐性代价"目前<b>无法用公开数据量化</b>。</p>
+    </div>
+
+    <h2>5. PLE 的姊妹技术（Gemma 3n 一起用的）</h2>
+    <table>
+      <thead><tr><th>技术</th><th>作用</th><th>出处</th></tr></thead>
+      <tbody>
+        <tr><td><b>MatFormer</b>（套娃 Transformer）</td><td>一个大模型内嵌套小模型，E4B 内含 E2B；可"Mix-n-Match"拼出 2B~4B 的中间尺寸，按需只激活核心，省算力/时延/能耗</td><td>arXiv:2310.07707</td></tr>
+        <tr><td><b>AltUp</b>（Alternating Updates，交替更新）</td><td>在不显著增加计算的前提下"加宽"表示的技巧；与 PLE 一起用于 Gemma 3n</td><td>Gemma 3n 组件</td></tr>
+        <tr><td><b>LAuReL</b>（Learned Augmented Residual Layer）</td><td>可学习的增强残差连接</td><td>Gemma 3n 组件</td></tr>
+        <tr><td><b>KVC sharing</b>（KV 缓存共享）</td><td>降低注意力 KV 缓存的内存占用</td><td>Gemma 3n</td></tr>
+        <tr><td><b>条件参数加载</b></td><td>纯文本任务跳过视觉/音频参数</td><td>Gemma 3n 文档</td></tr>
+        <tr><td><b>MobileNet-V5</b></td><td>高性能移动端视觉编码器</td><td>Gemma 3n 文档</td></tr>
+      </tbody>
+    </table>
+
+    <h2>6. PLE 如何被 esp32-ai 复刻到单片机</h2>
+    <p>这正是本合集的闭环。<a href="esp32-ai.html">esp32-ai</a> 把 Gemma 3n 的 PLE 思想<b>降三个数量级</b>搬到 ESP32-S3 单片机上，
+    并在代码注释里明确说它复刻的是"Gemma 的 <code>Gemma…TextDecoderLayer</code>，但<b>去掉了 AltUp</b>"。对照如下：</p>
+
+    <table>
+      <thead><tr><th>方面</th><th>Gemma 3n（手机/GPU）</th><th>esp32-ai（单片机）</th></tr></thead>
+      <tbody>
+        <tr><td>逐层表放哪</td><td>快速本地存储（flash）缓存，按需加载</td><td>flash 分区，<code>mmap</code> 内存映射，每 token 读几行</td></tr>
+        <tr><td>词表大小</td><td class="num">262,144</td><td class="num">32,768（实际训练 25,353）</td></tr>
+        <tr><td>逐层维 ple_dim</td><td class="num">256</td><td class="num">128</td></tr>
+        <tr><td>层数</td><td class="num">30</td><td class="num">6</td></tr>
+        <tr><td>主隐藏维</td><td class="num">2048</td><td class="num">96</td></tr>
+        <tr><td>注入公式</td><td><code>norm(proj(gelu(gate(h)) · ple_l))</code> 残差</td><td><b>完全相同</b>：<code>ple_norm(ple_proj(gelu(ple_gate(x)) · ple[l]))</code></td></tr>
+        <tr><td>逐层输入构成</td><td>上下文投影 + 逐层查表</td><td><code>(RMSNorm(proj(x)/√D) + table·√P) / √2</code></td></tr>
+        <tr><td>AltUp</td><td>使用</td><td><b>刻意去掉</b>（单片机装不下）</td></tr>
+        <tr><td>每 token 逐层读取</td><td>~4 KB</td><td>~450 B（约 6 行）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="mermaid">
+flowchart LR
+    G["Gemma 3n PLE<br/>手机/GPU 内存层级<br/>flash 缓存逐层表"] -->|降 3 个数量级<br/>同样的门控注入公式| E["esp32-ai PLE<br/>单片机 SRAM/flash 层级<br/>mmap 25M 查表"]
+    G -. 保留 .-> K1["逐层门控注入"]
+    G -. 去掉 .-> K2["AltUp（太重）"]
+    E --> K1
+    style G fill:#f4f6f8,stroke:#6b7785
+    style E fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 6-1　PLE 从手机降维到单片机：保留门控注入、去掉 AltUp</p>
+
+    <div class="callout note">
+      <p><span class="label">洞见迁移：</span>Gemma 3n 面对的是"手机 RAM 有限、flash 充裕"，esp32-ai 面对的是"单片机 SRAM 只有 512KB、flash 有 16MB"。
+      虽然硬件差三个数量级，但<b>内存层级的"形状"相同</b>——快内存小、慢存储大且擅长稀疏随机读。PLE 正是为这种"形状"设计的，
+      所以能直接迁移。这就是 esp32-ai 的核心洞见。</p>
+    </div>
+
+    <h2>7. 局限与要点</h2>
+    <ul>
+      <li><b>PLE 不改变"能力上限"</b>：它只是把"占体积但稀疏访问"的嵌入参数挪出快内存，省的是<b>内存</b>，
+        不是让模型"更聪明"。真正的推理能力仍由稠密主干决定。</li>
+      <li><b>省的是 RAM，不是存储</b>：逐层表仍要占用 flash/存储空间，只是不占宝贵的运行时 RAM。</li>
+      <li><b>依赖存储随机读性能</b>：每 token 每层都要从 flash 取一行，若存储随机读太慢会成为瓶颈
+        （esp32-ai 实测 flash 512B 随机读约 20.3µs，占比极小，验证了可行性）。</li>
+      <li><b>没有独立论文</b>：想深挖细节，要同时看官方文档、Gemma 3 技术报告与社区逆向工程，而非某一篇论文。</li>
+    </ul>
+
+    <h2>8. 给初学者的一句话总结</h2>
+    <p>PLE（Per-Layer Embeddings）的精髓是：<b>"把每层专属、体积巨大但每次只查一行的嵌入表，从 RAM 挪到 flash，用时才取。"</b>
+    Gemma 3n 用它让 5B/8B 模型在手机上以 2GB/3GB 内存运行；esp32-ai 用同一招，让 28.9M 模型在只有 512KB SRAM 的 8 美元单片机上跑起来。
+    它没有独立论文，但它的思想清晰而通用——凡是"快内存小、慢存储大"的设备，都能受益。</p>
+
+    <p style="color:var(--muted);font-size:.85rem;margin-top:36px">
+    数据来源：Gemma 3n 官方文档（ai.google.dev/gemma/docs/gemma-3n）、Google 开发者博客（Introducing Gemma 3n）、
+    Gemma 3 Technical Report（arXiv:2503.19786）、MatFormer（arXiv:2310.07707）、
+    社区项目 antimatter15/reverse-engineering-gemma-3n，以及 esp32-ai 仓库 <code>src/model.py</code> 与 <code>RESULTS.md</code>。</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="assets/common.js"></script>
+</body>
+</html>

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llama2.c 解读 · 用 700 行纯 C 推理 Llama 2</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="menu-toggle" aria-label="目录">☰ 目录</button>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><a href="index.html">← 报告合集</a></div>
+    <div class="subtitle">llama2.c 解读</div>
+    <ul class="toc"></ul>
+  </aside>
+
+  <main class="content">
+    <h1>llama2.c：用 700 行纯 C 推理 Llama 2</h1>
+    <p class="lead">项目：<a href="https://github.com/karpathy/llama2.c" target="_blank">github.com/karpathy/llama2.c</a>　
+    作者：Andrej Karpathy。目标：用 PyTorch 训练 Llama 2 架构，再用<b>一个约 700 行、零依赖的 C 文件</b>（<code>run.c</code>）完成推理。
+    它脱胎自 nanoGPT，把架构从 GPT-2 换成 Llama 2，核心是那份纯 C 推理引擎。</p>
+
+    <div class="kpi">
+      <div class="box"><div class="v">700 行</div><div class="k">run.c 纯 C 推理</div></div>
+      <div class="box"><div class="v">15M</div><div class="k">示范 baby Llama 参数量</div></div>
+      <div class="box"><div class="v">~110 tok/s</div><div class="k">M1 MacBook Air 上运行 15M</div></div>
+      <div class="box"><div class="v">32000</div><div class="k">默认 Llama 2 词表大小</div></div>
+      <div class="box"><div class="v">0 依赖</div><div class="k">纯 C，无第三方库</div></div>
+    </div>
+
+    <div class="callout note">
+      <p><span class="label">设计哲学：</span>与 llama.cpp 相比，Karpathy 想要的是<b>极简、最小、可教学</b>——
+      因此硬编码 Llama 2 架构，只用一份纯 C、无依赖的推理文件。目标是成为"训练/微调并部署微型 LLM（约 100M~1B 参数）
+      到边缘设备（MCU、手机、浏览器、笔记本）"这一工作流最简单、最可魔改的仓库。</p>
+    </div>
+
+    <h2>1. 项目全景与代码构成</h2>
+    <p>项目是一个"全栈"训练 + 推理方案，Python 侧负责训练与导出，C 侧负责推理。</p>
+    <table>
+      <thead><tr><th>文件</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>model.py</code></td><td>用 PyTorch 定义 Llama 2 架构（<code>ModelArgs</code>、<code>Transformer</code>、RoPE、注意力、SwiGLU）</td></tr>
+        <tr><td><code>train.py</code></td><td>训练脚本（源自 nanoGPT），支持 DDP 多卡、梯度累积、混合精度、余弦调度</td></tr>
+        <tr><td><code>tinystories.py</code></td><td>下载并预分词 TinyStories 数据集，可训练自定义 BPE 分词器</td></tr>
+        <tr><td><code>export.py</code></td><td>把 PyTorch 检查点导出为 run.c 可读的 <code>.bin</code>（version 0/1/2，含量化）</td></tr>
+        <tr><td><b><code>run.c</code></b></td><td><b>核心</b>：fp32 纯 C 推理引擎（约 700 行）</td></tr>
+        <tr><td><code>runq.c</code></td><td>int8 量化版推理引擎（Q8_0）</td></tr>
+        <tr><td><code>sample.py</code></td><td>用 PyTorch 直接采样生成</td></tr>
+        <tr><td><code>tokenizer.py</code> / <code>tokenizer.bin</code></td><td>分词器训练与导出为 C 可读格式</td></tr>
+        <tr><td><code>test.c</code> / <code>test_all.py</code></td><td>把 C 与 Python 前向 200 步对齐校验</td></tr>
+        <tr><td><code>win.c</code> / <code>win.h</code></td><td>Windows 平台兼容层（mmap 等）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="mermaid">
+flowchart LR
+    subgraph T["训练侧 (PyTorch)"]
+      TS["tinystories.py<br/>数据 + 分词"] --> TP["train.py<br/>训练 Transformer"]
+      MP["model.py<br/>Llama2 定义"] --> TP
+      TP --> CK["检查点 .pt"]
+    end
+    CK --> EX["export.py<br/>导出 .bin"]
+    EX -->|version 0/1| RC["run.c (fp32)"]
+    EX -->|version 2 量化| RQ["runq.c (int8)"]
+    TK["tokenizer.bin"] --> RC
+    TK --> RQ
+    RC --> OUT["流式生成文本"]
+    RQ --> OUT
+    style T fill:#eaf1fb,stroke:#2563c9
+    style RC fill:#eaf6ec,stroke:#a3d9a5
+    style RQ fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 1-1　训练 → 导出 → C 推理的全栈流程</p>
+
+    <h2>2. 模型架构（model.py）</h2>
+    <p><code>model.py</code> 实现的是标准 Llama 2 架构。相比 GPT-1/GPT-2，主要区别有：
+    ① 用 <b>RoPE 旋转位置编码</b>取代绝对/学习式位置编码；② 前馈用更花哨的 <b>SwiGLU</b>；
+    ③ 用 <b>RMSNorm</b> 取代 LayerNorm；④ 所有 Linear 层 <code>bias=False</code>；⑤ 可选<b>多查询注意力（multiquery/GQA）</b>。</p>
+
+    <h3>2.1 超参 ModelArgs</h3>
+    <table>
+      <thead><tr><th>字段</th><th>含义</th><th>Llama-7B 默认</th></tr></thead>
+      <tbody>
+        <tr><td><code>dim</code></td><td>模型隐藏维</td><td class="num">4096</td></tr>
+        <tr><td><code>n_layers</code></td><td>Transformer 层数</td><td class="num">32</td></tr>
+        <tr><td><code>n_heads</code></td><td>查询头数</td><td class="num">32</td></tr>
+        <tr><td><code>n_kv_heads</code></td><td>KV 头数（可小于查询头 → 多查询）</td><td class="num">None(=n_heads)</td></tr>
+        <tr><td><code>vocab_size</code></td><td>词表大小</td><td class="num">32000</td></tr>
+        <tr><td><code>hidden_dim</code></td><td>FFN 隐藏维</td><td>≈ 4·dim·2/3 对齐到 multiple_of</td></tr>
+        <tr><td><code>multiple_of</code></td><td>FFN 隐藏维对齐倍数</td><td class="num">256</td></tr>
+        <tr><td><code>norm_eps</code></td><td>RMSNorm eps</td><td class="num">1e-5</td></tr>
+        <tr><td><code>max_seq_len</code></td><td>最大上下文</td><td class="num">2048</td></tr>
+      </tbody>
+    </table>
+
+    <h3>2.2 核心组件逐块拆解</h3>
+    <ul>
+      <li><b>RMSNorm</b>：<code>x · rsqrt(mean(x²)+eps) · weight</code>，先在 fp32 上算再转回原精度。</li>
+      <li><b>RoPE</b>：<code>precompute_freqs_cis</code> 预计算 cos/sin，<code>apply_rotary_emb</code> 把 Q/K 视作复数对旋转（相对位置编码）。</li>
+      <li><b>Attention（GQA）</b>：<code>wq/wk/wv/wo</code> 四个无偏置线性层。KV 头可少于 Q 头，用 <code>repeat_kv</code> 把 KV 复制
+        <code>n_rep</code> 份共享——这就是<b>分组多查询注意力</b>，省 KV 缓存。若 PyTorch≥2.0 用 flash attention，否则手写带因果 mask 的 softmax。</li>
+      <li><b>FeedForward（SwiGLU）</b>：<code>w2(silu(w1(x)) · w3(x))</code>，三个线性层。</li>
+      <li><b>TransformerBlock</b>：<code>h = x + attn(attention_norm(x))</code> → <code>out = h + ffn(ffn_norm(h))</code>（前置归一化 + 残差）。</li>
+      <li><b>权重绑定</b>：<code>tok_embeddings.weight = output.weight</code>，输入嵌入与输出分类头共享权重。</li>
+      <li><b>残差投影特殊初始化</b>：对 <code>w3</code>/<code>wo</code> 用 <code>std = 0.02/√(2·n_layers)</code>（GPT-2 论文做法）。</li>
+    </ul>
+
+    <div class="mermaid">
+flowchart TB
+    TOK["tokens"] --> EMB["tok_embeddings 查表"]
+    EMB --> DROP["dropout"]
+    DROP --> LOOP
+    subgraph LOOP["n_layers 个 TransformerBlock"]
+      AN["attention_norm (RMSNorm)"] --> ATT["Attention: wq/wk/wv + RoPE<br/>+ repeat_kv(GQA) + 因果注意力 + wo"]
+      ATT --> R1["残差: h = x + attn"]
+      R1 --> FN["ffn_norm (RMSNorm)"]
+      FN --> FF["FeedForward: w2(silu(w1)·w3)"]
+      FF --> R2["残差: out = h + ffn"]
+    end
+    LOOP --> NORM["final RMSNorm"]
+    NORM --> HEAD["output 线性 (= 嵌入权重)"]
+    HEAD --> LOGITS["logits[vocab]"]
+    style ATT fill:#eaf1fb,stroke:#2563c9
+    style FF fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 2-1　Llama 2 前向结构（model.py）</p>
+
+    <h3>2.3 训练侧 vs 推理侧的一个小优化</h3>
+    <p>前向时，如果给了 <code>targets</code>（训练），就对<b>所有位置</b>算 logits 并求交叉熵；
+    如果没给（推理），只对<b>最后一个位置</b>算 logits——省掉无用计算。此外 <code>estimate_mfu</code> 会按
+    <code>flops_per_token = 6N + 12·L·H·Q·T</code> 估算 A100 bf16 的算力利用率（MFU）。</p>
+
+    <h2>3. 如何训练一个 baby Llama</h2>
+    <h3>3.1 数据准备（tinystories.py）</h3>
+    <p>下载 TinyStories，用 SentencePiece 训练自定义 BPE（默认可选 4096 等小词表），预分词后存为 token 流供训练读取。
+    小词表的好处：嵌入表更小 → 参数更少、推理更快、序列更短。</p>
+
+    <h3>3.2 训练配方（train.py）</h3>
+    <p>README 给出的 <b>110M 模型</b>真实训练配方（作者自评"并非最优但合理"）：</p>
+    <table>
+      <thead><tr><th>元参数</th><th>值</th></tr></thead>
+      <tbody>
+        <tr><td>dim / n_layers / n_heads</td><td class="num">768 / 12 / 12（每头 64 通道）</td></tr>
+        <tr><td>seq_len</td><td class="num">1024</td></tr>
+        <tr><td>batch_size</td><td class="num">16（A100 40GB 显存上限）</td></tr>
+        <tr><td>gradient_accumulation_steps</td><td class="num">8</td></tr>
+        <tr><td>每次更新总 token 数</td><td class="num">16 × 1024 × 8 = 131,072</td></tr>
+        <tr><td>learning_rate</td><td class="num">4e-4（作者认为略低）</td></tr>
+        <tr><td>max_iters</td><td class="num">200K（略高）</td></tr>
+        <tr><td>dropout</td><td class="num">0.1</td></tr>
+        <tr><td>并行</td><td>DDP，4× A100，训练约 1 天</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip">
+      <p><span class="label">调参经验（作者原话精炼）：</span>参考 Chinchilla 论文末表理解 dim/n_layers/n_heads 如何协同缩放；
+      每次更新的<b>总 batch token 数</b>中等应用约 <b>100K</b>；先把 <code>batch_size</code> 拉满显存，再用梯度累积补到目标 token 数；
+      学习率能高就高，小网络甚至可用 1e-3+，中型 3e-4 较稳。</p>
+    </div>
+
+    <h3>3.3 官方 TinyStories 模型系列</h3>
+    <p>这批模型都用 TinyStories 训练，托管在 HuggingFace <code>tinyllamas</code>：</p>
+    <table>
+      <thead><tr><th>model</th><th class="num">dim</th><th class="num">n_layers</th><th class="num">n_heads</th><th class="num">n_kv_heads</th><th class="num">ctx</th><th class="num">参数量</th><th class="num">val loss</th></tr></thead>
+      <tbody>
+        <tr><td>260K</td><td class="num">64</td><td class="num">5</td><td class="num">8</td><td class="num">4</td><td class="num">512</td><td class="num">260K</td><td class="num">1.297</td></tr>
+        <tr><td>OG (15M)</td><td class="num">288</td><td class="num">6</td><td class="num">6</td><td class="num">6</td><td class="num">256</td><td class="num">15M</td><td class="num">1.072</td></tr>
+        <tr><td>42M</td><td class="num">512</td><td class="num">8</td><td class="num">8</td><td class="num">8</td><td class="num">1024</td><td class="num">42M</td><td class="num">0.847</td></tr>
+        <tr><td>110M</td><td class="num">768</td><td class="num">12</td><td class="num">12</td><td class="num">12</td><td class="num">1024</td><td class="num">110M</td><td class="num">0.760</td></tr>
+      </tbody>
+    </table>
+    <p>110M 模型的规模等价于 <b>GPT-1</b>，也是 <b>GPT-2 small</b> 系列里最小的那个（只是上下文 1024 而非 2048）。</p>
+
+    <h2>4. 纯 C 推理实现（run.c）</h2>
+    <p><code>run.c</code> 用三个结构体组织一切，无任何第三方依赖：</p>
+    <table>
+      <thead><tr><th>结构体</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>Config</code></td><td>模型维度（dim / hidden_dim / n_layers / n_heads / n_kv_heads / vocab_size / seq_len）</td></tr>
+        <tr><td><code>TransformerWeights</code></td><td>所有权重指针（嵌入表、各层 RMSNorm、wq/wk/wv/wo、w1/w2/w3、最终 norm、可选分类头）</td></tr>
+        <tr><td><code>RunState</code></td><td>前向时的激活缓冲（x、xb、q/k/v、att、hb、logits、以及 KV 缓存）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>4.1 权重加载：内存映射检查点</h3>
+    <p>C 侧用 <code>mmap</code>（Windows 走 <code>win.c</code> 兼容层）把 <code>.bin</code> 检查点直接映射进内存，
+    权重指针按固定顺序在文件上"就地绑定"，无需逐个 <code>malloc</code>+拷贝——这也是能在受限设备上运行的关键。</p>
+
+    <h3>4.2 前向单步 forward()</h3>
+    <div class="mermaid">
+flowchart TB
+    E["memcpy 嵌入行 → x"] --> LP
+    subgraph LP["逐层 l = 0..n_layers-1"]
+      N1["rmsnorm(x) → xb"] --> QKV["matmul: wq/wk/wv<br/>k,v 直接写进 KV cache"]
+      QKV --> ROPE["对 q,k 施加 RoPE 旋转"]
+      ROPE --> MH["多头注意力 (#pragma omp 并行)<br/>score=q·k/√d → softmax → 加权 v"]
+      MH --> WO["matmul(wo) → 残差回 x"]
+      WO --> N2["rmsnorm(x) → xb"]
+      N2 --> FFN["matmul w1,w3 → SwiGLU silu(w1)·w3 → matmul w2 → 残差"]
+    end
+    LP --> FN["rmsnorm 最终"]
+    FN --> CLS["matmul(wcls) → logits"]
+    CLS --> SMP["采样器: argmax / 温度+top-p"]
+    SMP --> NEXT["下一个 token"]
+    style MH fill:#eaf1fb,stroke:#2563c9
+    style FFN fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 4-1　run.c 中 forward() 的单步计算流程</p>
+
+    <ul>
+      <li><b>KV 缓存</b>：<code>key_cache</code>/<code>value_cache</code> 按 <code>[层][位置][kv_dim]</code> 布局，
+        每步只算当前位置的 K/V 并写入缓存，注意力对 <code>0..pos</code> 历史求和。</li>
+      <li><b>RoPE</b>：直接在循环里对 <code>q</code>、<code>k</code> 的每一对维度做复数旋转；<code>rotn</code> 控制只旋 q 还是 q+k（GQA 下 K 维更少）。</li>
+      <li><b>多头注意力</b>：用 <code>#pragma omp parallel for</code> 按头并行；每头点积→ <code>/√head_size</code> → softmax → 加权 value。</li>
+      <li><b>matmul</b>：最朴素的 <code>W(d,n)·x(n)</code>，也用 OpenMP 并行行。</li>
+      <li><b>采样器</b>：支持贪心 argmax、温度缩放 + <b>top-p（nucleus）</b>采样。</li>
+      <li><b>分词器</b>：C 侧实现字节级 BPE 的合并/解码，从 <code>tokenizer.bin</code> 读词表与分数。</li>
+    </ul>
+
+    <div class="callout note">
+      <p><span class="label">性能：</span>在 M1 MacBook Air 上，15M 模型 fp32 版约 <b>110 tok/s</b>。
+      用 <code>-Ofast -fopenmp -march=native</code> 及合适线程数（建议等于物理核数）可显著加速。</p>
+    </div>
+
+    <h2>5. int8 量化（runq.c）</h2>
+    <p>fp32 版每个权重占 4 字节，检查点大且慢。<code>runq.c</code> 采用 llama.cpp 术语的 <b>Q8_0</b> 量化：
+    对称量化到 <code>[-127, 127]</code>，只量化参与 matmul 的权重（RMSNorm 的缩放/偏置仍保 fp32，因为很敏感）。</p>
+    <p>进一步地，它<b>连激活也动态量化</b>到 int8，使 matmul 变成纯整数运算——这才是提速的根本来源。</p>
+
+    <table>
+      <thead><tr><th>指标（Llama-2 7B 为例）</th><th>fp32</th><th>int8 (Q8_0)</th></tr></thead>
+      <tbody>
+        <tr><td>检查点体积</td><td class="num">26 GB</td><td class="num">6.7 GB（↓4×）</td></tr>
+        <tr><td>推理速度（OMP 64 线程）</td><td class="num">4.6 tok/s</td><td class="num">14 tok/s（↑3×）</td></tr>
+      </tbody>
+    </table>
+    <p>导出量化模型用 <code>export.py --version 2</code>；质量仅有轻微下降。README 也指出 LLM 甚至能容忍 4-bit
+    ——这正是 <a href="esp32-ai.html">esp32-ai</a> 走 4-bit 路线的背景。</p>
+
+    <div class="mermaid">
+flowchart LR
+    W["fp32 权重"] -->|"对称量化 [-127,127]"| WQ["int8 权重 + 组缩放"]
+    A["fp32 激活"] -->|每次前向动态量化| AQ["int8 激活 + 缩放"]
+    WQ --> MM["int8×int8 → int32 matmul"]
+    AQ --> MM
+    MM -->|乘缩放还原| Y["fp32 结果"]
+    style MM fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 5-1　Q8_0：权重与激活同时量化，matmul 走整数运算</p>
+
+    <h2>6. 导出格式与自定义分词器</h2>
+    <ul>
+      <li><b>导出版本</b>：version 0（原始 fp32）、version 1（改进的 fp32 头部）、version 2（int8 量化）。
+        也可用 <code>--meta-llama</code> 导出 Meta 官方权重，或用 <code>--hf</code> 导出 HuggingFace 上的 Llama 2 架构模型。</li>
+      <li><b>自定义分词器</b>：默认 Llama 2 分词器 32000 词。小应用可训练更小词表（如 4096），
+        用 <code>-z data/tok4096.bin</code> 传给 run.c。小词表 → 参数更少、更快、序列更短。</li>
+    </ul>
+
+    <h2>7. 与本合集其它材料的联系</h2>
+    <ul>
+      <li><b>← TinyStories</b>：llama2.c 直接以 TinyStories 论文为"小模型可用"的依据，并用该数据集训练 baby Llama 系列。</li>
+      <li><b>→ esp32-ai</b>：esp32-ai 作者称 llama2.c 让很多人（包括他自己）相信"能训练一个微型 LM 并用纯 C 运行"。
+        但要强调：esp32-ai 在<b>代码与方法上并不派生自 llama2.c</b>（见其 <code>RESULTS.md</code> 的 Provenance 声明），
+        二者是同一"微型 LM/单片机"空间里的独立工作。llama2.c 是 fp32/int8 的通用架构；esp32-ai 则专门为单片机内存层级做了 PLE + 4-bit 定制。</li>
+    </ul>
+
+    <h2>8. 给初学者的一句话总结</h2>
+    <p>llama2.c 把"现代 LLM 到底怎么跑"这件事，剥到只剩一份能读懂的 C 文件：<b>加载权重 → 逐层
+    RMSNorm/RoPE/注意力/SwiGLU → 采样下一个词</b>。它是理解 Transformer 推理、KV 缓存、量化最好的"活教材"，
+    也是 esp32-ai 这类端侧项目的精神起点。</p>
+
+    <p style="color:var(--muted);font-size:.85rem;margin-top:36px">
+    数据来源：llama2.c 仓库 <code>README.md</code>、<code>model.py</code>、<code>run.c</code>、<code>runq.c</code>、<code>export.py</code>。</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="assets/common.js"></script>
+</body>
+</html>

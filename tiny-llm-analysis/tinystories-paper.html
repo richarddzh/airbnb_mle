@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyStories 论文解读 · 小模型能有多小还能说流利英语</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<button class="menu-toggle" aria-label="目录">☰ 目录</button>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><a href="index.html">← 报告合集</a></div>
+    <div class="subtitle">TinyStories 论文解读</div>
+    <ul class="toc"></ul>
+  </aside>
+
+  <main class="content">
+    <h1>TinyStories：语言模型能有多小，还能说出连贯的英语？</h1>
+    <p class="lead">论文：<a href="https://arxiv.org/abs/2305.07759" target="_blank">arXiv:2305.07759</a>　
+    作者：Ronen Eldan、Yuanzhi Li（微软研究院，2023）。核心主张：只要把语言的<b>领域收窄</b>到"三四岁小孩能懂的故事"，
+    参数量<b>低于 1000 万</b>的小模型也能生成语法几乎完美、情节连贯的多段落故事。</p>
+
+    <div class="kpi">
+      <div class="box"><div class="v">&lt;10M</div><div class="k">可连贯生成的参数量下限</div></div>
+      <div class="box"><div class="v">1–8 层</div><div class="k">实验模型层数范围</div></div>
+      <div class="box"><div class="v">1 块</div><div class="k">最简甚至只需 1 个 Transformer 块</div></div>
+      <div class="box"><div class="v">≤30 小时</div><div class="k">单张 V100 GPU 训练时间</div></div>
+      <div class="box"><div class="v">GPT-4</div><div class="k">新评测范式：当老师打分</div></div>
+    </div>
+
+    <h2>1. 研究动机：小模型到底为什么"说不出话"？</h2>
+    <p>此前的普遍认知是：要生成连贯英文，模型至少得几亿参数。像 <b>GPT-Neo（small）</b>或 <b>GPT-2（small）</b>这样约
+    <b>1.25 亿参数</b>的模型，即便在 Pile、Common Crawl、CC-100 等大语料上充分训练，也常常只能写出几个词就语无伦次、
+    重复、离题。</p>
+
+    <p>作者提出一个尖锐的问题：小模型的无能，究竟是<b>自然语言本身的内在复杂度</b>造成的，
+    还是<b>训练语料过于宽泛庞杂</b>造成的？当我们在维基百科上训练时，其实是在同时教模型两件事：
+    ① 怎么说英语；② 如何编码和检索海量跨领域的事实。会不会是第二件事"淹没"了小模型，
+    以至于它学不好第一件事——语言的核心机制？</p>
+
+    <div class="callout note">
+      <p><span class="label">关键假设：</span>如果能设计一个数据集，<b>保留</b>语言的本质要素（语法、词汇、事实、推理），
+      但<b>大幅收窄</b>其广度与多样性，也许就能把"学会说连贯英语"所需的最小规模暴露出来。这就是 TinyStories 的由来。</p>
+    </div>
+
+    <h2>2. TinyStories 数据集是怎么造出来的</h2>
+    <p>TinyStories 是一个<b>合成</b>数据集：用 <b>GPT-3.5 和 GPT-4</b> 生成短篇故事，每篇 2–3 段，情节简单、主题一致，
+    只使用一个典型 3–4 岁孩子能理解的词汇。</p>
+
+    <h3>2.1 如何保证多样性（最大难点）</h3>
+    <p>直接让大模型"写个简单故事"，即使调高温度，产出也会高度重复，多样性远不足以训练语言模型。作者的解法：</p>
+    <ul>
+      <li>收集约 <b>1500 个基础词</b>，模拟三四岁孩子的词汇，分成<b>名词、动词、形容词</b>三类。</li>
+      <li>每次生成随机抽 <b>3 个词</b>（1 动词 + 1 名词 + 1 形容词），要求故事把这三个词自然融合进去。这迫使故事覆盖整个儿童词汇空间。</li>
+      <li>再随机附加若干"<b>故事特征</b>"要求：对话（dialogue）、情节转折（plot twist）、坏结局（bad ending）、
+        道德寓意（moral value）、伏笔（foreshadowing）、冲突（conflict）。</li>
+    </ul>
+
+    <div class="mermaid">
+flowchart LR
+    V["1500 基础词库<br/>名词/动词/形容词"] -->|随机抽1动1名1形| P["构造提示词 Prompt"]
+    F["特征池<br/>对话/转折/坏结局/寓意/伏笔/冲突"] -->|随机子集| P
+    P --> G["GPT-3.5 / GPT-4 生成"]
+    G --> S["2-3 段短故事<br/>仅用 3-4 岁词汇"]
+    S --> D["TinyStories 数据集"]
+    style V fill:#eaf1fb,stroke:#2563c9
+    style F fill:#eaf1fb,stroke:#2563c9
+    style D fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 2-1　用"随机词 + 随机特征"逼出多样性的数据生成流水线</p>
+
+    <div class="callout tip">
+      <p><span class="label">生成样例：</span>提示"用动词 decorate、名词 thunder、形容词 ancient，包含对话，坏结局"
+      → GPT-3.5 产出关于小女孩 Lily 在古老房子里装饰房间、最后装饰被毁而伤心的短故事。</p>
+    </div>
+
+    <h3>2.2 指令跟随变体 TinyStories-Instruct</h3>
+    <p>为了评测"指令跟随"能力，作者又造了一个变体：每篇故事前面<b>加上一组指令</b>。指令有四种类型，
+    每条数据随机取其子集：</p>
+    <ol>
+      <li>要包含的<b>词语列表</b>（Words）；</li>
+      <li>故事中应出现的一个<b>句子</b>（Sentence）；</li>
+      <li>一个<b>特征列表</b>（Features：对话/坏结局/寓意/转折/伏笔/冲突）；</li>
+      <li>一段 1–2 行的<b>摘要</b>（Summary）。</li>
+    </ol>
+    <p>构造方式：原始生成时已知词语和特征；再用 GPT-3.5 为每篇写摘要，并从故事中随机抽一个句子（除首句），
+    随机组合成指令 + 故事正文。</p>
+
+    <h2>3. 模型架构与训练配置</h2>
+    <p>论文的模型采用 <b>GPT-Neo 架构</b>（仅解码器 Transformer），并做了极致缩小：</p>
+    <table>
+      <thead><tr><th>项目</th><th>设置</th></tr></thead>
+      <tbody>
+        <tr><td>基础架构</td><td>GPT-Neo（decoder-only Transformer）</td></tr>
+        <tr><td>注意力窗口 window size</td><td class="num">256</td></tr>
+        <tr><td>上下文长度 context length</td><td class="num">512</td></tr>
+        <tr><td>分词器</td><td>GPT-Neo tokenizer，但<b>只保留最高频的 10K token</b></td></tr>
+        <tr><td>参数规模范围</td><td>约 1M ~ 35M（部分实验到 ~80M）</td></tr>
+        <tr><td>层数范围</td><td class="num">1 ~ 8 层（甚至单个 Transformer 块）</td></tr>
+        <tr><td>嵌入维度示例</td><td>低于 10M 参数的模型可用嵌入维 256；扫描实验用到 64~2048</td></tr>
+        <tr><td>训练资源</td><td>单张 <b>V100 GPU</b>，最多 <b>30 小时</b>内可训完</td></tr>
+        <tr><td>公开模型</td><td>HuggingFace：<code>TinyStories-1M/3M/9M/28M/33M/1Layer/2Layer</code> 及 <code>TinyStories-Instruct-*</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout note">
+      <p><span class="label">对比冲击力：</span>论文用一个 <b>28M</b> 参数的 TinyStories 模型，和比它大两个数量级的
+      <b>GPT-2XL（15 亿参数）</b>做续写对比。两者架构与训练方案本质相同，但 28M 模型在这个窄领域上的续写连贯性可与之媲美甚至更好。</p>
+    </div>
+
+    <h2>4. 新评测范式：让 GPT-4 当老师打分</h2>
+    <p>标准评测（如困惑度、固定基准）对这种"开放式生成"并不合适。作者提出用 <b>GPT-4 作为评分者</b>，
+    把模型的续写当作"学生的作文"来批改。</p>
+
+    <div class="mermaid">
+flowchart LR
+    A["~50 条人工准备的故事开头<br/>(含需要补全的半句)"] --> B["待评模型续写<br/>每个开头生成 10 次, 温度=1"]
+    B --> C["把『开头 + 续写』交给 GPT-4"]
+    C --> D["GPT-4 先文字点评, 再打分"]
+    D --> E["语法 Grammar"]
+    D --> F["创造力 Creativity"]
+    D --> G["一致性 Consistency"]
+    D -. Instruct 额外 .-> H["情节 Plot / 指令符合度"]
+    style A fill:#eaf1fb,stroke:#2563c9
+    style D fill:#fff7e6,stroke:#ffd591
+    </div>
+    <p class="figcap">图 4-1　GPT-Eval 评测流程（取 10 次续写的平均分）</p>
+
+    <p>对 TinyStories-Instruct，还会把<b>指令 + 生成故事</b>一起交给 GPT-4，让它根据"故事在多大程度上符合指令"来打一致性分，
+    并额外增加一个 <b>Plot（情节）</b>维度。</p>
+
+    <div class="callout tip">
+      <p><span class="label">这个范式的价值：</span>它克服了标准基准的诸多缺陷，能对<b>不同能力维度</b>（语法、创造力、指令跟随）
+      分别给分，且论文指出这个思路"远不止适用于 TinyStories"——为后来大量"LLM-as-a-judge"工作提供了雏形。</p>
+    </div>
+
+    <h2>5. 核心发现</h2>
+    <h3>5.1 能力的"涌现"发生在惊人小的规模</h3>
+    <ul>
+      <li>约 <b>2.5M</b> 参数或<b>仅 1 层</b>的模型，已能获得一定的事实知识；稍大的模型能表现出一定推理能力。</li>
+      <li>当隐藏维（hidden size）从 <b>64 增加到 128</b> 时，生成连贯故事的能力"涌现"出来。</li>
+      <li>最大的约 <b>80M</b> 参数模型，在语法和一致性上达到<b>近乎满分</b>，但在创造力上仍逊于 GPT-4。</li>
+    </ul>
+
+    <h3>5.2 宽度 vs 深度：分工明确</h3>
+    <p>这是论文最有洞见的发现之一。作者在层数 <code>{2,4,8,12}</code> × 隐藏维 <code>{64,128,256,512,768,1024,2048}</code>
+    的网格上做扫描，得到清晰的分工：</p>
+
+    <div class="mermaid">
+flowchart TB
+    W["增大『宽度』<br/>嵌入/隐藏维度"] --> WK["→ 事实知识 / 语法"]
+    DP["增加『深度』<br/>层数"] --> DK["→ 上下文一致性 / 长程依赖 / 指令跟随"]
+    N1["1 层模型"] --> N1R["能答对一些事实, 但一致性几乎全错"]
+    N2["嵌入维 64 模型"] --> N2R["答不对事实, 但能维持一致性若干次"]
+    style W fill:#eaf1fb,stroke:#2563c9
+    style DP fill:#eaf6ec,stroke:#a3d9a5
+    </div>
+    <p class="figcap">图 5-1　宽度负责"知识与语法"，深度负责"上下文追踪"</p>
+
+    <ul>
+      <li><b>宽度（嵌入维）</b>更关键于：捕捉词义与词间关系 → <b>事实知识</b>。</li>
+      <li><b>深度（层数）</b>更关键于：捕捉长程依赖 → <b>上下文一致性、指令跟随</b>。</li>
+      <li>能力的<b>涌现顺序</b>：语法/句法能力先出现，然后才是生成一致文本的能力。</li>
+      <li>较浅的模型语法分高于一致性分——印证"深度对保持内容一致更重要"。</li>
+      <li>注意力头数：在头数较少的区间，<b>增加头数</b>能全面提升各项指标。</li>
+    </ul>
+
+    <h3>5.3 小模型更"可解释"</h3>
+    <p>当模型层数少、神经元少时，其内部结构变得有意义、可视化：</p>
+    <ul>
+      <li>用一个 <b>1 层、隐藏维 1024、16 个注意力头</b>的模型分析，注意力头呈现非常清晰的模式，
+        且能明显区分<b>局部头</b>与<b>语义头</b>。</li>
+      <li>MLP 神经元通常在"句中扮演明确共同角色"的 token 上激活。</li>
+      <li>相比之下，这种可解释性在大模型中很难观察到。</li>
+    </ul>
+
+    <h3>5.4 小模型也复现了 LLM 的宏观规律</h3>
+    <p>尽管规模极小、算力有限，TinyStories 模型仍表现出与大模型相似的行为：<b>缩放定律（scaling laws）</b>、
+    宽度与深度的权衡等。这让它成为一个廉价而强大的"研究沙盒"——一天内就能在单 GPU 上做大量超参/架构/训练方法的对照实验。</p>
+
+    <h2>6. 论文的主要贡献（原文归纳）</h2>
+    <ol>
+      <li><b>数据集与可行性证明</b>：TinyStories 让远小于 SOTA（&lt;10M 参数、嵌入维 256）或结构极简（单块）的模型，
+        也能生成多样、流利、连贯的故事，并涌现出推理、常识与一定的指令跟随能力。</li>
+      <li><b>GPT-4 评测范式</b>：用 GPT-4 当"老师"给多维度打分，克服标准基准的局限。</li>
+      <li><b>廉价的科学研究平台</b>：不到一天即可训练，却能复现 scaling laws、宽深权衡等 LLM 行为。</li>
+      <li><b>可解释性</b>：小模型的注意力头与 MLP 神经元具有清晰、可分析的功能。</li>
+    </ol>
+
+    <h2>7. 与本合集其它材料的联系</h2>
+    <p>TinyStories 是 <a href="llama2c.html">llama2.c</a> 和 <a href="esp32-ai.html">esp32-ai</a> 共同的<b>数据地基</b>：</p>
+    <ul>
+      <li><b>llama2.c</b> 直接引用 TinyStories 论文作为"小模型可用"的依据，并用该数据集训练了 15M/42M/110M 的 baby Llama。</li>
+      <li><b>esp32-ai</b> 在 TinyStories 上训练其 28.9M 模型——正因领域够窄，几十 KB 的稠密核心才够用；
+        它也因此继承了同样的能力上限（只会写小故事）。</li>
+    </ul>
+
+    <div class="callout warn">
+      <p><span class="label">数据准确性说明：</span>本文所有数值（层数 1–8、隐藏维 64–2048、窗口 256、上下文 512、
+      词表 top 10K、单 V100 ≤30 小时、~1500 词库、~50 评测提示、10 次续写等）均直接取自论文 PDF 原文。
+      个别第三方复现模型（如 HuggingFace 上的社区 22M 模型）的超参与官方模型不完全一致，本文不将其混入官方数据。</p>
+    </div>
+
+    <h2>8. 给初学者的一句话总结</h2>
+    <p>TinyStories 证明了：<b>"会不会说话"和"知道多少事"是两件事</b>。只要把要"知道的事"砍到三四岁孩子的水平，
+    一个几百万参数的小模型就能把"话"说得又通顺又连贯。这为端侧/边缘设备上的微型语言模型（如 llama2.c、esp32-ai）
+    打开了大门。</p>
+
+    <p style="color:var(--muted);font-size:.85rem;margin-top:36px">
+    数据来源：论文 <a href="https://arxiv.org/pdf/2305.07759" target="_blank">arXiv:2305.07759</a> PDF 全文（Eldan &amp; Li, 2023）。</p>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script src="assets/common.js"></script>
+</body>
+</html>
