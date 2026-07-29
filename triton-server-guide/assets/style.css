@@ -17,7 +17,6 @@
   --sidebar-width: 310px;
   --content-width: 980px;
 }
-
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
@@ -220,4 +219,3 @@ tr:nth-child(even) td { background: var(--panel-2); }
   }
   table { display: block; overflow-x: auto; }
 }
-
