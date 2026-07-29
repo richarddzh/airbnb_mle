@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>单 GPU 本地 Triton 实验</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">单机单卡可行性与资源规划</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>只有一张 GPU，能否学习 Triton？</h1>
+  <p class="lead">能。NVIDIA Quickstart 的 GPU 示例本身就使用 <code>--gpus=1</code>。单卡足够覆盖 Triton 最重要的学习目标，真正限制通常来自模型显存，而不是 Triton 要求多卡。</p>
+
+  <div class="callout tip"><p><strong>推荐策略：</strong>先用小型 ONNX/TorchScript 模型学习 Triton 的仓库、协议和 dynamic batching；再用显存可容纳的小型 LLM 学习 vLLM backend。这样能把“服务器机制问题”和“LLM 显存问题”分开。</p></div>
+
+  <h2>单卡能学到什么</h2>
+  <div class="kpi">
+    <div class="box"><div class="value">完整</div><div class="label">模型仓库与版本</div></div>
+    <div class="box"><div class="value">完整</div><div class="label">HTTP/gRPC 与 health</div></div>
+    <div class="box"><div class="value">完整</div><div class="label">Dynamic batching</div></div>
+    <div class="box"><div class="value">完整</div><div class="label">Metrics / trace</div></div>
+    <div class="box"><div class="value">条件式</div><div class="label">本地 LLM（受显存限制）</div></div>
+  </div>
+
+  <table>
+    <thead><tr><th>可以充分实验</th><th>只能概念学习或小规模模拟</th></tr></thead>
+    <tbody>
+      <tr><td>模型加载/卸载、版本目录、自动配置</td><td>多节点容错、跨主机负载均衡</td></tr>
+      <tr><td>并发、队列、动态合批、model instance</td><td>多 GPU tensor/pipeline parallel</td></tr>
+      <tr><td>CPU 与 GPU instance 对比</td><td>大规模模型仓库和生产 HA</td></tr>
+      <tr><td>Prometheus、trace、perf_analyzer</td><td>MIG 多租户（取决于 GPU）</td></tr>
+      <tr><td>一张卡上的 vLLM continuous batching</td><td>超出单卡显存的大模型</td></tr>
+    </tbody>
+  </table>
+
+  <h2>硬件与软件最低条件</h2>
+  <ul>
+    <li><strong>GPU：</strong>支持 CUDA 的 NVIDIA GPU；具体 compute capability 和驱动要求取决于所选 Triton 容器版本。</li>
+    <li><strong>驱动：</strong>宿主机 NVIDIA 驱动必须满足容器所需 CUDA 的最低 driver 版本。容器带 CUDA 用户态库，但不会替你提供宿主驱动。</li>
+    <li><strong>系统：</strong>原生 Linux 最直接；Windows 建议 WSL2。</li>
+    <li><strong>容器：</strong>Docker 能以 <code>--gpus all</code> 或 <code>--gpus=1</code> 访问 GPU。</li>
+    <li><strong>内存与磁盘：</strong>除 GPU 显存外，容器镜像、模型权重和 Hugging Face cache 会占用大量磁盘和系统内存。</li>
+  </ul>
+
+  <h2>显存如何估算</h2>
+  <p>只计算权重是不够的。LLM 推理显存可粗略拆成：</p>
+  <div class="mermaid">
+flowchart LR
+  W["模型权重<br/>参数量 × 每参数字节"] --> T["总显存需求"]
+  K["KV cache<br/>上下文 × 并发 × 层数"] --> T
+  R["Runtime workspace<br/>CUDA graph / kernels"] --> T
+  A["激活、临时 tensor<br/>tokenization buffers"] --> T
+  O["安全余量<br/>碎片与其他进程"] --> T
+  </div>
+  <table>
+    <thead><tr><th>权重精度</th><th>理论每参数</th><th>仅权重示例：7B</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>FP32</td><td>4 bytes</td><td>约 28 GB</td><td>本地推理通常不划算</td></tr>
+      <tr><td>FP16/BF16</td><td>2 bytes</td><td>约 14 GB</td><td>还未计 KV cache 与 runtime</td></tr>
+      <tr><td>INT8</td><td>约 1 byte</td><td>约 7 GB</td><td>实际取决于量化格式和 engine 支持</td></tr>
+      <tr><td>INT4</td><td>约 0.5 byte</td><td>约 3.5 GB</td><td>仍有 scales、metadata 和运行时开销</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><p><strong>不要把表格当成保证：</strong>即使权重“看起来放得下”，长上下文和高并发的 KV cache 也可能触发 OOM。入门时先用 0.5B–3B 量级或更小模型，并限制最大上下文和并发。</p></div>
+
+  <h2>四步检查机器</h2>
+  <ol class="steps">
+    <li><strong>宿主机识别 GPU。</strong><pre><code>nvidia-smi</code></pre>记录 GPU 型号、显存总量和 driver 版本。</li>
+    <li><strong>Linux/WSL2 识别 GPU。</strong><pre><code>nvidia-smi
+uname -a</code></pre>Windows 详见 WSL2 页面。</li>
+    <li><strong>容器识别 GPU。</strong><pre><code>docker run --rm --gpus all ubuntu nvidia-smi</code></pre>若这里失败，先不要启动 Triton。</li>
+    <li><strong>Triton 容器识别 GPU。</strong><pre><code>docker run --rm --gpus=1 \
+  nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-py3 nvidia-smi</code></pre></li>
+  </ol>
+
+  <h2>单卡资源隔离建议</h2>
+  <ul>
+    <li>实验时关闭占显存的软件和其他模型进程，先用 <code>nvidia-smi</code> 查看空闲显存。</li>
+    <li>一次只加载一个 LLM；模型仓库可保留多个目录，但用 explicit model control 或单独仓库控制加载。</li>
+    <li>不要一开始设置多个 model instance。每个实例通常会增加模型与 runtime 资源占用。</li>
+    <li>对普通小模型，从 <code>instance_group [{ count: 1 kind: KIND_GPU }]</code> 开始。</li>
+    <li>对 vLLM，限制 max model length、并发和 GPU memory utilization，具体参数以匹配的 vLLM release 为准。</li>
+  </ul>
+
+  <h2>CPU-only 是否能学习</h2>
+  <p>Triton 可以不带 <code>--gpus</code> 启动。你仍可学习模型仓库、health、HTTP/gRPC 和 CPU backend；但要求 GPU 的模型配置无法加载，vLLM GPU 路径和 GPU batching 性能也无法真实实验。</p>
+  <pre><code>docker run --rm \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-py3 \
+  tritonserver --model-repository=/models</code></pre>
+
+  <h2>成功标准</h2>
+  <ul>
+    <li>容器内 <code>nvidia-smi</code> 能看到同一张 GPU。</li>
+    <li>Triton 启动日志列出模型并显示 <code>READY</code>。</li>
+    <li><code>/v2/health/ready</code> 返回 HTTP 200。</li>
+    <li><code>:8002/metrics</code> 出现 Triton 和 GPU 指标。</li>
+    <li>并发提高时能看到吞吐、队列和 execution count 的变化。</li>
+  </ul>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/getting_started/quickstart.html">NVIDIA Triton Quickstart</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/optimization.html">NVIDIA — Optimization</a></li>
+  </ul>
+  <nav class="page-nav"><a href="concepts.html">← 核心概念</a><a href="model-repository.html">下一页：Quickstart →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>

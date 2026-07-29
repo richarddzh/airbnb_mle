@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton Quickstart 与模型仓库</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">从目录结构到第一次请求</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>Quickstart 与 Model Repository</h1>
+  <p class="lead">Triton 的核心不是一条启动命令，而是“模型仓库契约”：目录名决定模型名，数字子目录决定版本，<code>config.pbtxt</code> 决定 backend、tensor 形状、batching 和实例。</p>
+
+  <h2>先理解目录契约</h2>
+  <pre><code>model_repository/
+├── add_sub/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.py
+└── my_torch_model/
+    ├── config.pbtxt
+    ├── 1/
+    │   └── model.pt
+    └── 2/
+        └── model.pt</code></pre>
+  <ul>
+    <li><code>add_sub</code> 是请求中的 model name。</li>
+    <li><code>1</code>、<code>2</code> 必须是数字版本目录，不是随意分类目录。</li>
+    <li>版本目录中的文件名和结构由 backend 决定。</li>
+    <li><code>config.pbtxt</code> 位于模型目录根部，不在版本目录内。</li>
+    <li>Triton 可从多个 repository、本地目录、S3、GCS、Azure Storage 读取模型；入门只用本地挂载。</li>
+  </ul>
+
+  <h2>推荐的 Windows 实验目录</h2>
+  <p>在 WSL2 的 Linux home 中创建，不要优先放在 <code>C:\</code> 对应的 <code>/mnt/c</code>。Linux 文件系统通常有更自然的权限、链接和 I/O 行为。</p>
+  <pre><code>mkdir -p ~/triton-lab/model_repository
+cd ~/triton-lab
+pwd
+# 预期类似 /home/&lt;user&gt;/triton-lab</code></pre>
+
+  <h2>实验 A：创建 CPU/GPU 都能运行的 Python backend 模型</h2>
+  <p>这个模型只做加减法，不依赖 GPU。它特别适合 CPU 机器，也适合先证明 Triton server、仓库和客户端链路正确。</p>
+  <span class="code-title">WSL2 / Linux：创建目录</span>
+  <pre><code>mkdir -p ~/triton-lab/model_repository/add_sub/1
+cd ~/triton-lab</code></pre>
+
+  <span class="code-title">model_repository/add_sub/config.pbtxt</span>
+  <pre><code>name: "add_sub"
+backend: "python"
+max_batch_size: 8
+
+input [
+  { name: "INPUT0" data_type: TYPE_FP32 dims: [ 4 ] },
+  { name: "INPUT1" data_type: TYPE_FP32 dims: [ 4 ] }
+]
+
+output [
+  { name: "OUTPUT0" data_type: TYPE_FP32 dims: [ 4 ] },
+  { name: "OUTPUT1" data_type: TYPE_FP32 dims: [ 4 ] }
+]
+
+dynamic_batching {}</code></pre>
+
+  <span class="code-title">model_repository/add_sub/1/model.py</span>
+  <pre><code>import numpy as np
+import triton_python_backend_utils as pb_utils
+
+
+class TritonPythonModel:
+    def execute(self, requests):
+        responses = []
+        for request in requests:
+            input0 = pb_utils.get_input_tensor_by_name(
+                request, "INPUT0").as_numpy()
+            input1 = pb_utils.get_input_tensor_by_name(
+                request, "INPUT1").as_numpy()
+
+            output0 = pb_utils.Tensor(
+                "OUTPUT0", (input0 + input1).astype(np.float32))
+            output1 = pb_utils.Tensor(
+                "OUTPUT1", (input0 - input1).astype(np.float32))
+            responses.append(pb_utils.InferenceResponse(
+                output_tensors=[output0, output1]))
+        return responses</code></pre>
+
+  <div class="callout note"><p><strong>为什么能 batching：</strong><code>max_batch_size: 8</code> 表示 Triton 会在配置中的 <code>dims: [4]</code> 前添加 batch 维度。Python backend 的 <code>execute</code> 接收 request 列表；每个 tensor 自身也会带 batch 维。</p></div>
+
+  <h2>启动 server：GPU 与 CPU 两条命令</h2>
+  <h3>RTX 4070 12GB / WSL2 GPU</h3>
+  <pre><code>cd ~/triton-lab
+export TRITON_VERSION=&lt;xx.yy&gt;
+
+docker run --gpus=1 --rm \
+  --shm-size=1g \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <h3>CPU-only</h3>
+  <pre><code>cd ~/triton-lab
+export TRITON_VERSION=&lt;xx.yy&gt;
+
+docker run --rm \
+  --shm-size=1g \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <p>两条命令的唯一关键差异是 GPU 路径有 <code>--gpus=1</code>。当前 add/sub 模型仍在 CPU 执行；GPU 暴露只是为后续 GPU 模型准备。</p>
+
+  <h2>逐项解释启动参数</h2>
+  <table>
+    <thead><tr><th>参数</th><th>含义</th><th>常见问题</th></tr></thead>
+    <tbody>
+      <tr><td><code>--gpus=1</code></td><td>向容器暴露一张 GPU</td><td>不是“使用编号为 1 的 GPU”；单卡机器表示数量为 1</td></tr>
+      <tr><td><code>-p 8000:8000</code></td><td>映射 HTTP</td><td>端口被占用时更换左侧宿主端口</td></tr>
+      <tr><td><code>-v "$PWD/...:/models"</code></td><td>把宿主仓库挂进容器</td><td>路径错误时 server 看不到模型</td></tr>
+      <tr><td><code>...:&lt;xx.yy&gt;-py3</code></td><td>带 Python backend 的 Triton 镜像</td><td>必须换成 NGC 中存在的标签</td></tr>
+      <tr><td><code>--model-repository=/models</code></td><td>容器内仓库路径</td><td>它对应 volume 的右侧路径</td></tr>
+    </tbody>
+  </table>
+
+  <h2>验证 server 和模型</h2>
+  <span class="code-title">WSL2 另开一个终端</span>
+  <pre><code>curl -i localhost:8000/v2/health/live
+curl -i localhost:8000/v2/health/ready
+curl -i localhost:8000/v2/models/add_sub/ready
+curl localhost:8000/v2/models/add_sub/config</code></pre>
+  <p>前三个检查都应返回 200。若 server ready 但模型不 ready，问题通常在仓库结构、配置或 backend 文件。</p>
+
+  <h2>发送 HTTP 推理请求</h2>
+  <pre><code>curl -s localhost:8000/v2/models/add_sub/infer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inputs": [
+      {
+        "name": "INPUT0",
+        "shape": [1, 4],
+        "datatype": "FP32",
+        "data": [1, 2, 3, 4]
+      },
+      {
+        "name": "INPUT1",
+        "shape": [1, 4],
+        "datatype": "FP32",
+        "data": [10, 20, 30, 40]
+      }
+    ],
+    "outputs": [
+      {"name": "OUTPUT0"},
+      {"name": "OUTPUT1"}
+    ]
+  }'</code></pre>
+  <p>应得到加法结果 <code>[11,22,33,44]</code> 和减法结果 <code>[-9,-18,-27,-36]</code>。请求 shape 为 <code>[1,4]</code>，其中第一个 1 是 batch size。</p>
+
+  <h2>config.pbtxt 的最低理解</h2>
+  <table>
+    <thead><tr><th>字段</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>backend</code> / <code>platform</code></td><td>选择模型执行 backend/平台</td></tr>
+      <tr><td><code>max_batch_size</code></td><td>0 表示 Triton 不使用首维 batching；大于 0 表示最大 batch</td></tr>
+      <tr><td><code>input/output</code></td><td>tensor 名、数据类型、每个样本的维度</td></tr>
+      <tr><td><code>dynamic_batching</code></td><td>为无状态模型启用动态合批</td></tr>
+      <tr><td><code>instance_group</code></td><td>指定实例数量和 CPU/GPU 类型</td></tr>
+      <tr><td><code>model_transaction_policy</code></td><td>声明 decoupled 等请求响应语义</td></tr>
+    </tbody>
+  </table>
+
+  <h2>常见错误排查</h2>
+  <table>
+    <thead><tr><th>现象</th><th>检查</th></tr></thead>
+    <tbody>
+      <tr><td>模型未出现在启动表格</td><td>检查 volume 左侧路径、模型目录层级、数字版本目录</td></tr>
+      <tr><td>UNAVAILABLE</td><td>从日志找到第一条具体 backend/config 错误，不只看最后的 server not ready</td></tr>
+      <tr><td>shape mismatch</td><td>区分 config 的 per-sample dims 与请求中的 batch + dims</td></tr>
+      <tr><td>端口访问失败</td><td>确认容器仍在运行、端口映射、Windows 防火墙和端口占用</td></tr>
+      <tr><td>GPU model 加载失败</td><td>先验证容器内 nvidia-smi，再检查驱动、CUDA 兼容和显存</td></tr>
+    </tbody>
+  </table>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/getting_started/quickstart.html">NVIDIA Triton Quickstart</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_repository.html">NVIDIA — Model Repository</a></li>
+    <li><a href="https://github.com/triton-inference-server/python_backend">Triton Python Backend</a></li>
+  </ul>
+  <nav class="page-nav"><a href="single-gpu-lab.html">← 单 GPU</a><a href="pytorch-backend.html">下一页：PyTorch →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>
+

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton PyTorch 后端手册</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">TorchScript、Python backend 与 LLM</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>用 PyTorch 作为 Triton 后端</h1>
+  <p class="lead">“PyTorch 模型”不只有一种接入方式。官方 PyTorch/LibTorch backend 主要直接运行 TorchScript；Python backend 可以运行普通 Python/PyTorch；生成式 LLM 通常更适合 vLLM 或 TensorRT-LLM。</p>
+
+  <h2>先做正确选型</h2>
+  <table>
+    <thead><tr><th>路径</th><th>模型形式</th><th>适合</th><th>主要限制</th></tr></thead>
+    <tbody>
+      <tr><td>PyTorch (LibTorch) backend</td><td>TorchScript <code>model.pt</code>；新版本另有 AOT Inductor PT2 支持</td><td>结构稳定的 PyTorch tensor 模型</td><td>普通 eager Python 模型需先转换；版本与算子兼容重要</td></tr>
+      <tr><td>Python backend</td><td><code>model.py</code> 中加载 PyTorch/Transformers</td><td>原型、自定义前后处理、难转换模型</td><td>Python 进程、依赖环境、性能和内存需自己管理</td></tr>
+      <tr><td>vLLM backend</td><td>vLLM 支持的生成式 LLM</td><td>token generation、continuous batching、paged attention</td><td>受 vLLM 模型/量化支持约束</td></tr>
+      <tr><td>TensorRT-LLM backend</td><td>构建后的 TensorRT-LLM engine</td><td>NVIDIA GPU 上追求生产性能</td><td>构建和版本组合更复杂</td></tr>
+    </tbody>
+  </table>
+  <div class="callout danger"><p><strong>常见误解：</strong>不能把 Hugging Face 下载的任意 <code>pytorch_model.bin</code> 或 <code>model.safetensors</code> 直接改名为 <code>model.pt</code> 放进 PyTorch backend。LibTorch backend 期待的是可加载的 TorchScript（或对应版本支持的编译包）。</p></div>
+
+  <h2>路径 A：TorchScript 小模型</h2>
+  <p>以下流程适合 RTX 4070，也可把模型配置为 CPU instance 在 CPU 机器上学习。</p>
+  <h3>1. 导出 TorchScript</h3>
+  <span class="code-title">export_model.py（在合适的 PyTorch 环境运行）</span>
+  <pre><code>import torch
+
+
+class TinyModel(torch.nn.Module):
+    def forward(self, input0, input1):
+        return input0 + input1
+
+
+model = TinyModel().eval()
+example = (torch.randn(1, 4), torch.randn(1, 4))
+scripted = torch.jit.trace(model, example)
+scripted.save("model.pt")</code></pre>
+  <p>生产模型应验证 trace 是否覆盖控制流；依赖数据控制流的模型可能需要 <code>torch.jit.script</code>，而不是 trace。</p>
+
+  <h3>2. 建立仓库</h3>
+  <pre><code>model_repository/
+└── tiny_torch/
+    ├── config.pbtxt
+    └── 1/
+        └── model.pt</code></pre>
+  <span class="code-title">tiny_torch/config.pbtxt</span>
+  <pre><code>name: "tiny_torch"
+platform: "pytorch_libtorch"
+max_batch_size: 8
+
+input [
+  { name: "input0" data_type: TYPE_FP32 dims: [4] },
+  { name: "input1" data_type: TYPE_FP32 dims: [4] }
+]
+output [
+  { name: "OUTPUT__0" data_type: TYPE_FP32 dims: [4] }
+]
+
+dynamic_batching {}
+
+instance_group [
+  { count: 1 kind: KIND_GPU }
+]</code></pre>
+  <p>PyTorch backend 因 TorchScript metadata 限制有输入/输出命名约定。输入可匹配 <code>forward</code> 参数名，或统一使用 <code>INPUT__0</code> 位置命名；输出常用 <code>OUTPUT__0</code>。以当前官方 backend 文档为准。</p>
+
+  <h3>3. CPU-only 配置</h3>
+  <p>将 instance 改成 CPU，或根据 backend 默认行为省略显式 instance group：</p>
+  <pre><code>instance_group [
+  { count: 1 kind: KIND_CPU }
+]</code></pre>
+  <div class="callout warn"><p><strong>容器兼容：</strong>官方 PyTorch backend 使用与 Triton release 匹配的 LibTorch。你在任意本地 PyTorch 版本导出的模型不一定无条件兼容。若加载失败，先核对对应 Triton/PyTorch release notes 和算子支持。</p></div>
+
+  <h2>路径 B：Python backend 包装 PyTorch</h2>
+  <p>如果模型无法方便转 TorchScript，可以在 <code>model.py</code> 中加载 eager-mode PyTorch。基本生命周期如下：</p>
+  <div class="mermaid">
+flowchart LR
+  A["auto_complete_config()<br/>可选"] --> I["initialize()<br/>加载 tokenizer / model"]
+  I --> E["execute(requests)<br/>必须"]
+  E --> R["InferenceResponse"]
+  E --> E
+  E --> F["finalize()<br/>可选清理"]
+  </div>
+  <ul>
+    <li><code>initialize</code> 每个 model instance 调一次，模型应在这里加载，而不是每个请求重复加载。</li>
+    <li><code>execute</code> 收到请求列表；必须为每个请求返回响应，除非模型使用 decoupled transaction policy。</li>
+    <li>第三方 Python 依赖要放入容器，或使用 Python execution environment。</li>
+    <li>多个 Python model instance 可能各自复制模型，RTX 4070 12GB 上很容易重复占显存。</li>
+  </ul>
+
+  <h2>能否用 PyTorch backend 部署 local LLM</h2>
+  <p><strong>可以，但“能”不等于“推荐”。</strong></p>
+  <ul>
+    <li>若 LLM 能稳定导出为受支持 TorchScript/PT2，并且你自己实现 tokenization、autoregressive loop、KV cache 和 streaming，理论上可用。</li>
+    <li>若通过 Python backend 直接调用 Transformers，可以更快跑通，但 batching、KV cache、流式响应、取消请求和显存管理都需谨慎处理。</li>
+    <li>对真正的文本生成服务，vLLM 已提供 continuous batching 和 paged attention，通常更适合 RTX 4070 的 12GB 显存。</li>
+  </ul>
+
+  <h2>RTX 4070 12GB 的选择建议</h2>
+  <table>
+    <thead><tr><th>目标</th><th>建议</th></tr></thead>
+    <tbody>
+      <tr><td>学习 Triton tensor batching</td><td>小型 TorchScript/ONNX 模型，batch 1–16，单 GPU instance</td></tr>
+      <tr><td>加载普通 PyTorch 模型</td><td>先做 TorchScript 小例子；复杂模型再评估 Python backend</td></tr>
+      <tr><td>本地聊天 LLM</td><td>优先 vLLM backend，选小模型/适配量化，限制上下文与并发</td></tr>
+      <tr><td>CPU 机器学习 server</td><td>Python backend add/sub 或小型 ONNX/TorchScript CPU 模型；不以 LLM 性能为目标</td></tr>
+    </tbody>
+  </table>
+
+  <h2>故障定位</h2>
+  <ul>
+    <li><strong>cannot load model：</strong>检查文件是否真的是 TorchScript、文件名、platform 和 release 兼容。</li>
+    <li><strong>unknown input/output：</strong>检查 TorchScript forward 参数与 <code>INPUT__n/OUTPUT__n</code> 命名约定。</li>
+    <li><strong>shape mismatch：</strong>若 <code>max_batch_size &gt; 0</code>，配置 dims 不包含首个 batch 维。</li>
+    <li><strong>CUDA OOM：</strong>先将 instance count 设 1，缩小模型/batch，并确认没有其他进程占显存。</li>
+    <li><strong>Python import error：</strong>依赖不在 Python backend stub 环境内，需构建镜像或配置 execution environment。</li>
+  </ul>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/triton-inference-server/pytorch_backend">Triton PyTorch Backend</a></li>
+    <li><a href="https://github.com/triton-inference-server/python_backend">Triton Python Backend</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html">NVIDIA — Model Configuration</a></li>
+  </ul>
+  <nav class="page-nav"><a href="model-repository.html">← Quickstart</a><a href="vllm-backend.html">下一页：vLLM →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>
+

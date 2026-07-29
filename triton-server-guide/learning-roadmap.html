@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton 学习路线与检查表</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">从 CPU server 到单卡 LLM</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>分阶段学习路线与验收清单</h1>
+  <p class="lead">不要在第一天同时解决 WSL、Docker、Triton、LLM、量化和 batching。下面每一阶段只有一个主要变量，并给出可验证的完成标准。</p>
+
+  <h2>路线总览</h2>
+  <div class="mermaid">
+flowchart LR
+  S0["0 环境<br/>GPU/CPU + Docker"] --> S1["1 Server<br/>health + metrics"]
+  S1 --> S2["2 小模型<br/>repository + infer"]
+  S2 --> S3["3 Batching<br/>baseline + concurrency"]
+  S3 --> S4["4 PyTorch<br/>TorchScript"]
+  S4 --> S5["5 vLLM<br/>单卡小 LLM"]
+  S5 --> S6["6 观测<br/>trace + GenAI perf"]
+  </div>
+
+  <h2>Stage 0：环境验证</h2>
+  <p><strong>目标：</strong>证明执行环境可用，不启动 Triton。</p>
+  <h3>RTX 4070 路径</h3>
+  <pre><code># Windows PowerShell
+nvidia-smi
+wsl -l -v
+
+# WSL2 Ubuntu
+nvidia-smi
+docker run --rm --gpus all ubuntu nvidia-smi</code></pre>
+  <h3>CPU-only 路径</h3>
+  <pre><code>docker version
+docker run --rm ubuntu uname -a</code></pre>
+  <p><strong>成功标准：</strong>GPU 路径在三层都看见 RTX 4070；CPU 路径能正常运行 Linux 容器。</p>
+
+  <h2>Stage 1：空仓库与 Server 生命周期</h2>
+  <p><strong>目标：</strong>理解容器、端口、live/ready、日志和 metrics。</p>
+  <pre><code>mkdir -p ~/triton-lab/model_repository
+cd ~/triton-lab
+
+docker run --rm \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <p><strong>成功标准：</strong>health ready 返回 200；metrics 端点返回 Prometheus 文本；你能解释三个端口。</p>
+
+  <h2>Stage 2：CPU add/sub 模型</h2>
+  <p><strong>目标：</strong>跑通本手册<a href="model-repository.html">模型仓库页面</a>的 Python backend 示例。</p>
+  <ul>
+    <li>创建 <code>config.pbtxt</code> 和 <code>1/model.py</code>。</li>
+    <li>模型状态为 READY。</li>
+    <li>curl 推理返回正确加减结果。</li>
+    <li>故意改错 tensor name，观察日志，再恢复。</li>
+  </ul>
+  <p><strong>成功标准：</strong>能从日志定位一次配置错误，而不是只会重启容器。</p>
+
+  <h2>Stage 3：动态批处理实验</h2>
+  <p><strong>目标：</strong>用数据证明 request batching。</p>
+  <ol>
+    <li>关闭 dynamic batching，测 concurrency 1/2/4/8。</li>
+    <li>启用 <code>dynamic_batching {}</code>，重复测量。</li>
+    <li>记录 throughput、p95、queue duration。</li>
+    <li>读取 inference count 和 execution count，计算平均 batch size。</li>
+    <li>加入 100–500µs delay，观察吞吐/延迟边界。</li>
+  </ol>
+  <p><strong>成功标准：</strong>能解释为什么 concurrency=1 很难观察 server-side dynamic batching，以及为什么更高吞吐可能伴随更高延迟。</p>
+
+  <h2>Stage 4：TorchScript 模型</h2>
+  <p><strong>目标：</strong>理解 PyTorch eager 模型与 Triton PyTorch backend 接口的区别。</p>
+  <ul>
+    <li>导出一个最小 TorchScript 模型。</li>
+    <li>先在 CPU instance 加载，再改为 RTX 4070 GPU instance。</li>
+    <li>核对 input/output 命名和 batch dimension。</li>
+    <li>观察 CPU/GPU 的显存与延迟，但不急于做性能结论。</li>
+  </ul>
+  <p><strong>成功标准：</strong>能解释为什么普通 <code>safetensors</code> 不能直接作为 LibTorch model file。</p>
+
+  <h2>Stage 5：RTX 4070 上的 vLLM</h2>
+  <p><strong>目标：</strong>部署显存可容纳的小型 instruct LLM。</p>
+  <ol>
+    <li>从与 Triton 版本相同的 vLLM backend release branch 复制 sample repository。</li>
+    <li>选择当前 vLLM 明确支持的 0.5B–3B 模型。</li>
+    <li>设置 tensor parallel=1、max model length=2048、GPU utilization 约 0.80。</li>
+    <li>挂载 Hugging Face cache，启动并观察 <code>nvidia-smi</code>。</li>
+    <li>先单请求成功，再提高到 concurrency 2/4。</li>
+  </ol>
+  <p><strong>成功标准：</strong>模型 READY；能得到完整或流式文本；不会把 vLLM continuous batching 误叫作 Triton dynamic batching。</p>
+
+  <h2>Stage 6：服务端观测</h2>
+  <p><strong>目标：</strong>把性能问题拆成接入、排队、输入、推理、输出和生成 token。</p>
+  <ul>
+    <li>普通模型：perf_analyzer + Prometheus + Triton trace。</li>
+    <li>LLM：GenAI-Perf（当前 release 支持时）+ time to first token + inter-token latency + tokens/s。</li>
+    <li>固定输入长度、输出长度和 sampling 参数，逐级改变 concurrency。</li>
+    <li>保存每轮模型、配置、容器版本、驱动版本和测试命令。</li>
+  </ul>
+
+  <h2>实验记录模板</h2>
+  <pre><code>日期:
+Windows / WSL 版本:
+GPU / Driver:
+Triton image:
+Backend release:
+Model / quantization:
+max_model_len:
+Model instance count:
+Batching config:
+Concurrency:
+Input shape or input tokens:
+Output tokens:
+
+Throughput:
+p50 / p95 / p99:
+Queue duration:
+Inference count:
+Execution count:
+Average execution batch:
+GPU memory / utilization:
+结论:
+下一轮只改变的变量:</code></pre>
+
+  <h2>最终能力检查</h2>
+  <table>
+    <thead><tr><th>问题</th><th>合格答案应包含</th></tr></thead>
+    <tbody>
+      <tr><td>Triton 是什么？</td><td>协议、模型仓库、per-model scheduler、backend、metrics；不是训练框架</td></tr>
+      <tr><td>一张 4070 能学吗？</td><td>能；12GB 限制模型、上下文和并发，不限制 server 核心概念</td></tr>
+      <tr><td>PyTorch LLM 怎么部署？</td><td>区分 TorchScript LibTorch、Python backend 与 vLLM/TensorRT-LLM</td></tr>
+      <tr><td>如何证明合批？</td><td>并发负载 + inference/execution count + latency/throughput 对照</td></tr>
+      <tr><td>Windows 为什么用 WSL2？</td><td>Linux 容器、GPU-PV、Docker Desktop WSL2 GPU 官方支持</td></tr>
+      <tr><td>CPU 可以做什么？</td><td>server/repository/protocol/batching/metrics；不代表 GPU LLM 性能</td></tr>
+    </tbody>
+  </table>
+
+  <h2>停止条件与回退策略</h2>
+  <ul>
+    <li>容器看不到 GPU：停止模型调试，回到环境验证。</li>
+    <li>小 add/sub 模型未成功：停止 LLM 部署，先修仓库和网络。</li>
+    <li>LLM OOM：减上下文、并发、模型规模；不要先增加 swap 期待解决 GPU OOM。</li>
+    <li>吞吐测试不稳定：增加 warmup 和测量时间，固定输入，关闭其他 GPU 程序。</li>
+    <li>版本不兼容：让 Triton server、SDK 和 backend sample 使用同一年月 release。</li>
+  </ul>
+
+  <h2>下一步</h2>
+  <p>完成本手册后，再考虑 Model Analyzer、ensemble、model control mode、OpenTelemetry、Kubernetes、TensorRT-LLM 和多 GPU。它们应建立在已理解单模型请求路径与可靠基线之上。</p>
+
+  <nav class="page-nav"><a href="windows-wsl2.html">← Windows/WSL2</a><a href="index.html">返回首页 ↩</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>

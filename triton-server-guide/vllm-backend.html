@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton vLLM 本地 LLM 部署</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">RTX 4070 12GB 本地 LLM 路径</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>用 vLLM backend 部署本地 LLM</h1>
+  <p class="lead">可以。Triton 官方 vLLM backend 把请求放入 vLLM AsyncEngine，由 vLLM 负责 inflight/continuous batching 和 paged attention。RTX 4070 12GB 适合小模型、量化模型和低并发实验。</p>
+
+  <div class="callout tip"><p><strong>适合你的基线：</strong>Windows 11 + WSL2 + RTX 4070 12GB；先选约 0.5B–3B 的 instruct 模型或 vLLM 明确支持的量化模型，将最大上下文控制在 2K–4K，初始并发设 1–2。确认稳定后再增加。</p></div>
+
+  <h2>Triton 与 vLLM 的职责边界</h2>
+  <div class="mermaid">
+flowchart LR
+  C["客户端请求"] --> T["Triton frontend<br/>协议 · health · metrics"]
+  T --> B["vLLM backend<br/>Python-based adapter"]
+  B --> E["vLLM AsyncEngine<br/>continuous batching<br/>paged attention · KV cache"]
+  E --> G["RTX 4070 12GB"]
+  R["model.json<br/>engine arguments"] --> E
+  </div>
+  <table>
+    <thead><tr><th>层</th><th>主要职责</th></tr></thead>
+    <tbody>
+      <tr><td>Triton</td><td>统一服务端口、模型仓库与生命周期、协议、模型级 metrics/trace、部署集成</td></tr>
+      <tr><td>vLLM backend</td><td>把 Triton request/response 转换为 vLLM engine 调用</td></tr>
+      <tr><td>vLLM AsyncEngine</td><td>token 调度、KV cache、paged attention、inflight/continuous batching</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><p><strong>关键区别：</strong>不要把普通模型的 Triton <code>dynamic_batching {}</code> 与 vLLM 的 continuous batching 当成同一个机制。官方 vLLM backend 会尽快把请求交给 AsyncEngine，生成阶段的批调度由 vLLM 完成。</p></div>
+
+  <h2>容器选择</h2>
+  <p>官方预构建 vLLM 镜像标签形式为：</p>
+  <pre><code>nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-vllm-python-py3</code></pre>
+  <p>该镜像从 Triton 23.10 起提供。使用前在 NGC 查询实际存在的标签，并阅读对应 release notes。不要把普通 <code>-py3</code> 镜像与 vLLM 镜像混淆。</p>
+
+  <h2>建立模型仓库</h2>
+  <p>官方仓库提供 sample model repository。不同 release 的字段可能变化，因此最可靠流程是克隆与容器版本相同的 release branch，再修改样例，而不是凭记忆手写所有字段。</p>
+  <pre><code>cd ~/triton-lab
+export TRITON_VERSION=&lt;xx.yy&gt;
+
+git clone --branch r${TRITON_VERSION} --depth 1 \
+  https://github.com/triton-inference-server/vllm_backend.git
+
+cp -r vllm_backend/samples/model_repository/vllm_model \
+  model_repository/</code></pre>
+  <p>典型结构如下：</p>
+  <pre><code>model_repository/
+└── vllm_model/
+    ├── config.pbtxt
+    ├── model.json
+    └── 1/
+        └── model.py</code></pre>
+
+  <h2>配置 model.json</h2>
+  <p><code>model.json</code> 是传给 vLLM engine 初始化参数的键值字典。实际字段以你所用 release 的 sample 和 vLLM argument 文档为准。概念示例如下：</p>
+  <pre><code>{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "dtype": "auto",
+  "tensor_parallel_size": 1,
+  "max_model_len": 4096,
+  "gpu_memory_utilization": 0.85
+}</code></pre>
+  <div class="callout note"><p><strong>模型名只是示例：</strong>部署前必须在当前 vLLM 的 supported models 页面确认架构和量化格式。若模型需要 Hugging Face 授权，还需先接受许可并提供 token。</p></div>
+
+  <h3>RTX 4070 12GB 参数起点</h3>
+  <table>
+    <thead><tr><th>参数</th><th>建议起点</th><th>原因</th></tr></thead>
+    <tbody>
+      <tr><td><code>tensor_parallel_size</code></td><td>1</td><td>只有一张 GPU</td></tr>
+      <tr><td><code>gpu_memory_utilization</code></td><td>0.80–0.85</td><td>给 CUDA、桌面与碎片保留余量</td></tr>
+      <tr><td><code>max_model_len</code></td><td>2048 或 4096</td><td>KV cache 随上下文和并发增长</td></tr>
+      <tr><td>并发</td><td>1 起步，再到 2/4</td><td>先确认稳定和延迟，再观察连续批处理</td></tr>
+      <tr><td>模型规模</td><td>0.5B–3B 优先</td><td>让 12GB 显存有足够 KV cache 与 runtime 空间</td></tr>
+    </tbody>
+  </table>
+
+  <h2>挂载 Hugging Face cache 并启动</h2>
+  <pre><code>cd ~/triton-lab
+mkdir -p ~/.cache/huggingface
+
+docker run --gpus=1 --rm \
+  --shm-size=2g \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -e HF_TOKEN="${HF_TOKEN:-}" \
+  nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-vllm-python-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <p>缓存挂载避免每次销毁容器都重新下载权重。不要把 token 写进 HTML、脚本、镜像或 Git；只通过环境变量/安全凭据传递。</p>
+
+  <h2>加载阶段要观察什么</h2>
+  <ol class="steps">
+    <li><strong>下载。</strong>首次运行可能长时间下载；看网络、磁盘和 cache，而不是误判 server 死亡。</li>
+    <li><strong>分配显存。</strong>用另一终端运行 <code>watch -n 1 nvidia-smi</code>，观察权重和 KV cache 分配。</li>
+    <li><strong>READY。</strong><code>curl -i localhost:8000/v2/models/vllm_model/ready</code> 必须返回 200。</li>
+    <li><strong>请求。</strong>优先运行该 release sample 自带 client，因为 vLLM backend 的 input/output tensor contract 可能随版本演进。</li>
+  </ol>
+
+  <h2>Streaming 与 decoupled mode</h2>
+  <p>LLM 会逐 token 生成。一请求一次完整响应适合最简测试；流式输出需要 backend 使用 decoupled transaction policy，使一个请求可以产生多个 response。客户端通常使用 gRPC streaming 或样例所定义的协议。</p>
+  <pre><code>model_transaction_policy {
+  decoupled: true
+}</code></pre>
+  <p>是否需要、如何配置，以当前 vLLM sample 的 <code>config.pbtxt</code> 为准。不要只添加这一行而忽略 client 和 output contract。</p>
+
+  <h2>12GB 显存常见 OOM 处理顺序</h2>
+  <ol>
+    <li>确认没有另一个模型/进程占 GPU。</li>
+    <li>把 model instance 保持为 1、tensor parallel 保持为 1。</li>
+    <li>降低 <code>max_model_len</code> 和并发。</li>
+    <li>降低 vLLM GPU memory utilization，给 runtime 留余量。</li>
+    <li>选择更小模型或当前 vLLM 支持的量化权重。</li>
+    <li>仍失败时检查量化 kernel 是否支持 RTX 4070（Ada）与当前 CUDA/vLLM 组合。</li>
+  </ol>
+
+  <h2>CPU-only 能否运行 vLLM Triton 实验</h2>
+  <p>本手册不把 CPU-only vLLM 当作可靠入门基线。vLLM 的 CPU 支持、构建方式和性能限制随版本变化，而且预构建 Triton vLLM 容器主要面向 GPU。CPU 机器更适合用 Python/ONNX/PyTorch CPU backend 学习 server、repository、protocol 和 batching；LLM 生成改在 RTX 4070 环境完成。</p>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://github.com/triton-inference-server/vllm_backend">Triton vLLM Backend</a></li>
+    <li><a href="https://docs.vllm.ai/en/latest/models/supported_models.html">vLLM — Supported Models</a></li>
+    <li><a href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver">NGC — Triton Server Container</a></li>
+  </ul>
+  <nav class="page-nav"><a href="pytorch-backend.html">← PyTorch</a><a href="batching-observability.html">下一页：Batching →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>

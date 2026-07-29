@@ -1,0 +1,223 @@
+:root {
+  --bg: #ffffff;
+  --panel: #f7f8fa;
+  --panel-2: #fbfcfd;
+  --border: #e2e6ea;
+  --text: #263238;
+  --muted: #66727d;
+  --accent: #356b2f;
+  --accent-soft: #edf6eb;
+  --blue: #285f9e;
+  --blue-soft: #edf4fb;
+  --warn: #8a5a00;
+  --warn-soft: #fff8e6;
+  --danger: #9b3434;
+  --danger-soft: #fff0f0;
+  --code: #f3f5f7;
+  --sidebar-width: 310px;
+  --content-width: 980px;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font: 16px/1.75 "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+a { color: var(--blue); }
+.layout { display: flex; align-items: flex-start; }
+.sidebar {
+  position: sticky;
+  top: 0;
+  width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
+  height: 100vh;
+  overflow-y: auto;
+  padding: 22px 16px 48px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+.brand a { color: var(--accent); font-size: 1.08rem; font-weight: 750; text-decoration: none; }
+.subtitle { margin: 3px 0 18px; color: var(--muted); font-size: .82rem; }
+.nav-label {
+  margin: 18px 10px 5px;
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.site-nav, .toc { margin: 0; padding: 0; list-style: none; }
+.site-nav a, .toc a {
+  display: block;
+  padding: 5px 10px;
+  color: var(--text);
+  border-left: 2px solid transparent;
+  border-radius: 5px;
+  font-size: .88rem;
+  text-decoration: none;
+}
+.site-nav a:hover, .toc a:hover { background: #edf0f2; }
+.site-nav a.current, .toc a.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-left-color: var(--accent);
+  font-weight: 650;
+}
+.toc a.h3 { padding-left: 25px; color: var(--muted); font-size: .82rem; }
+.content {
+  width: 100%;
+  max-width: calc(var(--content-width) + 112px);
+  min-width: 0;
+  margin: 0 auto;
+  padding: 40px 56px 100px;
+}
+h1 { margin: 0 0 10px; font-size: 2rem; line-height: 1.3; }
+h2 {
+  margin: 45px 0 14px;
+  padding-bottom: 7px;
+  border-bottom: 2px solid var(--border);
+  font-size: 1.42rem;
+  line-height: 1.4;
+  scroll-margin-top: 18px;
+}
+h3 { margin: 28px 0 9px; font-size: 1.13rem; scroll-margin-top: 18px; }
+h4 { margin: 20px 0 6px; font-size: 1rem; color: var(--muted); }
+p { margin: 11px 0; }
+ul, ol { padding-left: 24px; }
+li { margin: 5px 0; }
+.lead { margin-bottom: 22px; color: var(--muted); font-size: 1.06rem; }
+.meta { color: var(--muted); font-size: .82rem; }
+code {
+  padding: 2px 6px;
+  color: #a42657;
+  background: var(--code);
+  border-radius: 4px;
+  font: .88em "Cascadia Code", Consolas, monospace;
+}
+pre {
+  margin: 16px 0;
+  padding: 15px 17px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code);
+  line-height: 1.55;
+}
+pre code { padding: 0; color: #263238; background: transparent; }
+.code-title {
+  display: block;
+  margin-bottom: -17px;
+  padding: 7px 13px 20px;
+  color: var(--muted);
+  background: #e9edf0;
+  border: 1px solid var(--border);
+  border-radius: 8px 8px 0 0;
+  font-size: .78rem;
+  font-weight: 650;
+}
+table { width: 100%; margin: 18px 0; border-collapse: collapse; font-size: .9rem; }
+th, td { padding: 9px 11px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { background: #edf0f2; font-weight: 650; }
+tr:nth-child(even) td { background: var(--panel-2); }
+.callout {
+  margin: 18px 0;
+  padding: 13px 16px;
+  border: 1px solid;
+  border-radius: 8px;
+}
+.callout p:first-child { margin-top: 0; }
+.callout p:last-child { margin-bottom: 0; }
+.callout strong:first-child { margin-right: 5px; }
+.note { background: var(--blue-soft); border-color: #bdd3eb; }
+.tip { background: var(--accent-soft); border-color: #bed9b9; }
+.warn { background: var(--warn-soft); border-color: #eed38e; }
+.danger { background: var(--danger-soft); border-color: #efbcbc; }
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 15px;
+  margin: 22px 0;
+}
+.card {
+  display: block;
+  padding: 18px;
+  color: var(--text);
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  text-decoration: none;
+}
+.card:hover { border-color: #b8c2ca; box-shadow: 0 5px 16px rgba(35, 48, 58, .08); }
+.card h3 { margin: 0 0 6px; color: var(--accent); }
+.card p { margin: 0; color: var(--muted); font-size: .89rem; }
+.badge {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 2px 8px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 20px;
+  font-size: .74rem;
+}
+.kpi { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0; }
+.kpi .box { flex: 1 1 155px; padding: 13px 15px; border: 1px solid var(--border); border-radius: 8px; }
+.kpi .value { color: var(--accent); font-size: 1.25rem; font-weight: 750; }
+.kpi .label { color: var(--muted); font-size: .8rem; }
+.mermaid {
+  margin: 20px 0;
+  padding: 16px;
+  overflow-x: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  text-align: center;
+}
+.caption { margin: -10px 0 20px; color: var(--muted); font-size: .83rem; text-align: center; }
+.steps { counter-reset: step; padding: 0; list-style: none; }
+.steps > li {
+  position: relative;
+  margin: 18px 0;
+  padding: 2px 0 2px 45px;
+}
+.steps > li::before {
+  counter-increment: step;
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 30px;
+  height: 30px;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 50%;
+  font-weight: 700;
+  line-height: 30px;
+  text-align: center;
+}
+.page-nav { display: flex; justify-content: space-between; gap: 12px; margin-top: 50px; padding-top: 18px; border-top: 1px solid var(--border); }
+.page-nav a { padding: 8px 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; text-decoration: none; }
+.refs { color: var(--muted); font-size: .85rem; }
+.menu-toggle { display: none; }
+@media (max-width: 900px) {
+  .sidebar { position: fixed; z-index: 30; left: 0; transform: translateX(-100%); transition: transform .2s; }
+  .sidebar.open { transform: translateX(0); box-shadow: 4px 0 18px rgba(0,0,0,.13); }
+  .content { padding: 68px 20px 90px; }
+  .menu-toggle {
+    display: block;
+    position: fixed;
+    z-index: 40;
+    top: 12px;
+    left: 12px;
+    padding: 8px 12px;
+    color: #fff;
+    background: var(--accent);
+    border: 0;
+    border-radius: 6px;
+    font-size: .95rem;
+  }
+  table { display: block; overflow-x: auto; }
+}
+

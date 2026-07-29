@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton Batching 与可观测性</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">证明请求如何排队与合批</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>Request Batching 与可观测性实验</h1>
+  <p class="lead">Batching 的目标通常是用少量延迟换取更高吞吐。正确实验必须有基线、并发负载和指标证据；只看到 GPU utilization 变高，不能证明请求真的被合批。</p>
+
+  <h2>四种“batch”不要混淆</h2>
+  <table>
+    <thead><tr><th>机制</th><th>谁创建</th><th>适合</th><th>关键特点</th></tr></thead>
+    <tbody>
+      <tr><td>Client static batch</td><td>客户端</td><td>客户端本来就有一批样本</td><td>一个请求内 shape 首维大于 1</td></tr>
+      <tr><td>Triton dynamic batching</td><td>Triton scheduler</td><td>无状态 tensor 模型</td><td>把多个独立请求合成一次 backend execution</td></tr>
+      <tr><td>Sequence batching</td><td>Triton scheduler</td><td>序列状态必须保持的模型</td><td>按 sequence/correlation ID 调度</td></tr>
+      <tr><td>vLLM continuous batching</td><td>vLLM engine</td><td>autoregressive LLM</td><td>请求可在不同 token step 加入/退出执行集合</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Dynamic batching 工作方式</h2>
+  <div class="mermaid">
+sequenceDiagram
+  participant A as Request A
+  participant B as Request B
+  participant C as Request C
+  participant Q as Triton Queue
+  participant G as GPU Instance
+  A->>Q: t=0
+  B->>Q: t=40µs
+  C->>Q: t=70µs
+  Note over Q: max_queue_delay 内等待<br/>形成 batch=3
+  Q->>G: 一次 backend execution
+  G-->>Q: batched outputs
+  Q-->>A: response A
+  Q-->>B: response B
+  Q-->>C: response C
+  </div>
+  <p>启用默认 dynamic batching：</p>
+  <pre><code>max_batch_size: 8
+dynamic_batching {}</code></pre>
+  <p>允许最多等待 200 微秒来收集更多请求：</p>
+  <pre><code>dynamic_batching {
+  max_queue_delay_microseconds: 200
+}</code></pre>
+  <p>官方建议大多数模型<strong>不要先设置</strong> <code>preferred_batch_size</code>；默认让调度器尽可能组成不超过 max batch 的大批。只有特定 batch size 明显更快（例如 TensorRT optimization profile）时才优先使用。</p>
+
+  <h2>关键配置如何影响结果</h2>
+  <table>
+    <thead><tr><th>配置</th><th>调大后的可能收益</th><th>代价/风险</th></tr></thead>
+    <tbody>
+      <tr><td><code>max_batch_size</code></td><td>单次执行容纳更多样本</td><td>模型必须支持动态首维；显存与延迟可能增加</td></tr>
+      <tr><td><code>max_queue_delay_microseconds</code></td><td>低流量也更容易凑批</td><td>请求主动等待，tail latency 上升</td></tr>
+      <tr><td><code>preferred_batch_size</code></td><td>命中特定高效 profile</td><td>错误配置会增加等待且未必更快</td></tr>
+      <tr><td><code>instance_group.count</code></td><td>并发执行、重叠传输和计算</td><td>额外显存；可能妨碍单实例凑大批</td></tr>
+      <tr><td>客户端 concurrency</td><td>给 scheduler 足够在途请求</td><td>过高会积压并恶化 p95/p99</td></tr>
+    </tbody>
+  </table>
+
+  <h2>完整对照实验</h2>
+  <p>建议用普通小型 ONNX/TorchScript 模型，而不是先用 LLM。RTX 4070 和 CPU 机器都能完成；CPU 下数值不同，但方法相同。</p>
+  <ol class="steps">
+    <li><strong>准备基线配置。</strong>保持 <code>max_batch_size: 8</code>，暂时移除 <code>dynamic_batching</code>，model instance 为 1。</li>
+    <li><strong>预热。</strong>先发送若干请求，避免把模型加载、JIT 或 cache 冷启动计入稳态。</li>
+    <li><strong>测无 batching。</strong>用 perf_analyzer 做 concurrency 1、2、4、8，记录吞吐和 p95。</li>
+    <li><strong>启用默认 dynamic batching。</strong>仅添加 <code>dynamic_batching {}</code>，重启或 reload 模型，重复相同负载。</li>
+    <li><strong>加 queue delay。</strong>测试 100、200、500 微秒，找到延迟预算内的最高吞吐。</li>
+    <li><strong>读 metrics。</strong>比较 inference count / execution count，计算平均执行 batch size。</li>
+    <li><strong>最后才测试 instance count。</strong>将实例从 1 改 2，观察收益是否值得额外显存和延迟。</li>
+  </ol>
+
+  <h2>使用 perf_analyzer</h2>
+  <p>SDK 镜像包含客户端工具。Windows/WSL2 上不要依赖 <code>--net=host</code> 的跨平台细节，最稳妥是将 server 与 SDK 放入同一个 Docker network。</p>
+  <span class="code-title">创建网络并启动 server（示意）</span>
+  <pre><code>docker network create triton-net
+
+docker run --name triton --rm --network triton-net \
+  --gpus=1 \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <span class="code-title">另一终端：从 SDK 容器压测</span>
+  <pre><code>docker run --rm --network triton-net \
+  nvcr.io/nvidia/tritonserver:&lt;xx.yy&gt;-py3-sdk \
+  perf_analyzer -m &lt;model-name&gt; \
+    -u triton:8001 \
+    -i grpc \
+    --percentile=95 \
+    --concurrency-range 1:8</code></pre>
+  <div class="callout note"><p><strong>输入数据：</strong>真实模型通常需要用 <code>--input-data</code> 指定符合 tensor shape/type 的 JSON。先运行 <code>perf_analyzer --help</code> 并对照当前版本文档，不要假设随机输入适合所有模型。</p></div>
+
+  <h2>Prometheus 指标如何证明合批</h2>
+  <pre><code>curl -s localhost:8002/metrics &gt; metrics.txt
+grep 'nv_inference_.*{.*model="&lt;model-name&gt;"' metrics.txt</code></pre>
+  <p>官方 metrics 文档给出三个重要计数：</p>
+  <table>
+    <thead><tr><th>计数</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>Request Count</td><td>客户端请求数</td></tr>
+      <tr><td>Inference Count</td><td>请求中的样本总数；batch-8 请求贡献 8</td></tr>
+      <tr><td>Execution Count</td><td>backend model instance 实际执行次数</td></tr>
+    </tbody>
+  </table>
+  <pre><code>平均执行 batch size ≈ Inference Count / Execution Count</code></pre>
+  <p>例：发送 100 个 batch-1 请求，最终 inference count=100、execution count=25，则平均每次 backend execution 处理约 4 个样本。这是动态合批的直接聚合证据。</p>
+
+  <h3>延迟拆分</h3>
+  <ul>
+    <li><strong>queue duration：</strong>调度等待，包括为合批主动等待和实例繁忙等待。</li>
+    <li><strong>compute input：</strong>输入准备和传输。</li>
+    <li><strong>compute infer：</strong>核心模型执行。</li>
+    <li><strong>compute output：</strong>输出准备和复制。</li>
+    <li><strong>pending request count：</strong>已进入 Triton core 但尚未由 backend instance 开始执行的请求。</li>
+  </ul>
+
+  <h2>Trace 精确定位</h2>
+  <p>启动时采集前 100 个请求的时间戳：</p>
+  <pre><code>tritonserver --model-repository=/models \
+  --trace-config triton,file=/tmp/trace.json \
+  --trace-config triton,log-frequency=50 \
+  --trace-config rate=1 \
+  --trace-config level=TIMESTAMPS \
+  --trace-config count=100</code></pre>
+  <p>Trace 中可看到 <code>REQUEST_START</code>、<code>QUEUE_START</code>、<code>COMPUTE_START</code>、<code>COMPUTE_END</code>、<code>REQUEST_END</code>。生产环境不要无界开启高采样率，尤其不要随意记录 tensor 内容。</p>
+
+  <h2>vLLM 如何观察 batching</h2>
+  <p>vLLM 生成请求长度不同，不能用普通 fixed-shape dynamic batch 的思维解释。建议：</p>
+  <ul>
+    <li>使用当前 Triton release 提供的 GenAI-Perf，对固定 input/output token 长度和不同 concurrency 做对照。</li>
+    <li>记录 time to first token、inter-token latency、request latency、tokens/s。</li>
+    <li>同时查看 vLLM engine 暴露的 running/waiting requests、KV cache 使用等版本相关指标。</li>
+    <li>保持模型、prompt 长度、output token、sampling 参数一致，只改变并发。</li>
+  </ul>
+
+  <h2>如何判断优化成功</h2>
+  <table>
+    <thead><tr><th>现象</th><th>判断</th></tr></thead>
+    <tbody>
+      <tr><td>吞吐提高，p95 在预算内，平均 batch 增大</td><td>成功</td></tr>
+      <tr><td>吞吐几乎不变，queue latency 大幅增加</td><td>delay 过高或模型不从 batching 受益</td></tr>
+      <tr><td>GPU 已满载，增加 instance 只增延迟</td><td>一个实例已足够，回退</td></tr>
+      <tr><td>concurrency=1 看不到合批</td><td>正常；没有同时在途请求可合并</td></tr>
+      <tr><td>vLLM 吞吐提高但 Triton execution 指标难解释</td><td>应结合 engine/token 指标，不能套用普通 dynamic batch 结论</td></tr>
+    </tbody>
+  </table>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html">NVIDIA — Dynamic Batcher</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/metrics.html">NVIDIA — Metrics</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/trace.html">NVIDIA — Trace</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/optimization.html">NVIDIA — Optimization</a></li>
+  </ul>
+  <nav class="page-nav"><a href="vllm-backend.html">← vLLM</a><a href="windows-wsl2.html">下一页：Windows/WSL2 →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>
+

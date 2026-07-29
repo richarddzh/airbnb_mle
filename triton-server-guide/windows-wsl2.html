@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Windows WSL2 Triton GPU 手册</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">RTX 4070 12GB 与 CPU 路径</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>Windows + WSL2 + RTX 4070 操作手册</h1>
+  <p class="lead">Triton 官方容器是 Linux 环境。Windows 用户最简单可靠的实验方式是 WSL2：Windows 安装 NVIDIA 驱动，WSL2 通过 GPU paravirtualization 使用同一张 RTX 4070，Docker 再把 GPU 暴露给 Triton 容器。</p>
+
+  <div class="callout tip"><p><strong>推荐拓扑：</strong>Windows 11 → WSL2 Ubuntu → Docker Desktop WSL2 backend（或 WSL 内 Docker）→ Triton Linux container → RTX 4070 12GB。</p></div>
+
+  <h2>为什么不优先使用传统 Linux 虚拟机</h2>
+  <table>
+    <thead><tr><th>方案</th><th>CUDA GPU</th><th>入门难度</th><th>建议</th></tr></thead>
+    <tbody>
+      <tr><td>WSL2</td><td>NVIDIA GPU-PV，官方支持</td><td>低</td><td><strong>首选</strong></td></tr>
+      <tr><td>Linux 双系统</td><td>原生</td><td>中；需分区和重启</td><td>追求原生环境时考虑</td></tr>
+      <tr><td>Hyper-V DDA / 企业 passthrough</td><td>取决于硬件、宿主版本和设备支持</td><td>高</td><td>不适合普通入门</td></tr>
+      <tr><td>VMware/VirtualBox 普通 3D 加速</td><td>通常不是 CUDA passthrough</td><td>看似低但达不到目标</td><td>不要用于 Triton GPU 实验</td></tr>
+      <tr><td>CPU Linux VM</td><td>无</td><td>中</td><td>可学习 CPU server，但 WSL2 更轻</td></tr>
+    </tbody>
+  </table>
+
+  <h2>GPU 数据路径</h2>
+  <div class="mermaid">
+flowchart LR
+  W["Windows 11<br/>NVIDIA display driver"] --> P["WSL2 GPU-PV<br/>Linux CUDA interface"]
+  P --> D["Docker Desktop<br/>WSL2 backend"]
+  D --> C["Triton Linux container<br/>--gpus=1"]
+  C --> G["RTX 4070<br/>12GB VRAM"]
+  </div>
+  <div class="callout danger"><p><strong>不要在 WSL2 里安装 Linux NVIDIA display driver：</strong>NVIDIA CUDA on WSL 指南说明，Windows 主机驱动会以映射方式提供 CUDA 支持。若要安装 CUDA toolkit，只选择 WSL-Ubuntu toolkit，不要安装会覆盖驱动的 meta-package。</p></div>
+
+  <h2>步骤 1：更新 Windows 与 NVIDIA 驱动</h2>
+  <ol>
+    <li>优先使用 Windows 11，并完成 Windows Update。</li>
+    <li>从 NVIDIA 官方安装支持 WSL2 CUDA 的最新稳定驱动。</li>
+    <li>重启 Windows。</li>
+    <li>在 PowerShell 运行：</li>
+  </ol>
+  <pre><code>nvidia-smi</code></pre>
+  <p>确认型号为 RTX 4070、显存约 12GB，记录 Driver Version。若这一步失败，WSL2 和 Docker 都不会成功。</p>
+
+  <h2>步骤 2：安装 WSL2 Ubuntu</h2>
+  <span class="code-title">管理员 PowerShell</span>
+  <pre><code>wsl --install -d Ubuntu
+wsl --update
+wsl --set-default-version 2</code></pre>
+  <p>重启后首次打开 Ubuntu，创建 Linux 用户名和密码。然后回到 PowerShell：</p>
+  <pre><code>wsl -l -v
+wsl --status</code></pre>
+  <p>Ubuntu 的 VERSION 应为 2。若已有 WSL1：</p>
+  <pre><code>wsl --set-version Ubuntu 2</code></pre>
+
+  <h2>步骤 3：在 WSL2 验证 GPU</h2>
+  <span class="code-title">Ubuntu / WSL2</span>
+  <pre><code>nvidia-smi
+ls -l /usr/lib/wsl/lib/libcuda.so*
+uname -a</code></pre>
+  <p><code>nvidia-smi</code> 应看到 RTX 4070。WSL 里的显示可能与 Windows 版本略有差异，但设备必须可见。</p>
+
+  <h2>步骤 4：安装 Docker</h2>
+  <h3>方案 A：Docker Desktop（推荐新手）</h3>
+  <ol>
+    <li>安装最新 Docker Desktop for Windows。</li>
+    <li>Settings → General：启用 “Use the WSL 2 based engine”。</li>
+    <li>Settings → Resources → WSL Integration：启用 Ubuntu。</li>
+    <li>重启 Docker Desktop。</li>
+  </ol>
+  <p>Docker 官方明确说明：Docker Desktop for Windows 的 GPU 支持只在 WSL2 backend 可用。</p>
+
+  <h3>方案 B：直接在 WSL2 安装 Docker Engine</h3>
+  <p>适合熟悉 Linux 服务管理的用户。按 Docker Engine Ubuntu 官方步骤安装，并按 NVIDIA Container Toolkit 指南配置 runtime。两套 Docker 不要混用，以免 socket/context 混乱。</p>
+
+  <h2>步骤 5：验证容器 GPU</h2>
+  <span class="code-title">Ubuntu / WSL2</span>
+  <pre><code>docker version
+docker info
+docker run --rm --gpus all ubuntu nvidia-smi</code></pre>
+  <p>如果权限不足，Docker Desktop 路径通常不要求 Linux docker group；原生 Docker Engine 可按官方说明配置用户权限。不要用长期 <code>sudo chmod 666 /var/run/docker.sock</code> 作为修复。</p>
+
+  <h2>步骤 6：创建 Linux 文件系统实验目录</h2>
+  <pre><code>mkdir -p ~/triton-lab/model_repository
+cd ~/triton-lab</code></pre>
+  <p>推荐通过 Windows Explorer 的 <code>\\wsl$\Ubuntu\home\&lt;user&gt;\triton-lab</code> 查看文件，或使用 VS Code Remote WSL。模型和大量小文件放 Linux home，避免 <code>/mnt/c</code> 的性能和权限差异。</p>
+
+  <h2>步骤 7：启动 Triton</h2>
+  <h3>RTX 4070 GPU 路径</h3>
+  <pre><code>export TRITON_VERSION=&lt;xx.yy&gt;
+docker pull nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-py3
+
+docker run --gpus=1 --rm \
+  --shm-size=1g \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <h3>CPU-only 路径</h3>
+  <pre><code>export TRITON_VERSION=&lt;xx.yy&gt;
+docker run --rm \
+  --shm-size=1g \
+  -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+  -v "$PWD/model_repository:/models" \
+  nvcr.io/nvidia/tritonserver:${TRITON_VERSION}-py3 \
+  tritonserver --model-repository=/models</code></pre>
+  <p>CPU 路径不要带 <code>--gpus</code>，且模型配置必须能运行在 CPU。使用本手册 add/sub Python backend 示例最稳妥。</p>
+
+  <h2>从 Windows 访问 WSL2 中的 Triton</h2>
+  <p>Docker Desktop 映射的端口通常可直接从 Windows localhost 访问：</p>
+  <span class="code-title">Windows PowerShell</span>
+  <pre><code>curl.exe -i http://localhost:8000/v2/health/ready
+curl.exe http://localhost:8002/metrics</code></pre>
+  <p>PowerShell 的 <code>curl</code> 在旧版本中可能是别名，因此示例显式使用 <code>curl.exe</code>。</p>
+
+  <h2>RTX 4070 12GB 专用建议</h2>
+  <ul>
+    <li>Windows 桌面也会占用一部分显存；不要把 12GB 全部承诺给 engine。</li>
+    <li>vLLM 从 <code>gpu_memory_utilization=0.80</code> 或 0.85 起步。</li>
+    <li>选择 0.5B–3B 模型作为第一条成功路径；7B FP16 通常没有足够安全余量。</li>
+    <li>先把 <code>max_model_len</code> 限为 2048，稳定后再提高。</li>
+    <li>单模型、单 instance、并发 1 起步；每次只改变一个变量。</li>
+    <li>用 <code>watch -n 1 nvidia-smi</code> 观察显存；Windows 侧也可用任务管理器 GPU 页面辅助观察。</li>
+  </ul>
+
+  <h2>CPU 机器能学到什么</h2>
+  <table>
+    <thead><tr><th>可做</th><th>不建议当作目标</th></tr></thead>
+    <tbody>
+      <tr><td>Python backend add/sub、模型仓库、版本、health、HTTP/gRPC</td><td>高性能 LLM token generation</td></tr>
+      <tr><td>用小模型观察 queue、dynamic batching 和 execution count</td><td>推断 GPU 上的真实吞吐和 kernel 行为</td></tr>
+      <tr><td>学习 metrics、trace、模型加载错误排查</td><td>验证 GPU memory、paged attention 和 CUDA graph</td></tr>
+    </tbody>
+  </table>
+
+  <h2>故障排查树</h2>
+  <div class="mermaid">
+flowchart TD
+  A["Triton GPU 启动失败"] --> B{"Windows nvidia-smi?"}
+  B -->|失败| C["修复 Windows 驱动"]
+  B -->|成功| D{"WSL nvidia-smi?"}
+  D -->|失败| E["wsl --update<br/>检查 WSL2 与驱动"]
+  D -->|成功| F{"docker --gpus all?"}
+  F -->|失败| G["检查 Docker Desktop WSL2 backend<br/>或 NVIDIA Container Toolkit"]
+  F -->|成功| H{"Triton 容器 nvidia-smi?"}
+  H -->|失败| I["检查镜像与 runtime"]
+  H -->|成功| J["检查模型配置、CUDA 兼容与显存"]
+  </div>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://learn.microsoft.com/en-us/windows/wsl/install">Microsoft — Install WSL</a></li>
+    <li><a href="https://learn.microsoft.com/en-us/windows/ai/directml/gpu-cuda-in-wsl">Microsoft — Enable NVIDIA CUDA on WSL2</a></li>
+    <li><a href="https://docs.nvidia.com/cuda/wsl-user-guide/index.html">NVIDIA — CUDA on WSL User Guide</a></li>
+    <li><a href="https://docs.docker.com/desktop/features/gpu/">Docker — GPU support in Docker Desktop</a></li>
+  </ul>
+  <nav class="page-nav"><a href="batching-observability.html">← Batching</a><a href="learning-roadmap.html">下一页：学习路线 →</a></nav>
+</main></div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>
+

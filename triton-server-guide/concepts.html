@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Triton 核心概念与架构</title><link rel="stylesheet" href="assets/style.css"></head>
+<body>
+<button class="menu-toggle" aria-label="打开导航">☰ 目录</button>
+<div class="layout">
+<aside class="sidebar"><div class="brand"><a href="index.html">Triton 中文学习手册</a></div><div class="subtitle">核心概念与请求生命周期</div><div class="nav-label">全站导航</div><ul class="site-nav"></ul><div class="nav-label">本页目录</div><ul class="toc"></ul></aside>
+<main class="content">
+  <h1>Triton 核心概念与架构</h1>
+  <p class="lead">先把 Triton 看作“模型推理的统一服务进程”：客户端不直接操作模型文件，而是向 Triton 发请求；Triton 再按模型配置完成排队、合批、选择实例和调用 backend。</p>
+
+  <h2>Triton 做什么</h2>
+  <table>
+    <thead><tr><th>能力</th><th>说明</th><th>你能观察什么</th></tr></thead>
+    <tbody>
+      <tr><td>统一协议</td><td>HTTP/REST、gRPC，以及嵌入式使用的 C API</td><td>请求、响应、健康检查</td></tr>
+      <tr><td>模型生命周期</td><td>从一个或多个 model repository 加载、卸载、查询版本</td><td>READY/UNAVAILABLE、加载错误</td></tr>
+      <tr><td>每模型调度</td><td>模型可分别使用默认、dynamic 或 sequence scheduler</td><td>队列时间、execution count</td></tr>
+      <tr><td>多后端</td><td>TensorRT、ONNX Runtime、PyTorch、Python、vLLM 等</td><td>相同协议访问不同框架</td></tr>
+      <tr><td>实例管理</td><td>一个模型可以有一个或多个 CPU/GPU instance</td><td>并行执行与显存占用</td></tr>
+      <tr><td>可观测性</td><td>Prometheus metrics、trace、日志、性能工具</td><td>吞吐、延迟、GPU、batch size</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Triton 不做什么</h2>
+  <ul>
+    <li><strong>不训练模型：</strong>训练、微调、数据准备仍由 PyTorch、Transformers 等完成。</li>
+    <li><strong>不自动让任意模型变快：</strong>模型必须与 backend 兼容，batching 和 instance 数要通过测量调优。</li>
+    <li><strong>不是模型格式：</strong><code>config.pbtxt</code> 描述服务配置，真正模型仍是 TorchScript、ONNX、TensorRT plan 或 backend 所需文件。</li>
+    <li><strong>不是 vLLM 的替代品：</strong>vLLM 是 LLM execution engine；Triton 可以把它包装为统一服务的一种 backend。</li>
+    <li><strong>不是 Kubernetes：</strong>Triton 可被 Kubernetes 管理，但自身不负责跨主机部署、服务发现和高可用。</li>
+  </ul>
+
+  <h2>核心对象</h2>
+  <h3>Model repository</h3>
+  <p>文件系统或对象存储中的模型集合。启动参数 <code>--model-repository=/models</code> 告诉 Triton 去哪里找模型。每个模型一个目录，每个版本一个数字目录。</p>
+  <h3>Backend</h3>
+  <p>把 Triton 的标准请求转换成某种执行引擎调用的适配层。例如 PyTorch backend 使用 LibTorch 执行 TorchScript，vLLM backend 把生成请求放入 AsyncEngine。</p>
+  <h3>Scheduler 与 batcher</h3>
+  <p>每个模型有自己的调度器。无状态模型常用 dynamic batcher 合并同时到达的请求；有状态序列模型可用 sequence batcher 保持同一序列的相关性。</p>
+  <h3>Model instance</h3>
+  <p>模型的一份可执行副本。默认通常为一个实例；增加实例可能提高重叠执行能力，也会增加显存占用。实例多不等于性能一定更高。</p>
+
+  <h2>一次请求的生命周期</h2>
+  <div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant F as HTTP/gRPC Frontend
+  participant S as Per-model Scheduler
+  participant B as Backend
+  participant G as GPU
+  C->>F: Infer request + tensor/text
+  F->>S: 标准化为 Triton request
+  Note over S: 排队；可选 dynamic batching
+  S->>B: 一批 requests
+  B->>G: H2D / kernel / runtime
+  G-->>B: output
+  B-->>F: Triton response
+  F-->>C: HTTP/gRPC response
+  Note over F,G: metrics 计数；可选 trace 时间戳
+  </div>
+
+  <ol class="steps">
+    <li><strong>接入。</strong>Frontend 解析 HTTP/gRPC，把协议字段转换为 Triton 内部请求。此时还没有执行模型。</li>
+    <li><strong>排队。</strong>请求进入对应模型的 scheduler。若实例忙，请求处于 pending；若启用 dynamic batching，调度器尝试合并兼容请求。</li>
+    <li><strong>执行。</strong>批次交给一个可用 model instance，backend 调用框架或 engine。</li>
+    <li><strong>返回。</strong>输出被拆回各请求并经 frontend 返回；decoupled 模型则可能一请求多响应并流式返回。</li>
+  </ol>
+
+  <h2>端口与 API</h2>
+  <table>
+    <thead><tr><th>默认端口</th><th>用途</th><th>入门验证</th></tr></thead>
+    <tbody>
+      <tr><td><code>8000</code></td><td>HTTP/REST inference、health、model API</td><td><code>curl localhost:8000/v2/health/ready</code></td></tr>
+      <tr><td><code>8001</code></td><td>gRPC inference 与管理 API</td><td>使用 Triton client SDK</td></tr>
+      <tr><td><code>8002</code></td><td>Prometheus 文本指标</td><td><code>curl localhost:8002/metrics</code></td></tr>
+    </tbody>
+  </table>
+  <div class="callout note"><p><strong>live 与 ready：</strong>live 表示 server 进程活着；ready 表示 server 已准备接收推理。模型还有 <code>/v2/models/&lt;model&gt;/ready</code>。生产探针应按目标选择，不能只看容器进程存在。</p></div>
+
+  <h2>与 FastAPI + 模型代码的区别</h2>
+  <table>
+    <thead><tr><th>维度</th><th>直接 FastAPI</th><th>Triton</th></tr></thead>
+    <tbody>
+      <tr><td>灵活性</td><td>任意 Python 逻辑最灵活</td><td>受 backend 接口与模型配置约束</td></tr>
+      <tr><td>协议</td><td>自行设计</td><td>统一的 V2 inference protocol</td></tr>
+      <tr><td>批处理</td><td>自行写队列与并发控制</td><td>普通模型可配置 dynamic batching</td></tr>
+      <tr><td>多框架</td><td>自行维护不同 runtime</td><td>统一管理多 backend</td></tr>
+      <tr><td>可观测性</td><td>自行埋点</td><td>内置请求/GPU metrics 与 tracing</td></tr>
+      <tr><td>入门成本</td><td>小 demo 较低</td><td>需要理解仓库和 config.pbtxt</td></tr>
+    </tbody>
+  </table>
+
+  <h2>适合 Triton 的场景</h2>
+  <ul>
+    <li>希望用统一协议托管 ONNX、TensorRT、TorchScript、Python 或 LLM engine。</li>
+    <li>需要动态批处理、多模型实例、标准指标、模型版本和显式配置。</li>
+    <li>希望把模型服务层与业务 API 层分离。</li>
+  </ul>
+  <p>如果只是个人脚本调用一次模型，Triton 可能过重；如果目标正是学习“推理 server 如何调度请求”，Triton 非常合适。</p>
+
+  <h2>参考资料</h2>
+  <ul class="refs">
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/architecture.html">NVIDIA — Triton Architecture</a></li>
+    <li><a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html">NVIDIA — Model Configuration</a></li>
+  </ul>
+  <nav class="page-nav"><a href="index.html">← 首页</a><a href="single-gpu-lab.html">下一页：单 GPU 实验 →</a></nav>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script><script src="assets/common.js"></script>
+</body></html>
+
