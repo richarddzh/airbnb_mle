@@ -1,6 +1,7 @@
 param(
     [string]$RepoId = "richarddzh/tiny-qwen3-30m-zh-completion",
-    [string]$Proxy = "http://127.0.0.1:10808"
+    [string]$Proxy = "http://127.0.0.1:10808",
+    [string]$HfExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,15 +12,51 @@ if ($Proxy) {
     Remove-Item Env:ALL_PROXY -ErrorAction SilentlyContinue
 }
 
-$hf = Get-Command hf -ErrorAction Stop
+if (-not $HfExecutable) {
+    $hfCommand = Get-Command hf -ErrorAction SilentlyContinue
+    if ($hfCommand) {
+        $HfExecutable = $hfCommand.Source
+    }
+}
+
+if (-not $HfExecutable -and $env:VIRTUAL_ENV) {
+    $candidate = Join-Path $env:VIRTUAL_ENV "Scripts\hf.exe"
+    if (Test-Path $candidate) {
+        $HfExecutable = $candidate
+    }
+}
+
+if (-not $HfExecutable) {
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        $candidate = Join-Path (Split-Path $pythonCommand.Source) "hf.exe"
+        if (Test-Path $candidate) {
+            $HfExecutable = $candidate
+        }
+    }
+}
+
+if (-not $HfExecutable) {
+    $candidate = "D:\github\talking-flower-voice\.venv\Scripts\hf.exe"
+    if (Test-Path $candidate) {
+        $HfExecutable = $candidate
+    }
+}
+
+if (-not $HfExecutable -or -not (Test-Path $HfExecutable)) {
+    throw "Cannot find hf.exe. Install it with 'python -m pip install -U huggingface_hub' or pass -HfExecutable."
+}
+
 $source = $PSScriptRoot
 
-& $hf.Source auth whoami
+Write-Host "Using HF CLI: $HfExecutable"
+
+& $HfExecutable auth whoami
 if ($LASTEXITCODE -ne 0) {
     throw "Run 'hf auth login' first with a token that has Write permission."
 }
 
-& $hf.Source repo create $RepoId `
+& $HfExecutable repo create $RepoId `
     --type space `
     --sdk gradio `
     --flavor cpu-basic `
@@ -29,7 +66,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to create the Hugging Face Space."
 }
 
-& $hf.Source upload $RepoId $source . `
+& $HfExecutable upload $RepoId $source . `
     --repo-type space `
     --exclude "deploy.ps1" `
     --exclude "run-local.ps1" `

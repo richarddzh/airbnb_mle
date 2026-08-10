@@ -1222,6 +1222,136 @@ target tokens = 10,000 × 32,768 = 327,680,000
       TensorBoard 日志保存到 Drive，可通过 notebook magic 直接查看。
     </p>
 
+    <h3>7.8 TinyStories 原始论文使用了哪些训练超参数</h3>
+    <p>
+      TinyStories 原始论文是
+      <a href="https://arxiv.org/abs/2305.07759"
+         target="_blank" rel="noopener noreferrer">
+        Eldan &amp; Li, 2023, arXiv:2305.07759
+      </a>。论文正文、脚注和附录明确披露了一部分架构、训练资源和评估参数，
+      但没有给出一份完整的 optimizer 配置表。下面严格区分
+      <b>论文明确写出的内容</b>与<b>官方 33M 模型卡额外披露的内容</b>。
+    </p>
+
+    <h4>论文明确给出的设置</h4>
+    <table>
+      <thead><tr><th>项目</th><th>论文设置</th><th>出处与说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>基础架构</td>
+          <td>GPT-Neo decoder-only Transformer</td>
+          <td>PDF 第 2 页脚注 2</td>
+        </tr>
+        <tr>
+          <td>Local attention window</td>
+          <td class="num">256</td>
+          <td>PDF 第 2 页脚注 2</td>
+        </tr>
+        <tr>
+          <td>训练 context length</td>
+          <td class="num">512</td>
+          <td>PDF 第 2 页脚注 2</td>
+        </tr>
+        <tr>
+          <td>Tokenizer</td>
+          <td>GPT-Neo tokenizer，只保留最高频 10K tokens</td>
+          <td>PDF 第 2 页脚注 2</td>
+        </tr>
+        <tr>
+          <td>主要模型规模</td>
+          <td>约 1M–35M 参数，1–8 layers</td>
+          <td>PDF 第 6 页；这些模型最多约 30 小时可训完</td>
+        </tr>
+        <tr>
+          <td>架构/算力扫描 layers</td>
+          <td><code>{2, 4, 8, 12}</code></td>
+          <td>PDF 第 23 页 scaling-law 实验</td>
+        </tr>
+        <tr>
+          <td>架构/算力扫描 hidden size</td>
+          <td><code>{64, 128, 256, 512, 768, 1024, 2048}</code></td>
+          <td>PDF 第 23 页 scaling-law 实验</td>
+        </tr>
+        <tr>
+          <td>Attention heads 对照</td>
+          <td><code>{2, 4, 8}</code></td>
+          <td>PDF 第 24 页；hidden 768，1 或 2 layers 的对照表</td>
+        </tr>
+        <tr>
+          <td>训练硬件与时长</td>
+          <td>单张 V100，主要 1M–35M 模型最多约 30 小时</td>
+          <td>PDF 第 6 页</td>
+        </tr>
+        <tr>
+          <td>GPT-4 全量评估采样</td>
+          <td>每个手工 prompt 生成 10 次，temperature 1，再对分数取平均</td>
+          <td>PDF 第 5 页</td>
+        </tr>
+        <tr>
+          <td>Instruct 评估集</td>
+          <td>50 组与训练集不重叠的 instructions</td>
+          <td>PDF 第 5–6 页</td>
+        </tr>
+        <tr>
+          <td>论文定性示例解码</td>
+          <td>为可复现性，多数后续示例使用 temperature 0</td>
+          <td>PDF 第 9 页；另有标注为 0.5、0.8 的示例</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h4>官方 TinyStories-33M 模型卡额外披露的训练值</h4>
+    <p>
+      官方 Hugging Face 仓库
+      <a href="https://huggingface.co/roneneldan/TinyStories-33M"
+         target="_blank" rel="noopener noreferrer">
+        <code>roneneldan/TinyStories-33M</code>
+      </a>
+      的 README 给出了以下配置。这些值与论文作者发布的模型有关，但
+      <b>不是论文正文中统一声明的所有实验配置</b>：
+    </p>
+    <table>
+      <thead><tr><th>项目</th><th>TinyStories-33M 模型卡</th></tr></thead>
+      <tbody>
+        <tr><td>Learning rate</td><td class="num">5e-4</td></tr>
+        <tr><td>LR schedule</td><td>constant</td></tr>
+        <tr><td>Weight decay</td><td class="num">0.1</td></tr>
+        <tr><td>Adam β1 / β2</td><td class="num">0.9 / 0.95</td></tr>
+        <tr><td>Context length</td><td class="num">512</td></tr>
+        <tr><td>Batch size</td><td class="num">80（模型卡未说明是 micro 还是 effective）</td></tr>
+        <tr><td>Gradient accumulation</td><td class="num">16</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout warn">
+      <p>
+        <span class="label">论文没有披露：</span>
+        optimizer 的明确名称、warmup、完整训练 steps/epochs、总训练 tokens、
+        gradient clipping 以及统一 dropout 设置。虽然模型卡给出了 Adam betas
+        和 weight decay，但不能仅据此把 optimizer 名称写成论文事实。
+        官方已发布 config 中可看到 dropout 为 0 和
+        <code>max_position_embeddings=2048</code>，但论文明确写的是
+        <b>训练 context length 512</b>；配置容量与实际训练长度不是同一概念。
+      </p>
+    </div>
+
+    <h4>与本 notebook 的直接对比</h4>
+    <table>
+      <thead><tr><th>项目</th><th>官方 TinyStories-33M 卡片</th><th>本 Tiny Qwen3 notebook</th></tr></thead>
+      <tbody>
+        <tr><td>架构</td><td>GPT-Neo</td><td>Qwen3</td></tr>
+        <tr><td>Tokenizer</td><td>GPT-Neo 系列；论文称 top 10K</td><td>自训练 Byte-Level BPE，8,192</td></tr>
+        <tr><td>训练长度</td><td class="num">512</td><td class="num">512</td></tr>
+        <tr><td>模型配置上限</td><td>发布 config 为 2048</td><td class="num">1024</td></tr>
+        <tr><td>Learning rate</td><td class="num">5e-4</td><td class="num">3e-4</td></tr>
+        <tr><td>Scheduler</td><td>constant</td><td>cosine + 200-step warmup</td></tr>
+        <tr><td>Weight decay</td><td class="num">0.1</td><td class="num">0.1</td></tr>
+        <tr><td>Adam β1 / β2</td><td class="num">0.9 / 0.95</td><td class="num">0.9 / 0.95</td></tr>
+        <tr><td>Batch / accumulation</td><td>80 / 16，语义未进一步说明</td><td>micro 8 / accumulation 8，有效 64 sequences</td></tr>
+        <tr><td>训练停止条件</td><td>论文与卡片未给出统一 steps</td><td>max_steps 10,000</td></tr>
+      </tbody>
+    </table>
+
     <h2>8. Checkpoint 恢复与当前训练状态</h2>
     <h3>8.1 自动恢复机制</h3>
     <p>
