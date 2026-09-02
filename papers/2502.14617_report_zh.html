@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>论文解读：SageServe</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.72; margin: 0; color: #172033; background: #f6f8fb; }
+    main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 56px; }
+    article { background: #fff; border: 1px solid #dfe5ef; border-radius: 16px; padding: 32px; box-shadow: 0 8px 28px rgba(17, 24, 39, 0.06); }
+    h1 { line-height: 1.25; margin-top: 0; font-size: 2rem; }
+    h2 { margin-top: 2rem; border-bottom: 1px solid #e6ebf2; padding-bottom: 0.35rem; }
+    h3 { margin-top: 1.35rem; }
+    h4 { margin-bottom: 0.35rem; }
+    a { color: #0969da; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.95rem; }
+    th, td { border: 1px solid #d8dee9; padding: 8px 10px; vertical-align: top; }
+    th { background: #f3f6fa; text-align: left; }
+    code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    pre { background: #f3f4f6; border-radius: 8px; padding: 12px 14px; overflow-x: auto; line-height: 1.55; }
+    pre code { padding: 0; background: transparent; }
+    .meta, .box { background: #f1f6ff; border-left: 4px solid #2f6feb; padding: 14px 18px; border-radius: 8px; }
+    .takeaway { background: #f6fff1; border-left: 4px solid #2da44e; padding: 14px 18px; border-radius: 8px; }
+    .warn { background: #fff8c5; border-left: 4px solid #bf8700; padding: 14px 18px; border-radius: 8px; }
+    .small { color: #57606a; font-size: 0.92rem; }
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin: 1rem 0; align-items: stretch; }
+    .flow div { background: #f3f6fa; border: 1px solid #d8dee9; border-radius: 8px; padding: 12px 8px; text-align: center; font-size: 0.9rem; }
+    .flow strong { display: block; color: #0969da; margin-bottom: 4px; }
+    .metric { font-size: 1.15rem; font-weight: 700; color: #1f6f3e; }
+    @media (max-width: 760px) {
+      article { padding: 22px 18px; }
+      .flow { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+<article>
+  <h1>论文解读：SageServe — 用流量预测与多时间尺度控制优化云端 LLM Serving</h1>
+
+  <section class="meta">
+    <strong>论文信息</strong><br>
+    标题：SageServe: Optimizing LLM Serving on Cloud Data Centers with Forecast Aware Auto-Scaling<br>
+    作者：Shashwat Jaiswal, Kunal Jain, Yogesh Simmhan, Anjaly Parayil, Ankur Mallick, Rujia Wang, Renee St. Amant, Chetan Bansal, Victor Ruhle, Anoop Kulkarni, Steve Kofsky, Saravan Rajmohan<br>
+    机构：University of Illinois Urbana-Champaign、Georgia Institute of Technology、Indian Institute of Science、Microsoft<br>
+    发表：Proc. ACM Meas. Anal. Comput. Syst. 9(3), Article 61, 2025；DOI：<a href="https://doi.org/10.1145/3771576">10.1145/3771576</a><br>
+    arXiv：<a href="https://arxiv.org/abs/2502.14617">2502.14617v3</a>，PDF：<a href="2502.14617.pdf">2502.14617.pdf</a>，提取文本：<a href="2502.14617.extracted.txt">2502.14617.extracted.txt</a><br>
+    开源项目：<a href="https://github.com/shashwatj07/SageServe">github.com/shashwatj07/SageServe</a><br>
+    主题：LLM Serving、Forecast-aware Autoscaling、跨区域路由、GPU 资源池、ARIMA、ILP、多 SLA 调度
+  </section>
+
+  <h2>一句话概括</h2>
+  <p class="takeaway">SageServe 不把 LLM 自动伸缩看成单一阈值问题，而是把<strong>秒/分钟级路由与排队</strong>、<strong>小时级流量预测和容量规划</strong>、<strong>实时显存反馈纠偏</strong>组合成一个闭环：用可延迟的 NIW 请求填平交互式业务的 GPU 谷期，再用 ARIMA + ILP 提前配置跨区域、多模型容量，从而在保持尾延迟的同时最多减少约 25% GPU-hours。</p>
+
+  <h2>先看结论：它解决了什么</h2>
+  <table>
+    <thead><tr><th>问题</th><th>传统方案</th><th>SageServe</th><th>论文结果</th></tr></thead>
+    <tbody>
+      <tr><td>IW 与 NIW 资源碎片</td><td>不同 SLA 使用独立 GPU 池，低谷时闲置。</td><td>统一模型资源池；NIW 只在有余量时执行。</td><td>Unified 比 Siloed 少用 34.5% instance-hours，并多释放 52 instance-hours 给 Spot（Fig. 8）。</td></tr>
+      <tr><td>模型冷启动太慢</td><td>流量超过阈值后才扩容，实例就绪前已发生欠配。</td><td>预测未来一小时峰值，提前规划模型实例。</td><td>LT-I / LT-U / LT-UA 分别比 Reactive 少用 24.21% / 19.65% / 23.38% instance-hours（Fig. 11）。</td></tr>
+      <tr><td>预测会出错</td><td>纯预测容易漏掉突发流量。</td><td>LT-UA 同时看 ILP 目标、显存利用率和预测偏差。</td><td>在 8× 合成突发中，LT-UA 能突破预测上限继续扩容（Fig. 16）。</td></tr>
+      <tr><td>不同交互 SLA 冲突</td><td>FCFS 不区分快速层和普通层。</td><td>EDF、PF、DPA 按 deadline 和 tier 排序。</td><td>DPA 在 IW-F 与 IW-N 之间提供可调折中（Fig. 15）。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>为什么 LLM 自动伸缩特别难</h2>
+  <p>CPU Web 服务通常可以在秒级启动容器，LLM 服务却需要分配 GPU VM、复制模型结构和几十到数百 GB 权重、初始化并更新上游路由。论文给出的生产量级是：同区域已有模型权重时约需 <strong>10 分钟</strong>，权重不在本地时可达 <strong>2 小时</strong>。这意味着“看到负载升高再扩容”往往已经太迟。</p>
+  <p>论文 Fig. 1 用单实例 4,000 TPS 举例：Reactive 策略在第 15 分钟触发扩容，但实例第 20 分钟才就绪，中间 5 分钟持续欠配；若为了保险把有效容量按 3,500 TPS 估算，又会被短暂流量波动误导，造成过配。核心矛盾是：</p>
+  <pre><code>阈值设得激进  → 扩容太晚 → SLA 违约
+阈值设得保守  → 短暂尖峰触发扩容 → GPU 浪费
+模型切换很慢  → 错误决策的代价持续数十分钟甚至数小时</code></pre>
+
+  <h2>负载画像：为什么预测值得做</h2>
+  <p>作者分析了 Microsoft O365 在 East US、Central US、West US 三个区域、四种匿名 OpenAI 模型上的两组一周生产轨迹，时间分别是 2024 年 11 月和 2025 年 7 月。系统每天处理约 1,000 万次 LLM 请求。三个服务层级是：</p>
+  <table>
+    <thead><tr><th>层级</th><th>典型场景</th><th>SLA</th><th>流量特征</th></tr></thead>
+    <tbody>
+      <tr><td><strong>IW-F</strong></td><td>聊天、搜索、实时辅助</td><td>P95 TTFT 通常 &lt; 1 秒</td><td>日周期明显，周末回落，可预测性最高。</td></tr>
+      <tr><td><strong>IW-N</strong></td><td>普通交互式生成</td><td>P95 TTFT 可放宽至 &lt; 1 分钟</td><td>有周期，但部分模型在工作日逐日增长。</td></tr>
+      <tr><td><strong>NIW</strong></td><td>报告生成、批量标注、评测</td><td>截止期通常为 24 小时</td><td>周期性弱，但延迟弹性大，适合作为填谷负载。</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <thead><tr><th>生产观察</th><th>数值</th><th>设计含义</th></tr></thead>
+    <tbody>
+      <tr><td>IW-F Model A 周期性分数</td><td><span class="metric">0.70–0.95</span></td><td>可以用简单时间序列模型预测日峰值。</td></tr>
+      <tr><td>NIW 周期性分数</td><td><span class="metric">0–0.286</span></td><td>不适合依赖预测；更适合 deadline-aware 排队。</td></tr>
+      <tr><td>IW-F + IW-N 请求占比</td><td><span class="metric">72%</span></td><td>优先保障交互负载，NIW 使用剩余容量。</td></tr>
+      <tr><td>七个月内 RPS 与 TPS 增长</td><td><span class="metric">约 5×</span></td><td>继续按峰值静态采购会放大资本浪费。</td></tr>
+      <tr><td>RAG 请求占比</td><td><span class="metric">41.2%</span></td><td>输入 token 多，TPS 比 RPS 更适合作为容量信号。</td></tr>
+      <tr><td>Model A 容量分布</td><td>East 52% / West 27% / Central 21%</td><td>区域与模型之间存在不均衡，必须联合优化。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>系统架构：一个多时间尺度控制回路</h2>
+  <div class="flow">
+    <div><strong>1. Load Predictor</strong>每小时预测各模型、各区域的 IW 输入 TPS</div>
+    <div><strong>2. ILP Optimizer</strong>计算跨区域、跨模型的实例增减量</div>
+    <div><strong>3. Autoscaler</strong>结合显存与预测偏差执行扩缩容</div>
+    <div><strong>4. Region Router</strong>按实时负载把 IW 路由到可用区域</div>
+    <div><strong>5. Queue + Scheduler</strong>用空闲容量执行 NIW，并按 SLA 排批</div>
+  </div>
+  <p>这个设计的关键不是 ARIMA 或 ILP 本身，而是<strong>不同控制动作匹配不同时间尺度</strong>：</p>
+  <table>
+    <thead><tr><th>时间尺度</th><th>控制动作</th><th>解决的问题</th></tr></thead>
+    <tbody>
+      <tr><td>请求级</td><td>跨区域路由、区域内最短队列、实例内 batching</td><td>吸收秒级抖动，减少局部负载倾斜。</td></tr>
+      <tr><td>分钟级</td><td>NIW Queue Manager、Spot 回收、显存阈值纠偏</td><td>利用临时余量并快速应对预测误差。</td></tr>
+      <tr><td>小时级</td><td>ARIMA 预测 + ILP 容量规划</td><td>在模型加载耗时之前提前配置容量。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>交互式请求如何路由</h3>
+  <ol>
+    <li>Global Region Router 查找目标模型有效显存利用率低于 70% 的区域，并按网络距离等偏好选择；如果所有区域都超过阈值，就选利用率最低的区域。</li>
+    <li>区域内 Model Router 选择负载最低的 deployment。</li>
+    <li>deployment 内按剩余待处理 token 最少选择实例，即 token-aware 的 Join-the-Shortest-Queue。</li>
+    <li>实例调度器在显存允许范围内组 batch，优先处理高优先级与临近 deadline 的请求。</li>
+  </ol>
+  <p>“有效显存利用率”会扣除模型权重占用，主要反映请求 KV Cache 的压力，因此比 GPU 总显存利用率更接近实时 serving load。</p>
+
+  <h3>NIW 如何填谷且不伤害 IW</h3>
+  <table>
+    <thead><tr><th>规则</th><th>行为</th><th>目的</th></tr></thead>
+    <tbody>
+      <tr><td>endpoint 利用率 &lt; 60%</td><td>Queue Manager 每次释放 1 个 NIW 请求。</td><td>保守使用余量。</td></tr>
+      <tr><td>endpoint 利用率 &lt; 50%</td><td>每次释放 2 个 NIW 请求。</td><td>低谷时提高吞吐。</td></tr>
+      <tr><td>NIW 年龄 &lt; 10 小时</td><td>优先级为 1，排在 IW 之后。</td><td>避免干扰交互请求。</td></tr>
+      <tr><td>NIW 年龄 &gt; 10 小时</td><td>提升为优先级 0，与 IW 同级。</td><td>通过 aging 防止饥饿并满足 24 小时 deadline。</td></tr>
+      <tr><td>NIW 请求过大</td><td>拆成固定大小 job。</td><td>避免单个长请求占满 batch。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>预测、优化与自动伸缩</h2>
+  <h3>ARIMA 预测如何进入决策</h3>
+  <pre><code>每个模型 × 每个区域：
+  1. 用过去流量训练 ARIMA
+  2. 预测未来 1 小时输入 TPS
+  3. 取预测窗口内最大值
+  4. 加安全余量 β = 过去 1 小时 NIW 负载 × 10%
+  5. 交给 ILP 计算实例增减量
+  6. Autoscaler 决定何时真正执行</code></pre>
+  <p>论文比较了 Moving Average、TVAR、HMM 与 ARIMA。Moving Average 虽快但不准确；TVAR/HMM 可能更准，但训练更慢。作者最终选择 60 分钟训练窗口的 ARIMA，以较低预测开销换取“足够好”的周期性预测。下一小时预测约耗时 0.7 秒，ILP 在四模型、三区域、单 GPU 类型下平均约 1.41 秒，远低于一小时控制周期（Appendix B、Fig. 17）。</p>
+
+  <h3>ILP 在优化什么</h3>
+  <p>令 <code>n[i,j,k]</code> 为区域 <code>j</code> 中、GPU 类型 <code>k</code> 上模型 <code>i</code> 的当前实例数，<code>δ[i,j,k]</code> 为需要增加或减少的实例数，<code>θ[i,k]</code> 为单实例 TPS 容量，<code>ρ[i,j,w]</code> 为未来窗口 <code>w</code> 的预测需求，<code>ε</code> 为必须在本地满足的峰值比例。</p>
+  <pre><code>本地容量约束：
+Σk (n[i,j,k] + δ[i,j,k]) × θ[i,k]
+  ≥ max_w ε × ρ[i,j,w]
+
+全局容量约束：
+Σj Σk (n[i,j,k] + δ[i,j,k]) × θ[i,k]
+  ≥ max_w Σj ρ[i,j,w]
+
+合法缩容约束：
+δ[i,j,k] ≥ -n[i,j,k]
+
+目标：
+minimize  VM 调整成本 + 模型加载成本</code></pre>
+  <p>本地约束保证每个区域能独立承担一部分峰值，其余需求允许跨区路由；全局约束保证所有区域的总容量足够。目标函数惩罚 VM 获取与模型加载的浪费，避免为了短暂流量频繁换模型。严格来说，它不是直接最大化 SLA utility；SLA 主要由容量约束、在线路由和实例调度共同保证。</p>
+  <p>扩展到 20 个模型、20 个区域、5 种 GPU 时，论文报告 ILP 求解约 33 秒，对小时级控制仍然可接受。</p>
+
+  <h3>三种长期伸缩策略</h3>
+  <table>
+    <thead><tr><th>策略</th><th>执行方式</th><th>优点</th><th>风险</th></tr></thead>
+    <tbody>
+      <tr><td><strong>LT-I</strong><br>Immediate</td><td>每小时立刻调整到 ILP 推荐实例数。</td><td>最简单，GPU-hours 最低。</td><td>可能过早扩容或过早缩容，轻微损伤 TTFT/E2E。</td></tr>
+      <tr><td><strong>LT-U</strong><br>Utilization-aware</td><td>显存 &gt; 70% 才逐步扩容，&lt; 30% 才逐步缩容；不超过 ILP 目标。</td><td>避免仅凭预测提前做无效调整。</td><td>大突发超过预测目标后无法继续扩容。</td></tr>
+      <tr><td><strong>LT-UA</strong><br>Utilization + ARIMA gap</td><td>通常同 LT-U；小时最后 20 分钟内，实际 TPS ≥ 5× 预测时突破上限扩容，≤ 0.5× 时继续缩容。</td><td>兼顾成本、在线反馈与突发鲁棒性。</td><td>5× / 0.5× 是经验阈值，需要按模型和区域校准。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>多 SLA 请求调度</h2>
+  <p>SageServe 将“距 TTFT deadline 的剩余时间”作为核心信号，评估四种实例内排队策略：</p>
+  <table>
+    <thead><tr><th>策略</th><th>排序逻辑</th><th>IW-F：违反率 / Q3 TTFT</th><th>IW-N：违反率 / Q3 TTFT</th></tr></thead>
+    <tbody>
+      <tr><td>FCFS</td><td>只按到达时间，不区分 SLA。</td><td>约 45% / 5.6s</td><td>约 25% / 5.6s</td></tr>
+      <tr><td>EDF</td><td>最早 deadline 优先。</td><td>31% / 2.4s</td><td>34% / 6.1s</td></tr>
+      <tr><td>PF</td><td>先处理全部 IW-F，再处理 IW-N。</td><td>24% / 0.9s</td><td>60% / 12.1s</td></tr>
+      <tr><td>DPA</td><td>综合过期程度、紧急度和服务层级。</td><td>28% / 2.1s</td><td>38% / 7.9s</td></tr>
+    </tbody>
+  </table>
+  <p>DPA 的价值不是全面优于 EDF/PF，而是提供一个可调的 Pareto 折中：PF 把快速层体验推到最好，但会严重牺牲普通层；EDF 更公平；DPA 可以根据产品承诺改变偏好。</p>
+
+  <h2>实验设置</h2>
+  <table>
+    <thead><tr><th>维度</th><th>设置</th></tr></thead>
+    <tbody>
+      <tr><td>生产轨迹</td><td>约 1,000 万请求；三大美国区域；2024-11 与 2025-07 各一周。</td></tr>
+      <tr><td>模型映射</td><td>内部 GPT 模型映射到 Bloom-176B、Llama2-70B、Llama3.1-8B、Llama3.2-3B。</td></tr>
+      <tr><td>硬件</td><td>主实验使用 H100-80GB；消融另测 A100。</td></tr>
+      <tr><td>模拟器</td><td>扩展 Splitwise，加入多区域、全局路由、统一事件队列、模型与实例伸缩。</td></tr>
+      <tr><td>性能模型精度</td><td>80:20 训练/测试；MAPE &lt; 3%；prefill / decode 的 R² 为 0.99 / 0.83。</td></tr>
+      <tr><td>模型部署耗时</td><td>同区域已有权重约 10 分钟；权重不在本地约 2 小时。</td></tr>
+      <tr><td>Spot 回收</td><td>中位约 1 分钟，最大约 5 分钟。</td></tr>
+      <tr><td>基线</td><td>Reactive：有效显存 &gt; 70% 扩容、&lt; 30% 缩容、15 秒 cooldown；另对比 Chiron。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>关键实验结果</h2>
+  <h3>1. 先统一资源池，就能拿到大部分收益</h3>
+  <p>West US 单日实验中，Unified 比 Siloed 少用 <strong>34.5% instance-hours</strong>。P95 延迟并未明显恶化：</p>
+  <table>
+    <thead><tr><th>模型</th><th>TTFT：Siloed / Unified</th><th>E2E：Siloed / Unified</th></tr></thead>
+    <tbody>
+      <tr><td>Bloom-176B</td><td>14.5 / 12.9s</td><td>55.3 / 53.3s</td></tr>
+      <tr><td>Llama2-70B</td><td>34.9 / 34.5s</td><td>98.3 / 99.1s</td></tr>
+      <tr><td>Llama3.1-8B</td><td>1.0 / 1.0s</td><td>10.6 / 10.5s</td></tr>
+      <tr><td>Llama3.2-3B</td><td>1.0 / 1.0s</td><td>19.2 / 18.9s</td></tr>
+    </tbody>
+  </table>
+
+  <h3>2. 预测感知方案减少约四分之一容量</h3>
+  <table>
+    <thead><tr><th>策略</th><th>Llama2 高峰日 instance-hours</th><th>相对 Reactive</th></tr></thead>
+    <tbody>
+      <tr><td>Reactive</td><td>362.25</td><td>基线</td></tr>
+      <tr><td>LT-I</td><td>274.5</td><td>-24.21%</td></tr>
+      <tr><td>LT-U</td><td>291</td><td>-19.65%</td></tr>
+      <tr><td>LT-UA</td><td>277.5</td><td>-23.38%</td></tr>
+      <tr><td>Chiron</td><td>1,146</td><td>显著高于 Reactive，且未换来清晰的尾延迟改善</td></tr>
+    </tbody>
+  </table>
+  <p>在 2024 年 11 月轨迹上，Reactive / LT-I / LT-U / LT-UA 分别为 302 / 227 / 248 / 233 instance-hours，仍有最高约 25% 降幅，说明收益不是只针对一周数据调参得到。</p>
+
+  <h3>3. 成本数字要正确理解</h3>
+  <p>论文按 Azure H100 cluster 98.32 美元/小时，以及“85 instance-hours/天 × 3 模型 × 4 区域 × 7 天”线性外推，估算每周约节省 60 万美元、每月最高约 250 万美元。这是<strong>基于公开价格和扩展假设的潜在节省</strong>，不是实际生产账单审计。</p>
+  <p class="warn"><strong>注意两个不同口径：</strong>正文 §7.2.4 报告扩容期间浪费的 GPU cycles 下降约 70%；摘要和贡献项报告自动伸缩浪费或 VM cold-start 最高下降 80%。两者测量对象与表述并不完全相同，不应合并成同一个结论。</p>
+
+  <h3>4. 消融与鲁棒性</h3>
+  <table>
+    <thead><tr><th>场景</th><th>LT-UA 相对 Reactive 的 GPU-hours 降幅</th></tr></thead>
+    <tbody>
+      <tr><td>A100 cluster</td><td>28.2%</td></tr>
+      <tr><td>IW:NIW = 9:1</td><td>26.3%</td></tr>
+      <tr><td>IW:NIW = 1:1</td><td>22%</td></tr>
+    </tbody>
+  </table>
+  <p>当 NIW 占比变化时收益也变化，因为安全余量 <code>β</code> 直接由过去一小时 NIW token 数决定。论文还加入 Llama 4 Scout 109B MoE 作为第五种模型，结果显示框架仍能适应不同吞吐特征。</p>
+
+  <h2>这篇论文真正重要的思想</h2>
+  <ol>
+    <li><strong>Autoscaling 应是多时间尺度控制，而不是一个阈值。</strong>快控制负责路由与排队，慢控制负责模型放置和 GPU 容量，在线反馈负责纠偏。</li>
+    <li><strong>预测的价值是提前量，不是绝对准确。</strong>模型加载需要 10 分钟到 2 小时，只要预测能捕捉趋势，就能提前做有价值的决策；LT-UA 再处理预测误差。</li>
+    <li><strong>可延迟负载是提高 GPU 利用率的天然“蓄水池”。</strong>NIW 不只是低优先级请求，而是可以吸收 IW 低谷容量的调节资源。</li>
+    <li><strong>容量规划必须跨区域、跨模型联合看。</strong>单区域优化会忽略低延迟跨区网络和模型容量不均衡，单模型优化会忽略重部署机会成本。</li>
+    <li><strong>TPS 比 RPS 更接近 LLM 成本。</strong>RAG 等应用输入长度差异巨大，相同请求数可能产生完全不同的 KV Cache、prefill 和 decode 压力。</li>
+  </ol>
+
+  <h2>局限与批判性阅读</h2>
+  <table>
+    <thead><tr><th>局限</th><th>为什么重要</th><th>生产落地需要补什么</th></tr></thead>
+    <tbody>
+      <tr><td>主要结果来自模拟器</td><td>性能模型 MAPE 很低，但无法覆盖完整控制面、故障和长尾噪声。</td><td>Shadow traffic、逐区域灰度、真实扩缩容时延和故障注入。</td></tr>
+      <tr><td>内部 GPT 映射到开源模型</td><td>kernel、并行方式、KV Cache 和吞吐曲线可能不同。</td><td>为每个真实 model × GPU × engine 做在线校准。</td></tr>
+      <tr><td>主实验以同构 H100 为主</td><td>现实中 GPU SKU、网络、能耗与配额高度异构。</td><td>在 ILP 中加入 GPU 可替代性、配额、功耗和故障域约束。</td></tr>
+      <tr><td>ARIMA 依赖周期性</td><td>发布、故障、热点、新模型流量可能完全非平稳。</td><td>异常检测、事件特征、置信区间、保底容量和降级策略。</td></tr>
+      <tr><td>成本估计为线性外推</td><td>公开按需价格不等于企业合约成本，Spot 也有机会收益。</td><td>按实际 GPU 数、并行度、合约价和 Spot 收益重新核算。</td></tr>
+      <tr><td>多 SLA 调度仍有高违反率</td><td>DPA 实验中 IW-F/IW-N 仍有 28%/38% 违反率。</td><td>不能把“总体保持 SLA”理解为每个调度消融都零违反；需要更强 admission control 和容量安全线。</td></tr>
+      <tr><td>部分配置口径不够清晰</td><td>“每模型每区域初始 20 实例”和“endpoint 最小 2、最大 3”处于不同层级，但论文解释有限。</td><td>落地时明确 region、deployment、endpoint、instance 的容量边界。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>如果要在真实平台复现</h2>
+  <ol>
+    <li>先建立 <code>model × engine × GPU</code> 的 TPS/TTFT 容量曲线，并持续校准。</li>
+    <li>统一 IW/NIW 资源池，但为 IW 设置硬容量底线；NIW 必须支持 chunking、deadline aging 和快速暂停。</li>
+    <li>每小时预测模型与区域级输入 TPS，同时保留 P50/P90/P99 或置信区间，而不只输出点预测。</li>
+    <li>ILP 输出目标容量；执行层采用类似 LT-UA 的“预测目标 + 显存阈值 + 实际 TPS 偏差”控制。</li>
+    <li>预置热点模型权重，将跨模型重部署从约 2 小时压到约 10 分钟。</li>
+    <li>监控预测误差、有效显存、排队 token、TTFT/TBT/E2E、NIW deadline、冷启动时间、Spot 回收时间和跨区网络延迟。</li>
+    <li>先 shadow，再单模型/单区域灰度；成本收益用真实内部价格重新计算。</li>
+  </ol>
+
+  <h2>术语表</h2>
+  <table>
+    <thead><tr><th>术语</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>TPS / TPM</td><td>每秒 / 每分钟处理的 token 数；论文容量规划主要关注输入 TPS。</td></tr>
+      <tr><td>TTFT</td><td>从接收请求到生成第一个 token 的时间，反映交互响应性。</td></tr>
+      <tr><td>TBT</td><td>相邻输出 token 之间的时间。</td></tr>
+      <tr><td>E2E</td><td>完成整个请求的总延迟。</td></tr>
+      <tr><td>Effective memory utilization</td><td>扣除模型权重后，用于请求执行和 KV Cache 的显存利用率。</td></tr>
+      <tr><td>ARIMA</td><td>自回归积分移动平均时间序列模型。</td></tr>
+      <tr><td>ILP</td><td>整数线性规划，决策变量必须为整数，适合求模型实例增减量。</td></tr>
+      <tr><td>Spot donation</td><td>把暂时多余的内部实例转换给低优先级或外部服务使用。</td></tr>
+      <tr><td>LT-I / LT-U / LT-UA</td><td>立即执行、利用率感知、利用率与 ARIMA 偏差联合感知的长期伸缩策略。</td></tr>
+      <tr><td>EDF / PF / DPA</td><td>最早截止期优先、服务层优先、deadline 与 priority 联合调度。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>最终评价</h2>
+  <p>SageServe 的贡献不是发明了新的预测模型，而是把生产 LLM serving 中几个常被分开处理的问题——跨区路由、异步队列、模型放置、GPU 扩缩容、Spot 复用和多 SLA batching——放进同一个控制框架。它最值得借鉴的工程方法是：<strong>利用预测获得冷启动所需的提前量，但永远让实时系统信号保留纠错权</strong>。</p>
+  <p>从研究证据看，统一资源池是最稳健、最直接的收益来源；ARIMA + ILP 则进一步降低小时级容量浪费；LT-UA 展示了如何避免“预测驱动系统被预测绑架”。同时，成本节省和 SLA 结论主要来自生产轨迹回放与模拟，真正上线仍需对模型容量曲线、网络长尾、异常流量和业务级 deadline 做严格校准。</p>
+
+  <p class="small">数据与结论主要来自论文 v3 的 Sections 1–7、9，Figures 1–17，Tables 1–2 及 Appendices A–B。报告中的美元节省为论文外推估算；70% 与 80% 两个浪费降幅按论文不同口径分别呈现。</p>
+</article>
+</main>
+</body>
+</html>
