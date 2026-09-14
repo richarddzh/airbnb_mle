@@ -19,6 +19,7 @@
 
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
+section[id], h2[id], h3[id], p[id] { scroll-margin-top: 20px; }
 body {
   margin: 0;
   color: var(--ink);
@@ -50,6 +51,41 @@ h2 { margin-top: 2.2rem; padding-bottom: .38rem; border-bottom: 1px solid var(--
 h3 { margin-top: 1.45rem; line-height: 1.35; }
 h4 { margin-bottom: .35rem; }
 p { margin: .72rem 0; }
+.lead { font-size: 1.08rem; line-height: 1.9; }
+.toc {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 8px 18px;
+  padding: 20px;
+  margin: 24px 0;
+  background: var(--blue-soft);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.toc a { text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.example {
+  margin: 22px 0;
+  padding: 18px 22px;
+  border: 1px solid #b9dfca;
+  border-left: 5px solid var(--green);
+  border-radius: 10px;
+  background: var(--green-soft);
+}
+.example h3 { margin-top: 0; }
+.formula {
+  overflow-x: auto;
+  padding: 18px;
+  margin: 18px 0;
+  border-radius: 8px;
+  background: #f1f4f9;
+  font-family: "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+  line-height: 1.8;
+}
+caption { text-align: left; color: var(--muted); padding-bottom: 8px; font-weight: 600; }
+details { margin: 14px 0; padding: 14px 18px; border: 1px solid var(--line); border-radius: 10px; }
+summary { cursor: pointer; font-weight: 650; }
+summary:focus-visible, a:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+img, svg { max-width: 100%; height: auto; }
 ul, ol { padding-left: 1.35rem; }
 li + li { margin-top: .32rem; }
 .nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
@@ -112,6 +148,12 @@ footer { margin-top: 30px; color: var(--muted); font-size: .9rem; }
   main { padding: 16px 10px 40px; }
   article { border-radius: 10px; }
   table { display: block; overflow-x: auto; }
+  .toc { grid-template-columns: 1fr; padding: 14px; }
+  .example { padding: 14px; }
+  p, td, th, a { overflow-wrap: anywhere; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
 }
 @media print {
   body { background: white; }

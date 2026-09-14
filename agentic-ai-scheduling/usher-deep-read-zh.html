@@ -1,98 +1,258 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>USHER 深度解读</title><link rel="stylesheet" href="assets/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="面向初学者的 USHER 中文教程：GPU 资源、批处理与副本、内核图估计、干扰感知调度、算子融合，以及实验指标和现代 LLM 的适用边界。">
+  <title>USHER 深度解读：从 GPU 资源到干扰感知推理调度</title>
+  <link rel="stylesheet" href="assets/style.css">
 </head>
-<body><main>
-<nav class="nav"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
-<article>
-  <h1>USHER：面向资源优化 ML 推理的整体干扰规避</h1>
-  <div class="box"><strong>论文：</strong>Sudipta Saha Shubha 等，<em>Usher: Holistic Interference Avoidance for Resource-Optimized ML Inference</em>，OSDI 2024。<br><strong>核心思想：</strong>GPU 共置不能只看显存是否放得下；必须联合约束计算、显存带宽/容量和 cache interference，并主动寻找资源互补的模型组合。</div>
+<body>
+<main>
+  <nav class="nav" aria-label="站点导航"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
+  <article>
+    <header id="top">
+      <h1>USHER：为什么 GPU 放得下多个模型，却不一定服务得好？</h1>
+      <p class="lead">这是一篇从基础概念开始的中文教程，而不是论文摘要的条目扩写。我们要回答一个实际问题：一张 GPU 还有空闲资源时，能不能把另一个模型搬进来，同时让用户等待得更短、让服务成本更低？USHER 的回答不是简单的“可以”，而是先认识资源，再联合选择批大小、副本数和放置位置，最后处理共享缓存带来的干扰。</p>
+      <div class="box">
+        <p><strong>原论文：</strong>Sudipta Saha Shubha、Haiying Shen、Anand Iyer，<em>Usher: Holistic Interference Avoidance for Resource Optimized ML Inference</em>，OSDI 2024，正文第 947–960 页。<a href="https://www.usenix.org/conference/osdi24/presentation/shubha">USENIX 官方页面</a> · <a href="https://www.usenix.org/system/files/osdi24-shubha.pdf">官方完整 PDF</a> · <a href="https://github.com/ss7krd/Usher">作者公开代码</a>。</p>
+        <p><strong>阅读约定：</strong>“论文报告”指原文结果；“教学示例”中的数字为本文构造，不是论文测量；“工程延伸”是面向现代部署的分析，不冒充原算法。本页引用同时给出论文节号和印刷页码；PDF 多一页封面，例如印刷第 952 页对应 PDF 第 7 页。数学用普通文字及上下标表达，无需脚本或公式 CDN。</p>
+      </div>
+    </header>
 
-  <h2>1. 为什么 batching 和 GPU 利用率不够</h2>
-  <p>batch size 同时影响计算与显存，但只有一个旋钮，不能保证两类资源同时饱和。空间复用虽能把多个模型放到一张 GPU，却会引入 SM、显存和 cache 竞争。论文观察到，已有系统即使把计算/显存利用率推高，二者差值仍可达 5.3%–44.9%；GPUlet 中 87% 的模型、AlpaServe 中 100% 的模型，共置后的 goodput 不超过独占时的 55%。</p>
-  <div class="box warn"><strong>关键结论：</strong>“GPU 看起来很忙”并不等于“有效完成了更多满足 SLO 的请求”。调度器必须优化 goodput，而不是裸 utilization。</div>
+    <h2 id="toc-heading">本页目录</h2>
+    <nav class="toc" aria-labelledby="toc-heading">
+      <a href="#gpu-resources">1. 先拆开 GPU 的几种“利用率”</a>
+      <a href="#batch-replica-goodput">2. 批处理、副本、排队与 goodput</a>
+      <a href="#interference">3. 共置为什么产生非加性延迟</a>
+      <a href="#algorithm-flow">4. 沿原算法走完一次调度</a>
+      <a href="#gk-estimator">5. GK-Estimator：从算子图到内核图</a>
+      <a href="#ir-scheduler">6. IR-Scheduler：目标、分组与 best-fit</a>
+      <a href="#numeric-examples">7. 两个可手算的教学示例</a>
+      <a href="#og-merger">8. OG-Merger：复用相同权重，而非混合模型</a>
+      <a href="#experimental-setup">9. 实验到底运行了什么</a>
+      <a href="#results-and-evidence">10. 数字怎么读，证据到哪里为止</a>
+      <a href="#llm-applicability">11. 现代 LLM、动态 KV 与 MIG/MPS 边界</a>
+      <a href="#exercises">12. 有推导的练习</a>
+      <a href="#takeaways">13. 带走什么，不应照搬什么</a>
+      <a href="#sources-and-rights">14. 来源、PDF 许可与转载状态</a>
+    </nav>
 
-  <h2>2. 三个核心组件</h2>
-  <table>
-    <thead><tr><th>组件</th><th>职责</th><th>解决的错误假设</th></tr></thead>
-    <tbody>
-      <tr><td>GK-Estimator</td><td>估计模型在特定 batch size 与 GPU 类型下的计算需求 \(C_{req}\)、显存需求 \(M_{req}\) 和执行时间。</td><td>不能用模型大小或 FLOPs 单独代表运行时压力。</td></tr>
-      <tr><td>IR-Scheduler</td><td>联合选择 batch、replica、GPU 类型与 placement，使 C-heavy 和 M-heavy workload 互补。</td><td>“显存装得下即可共置”会造成严重干扰。</td></tr>
-      <tr><td>OG-Merger</td><td>融合架构与权重相似模型的 operator graph，提高 cache 内容复用。</td><td>空间切分无法隔离共享 cache 的争用。</td></tr>
-    </tbody>
-  </table>
+    <section id="gpu-resources">
+      <h2>1. 先拆开 GPU 的几种“利用率”</h2>
+      <p>可以把 GPU 想成一座工厂，但不要把所有资源都叫“工厂繁忙程度”。SM，即流式多处理器，是执行线程块和计算指令的主要单元；HBM 是 GPU 外部的高带宽显存；L2 是位于芯片上的共享缓存层。工人有多少、仓库装了多少、每秒能搬多少货、工作台上放了什么，是四个不同的问题。这个区分不是术语洁癖，而是决定共置是否合法、是否变慢的基础。</p>
+      <h3 id="compute-occupancy">1.1 SM、occupancy 与 FLOPS 不是同一把尺</h3>
+      <p>一个 CUDA kernel 是在 GPU 上启动的一段计算程序。线程以 warp 为单位被调度，一个 SM 可以同时容纳多个 warp。<code>achieved_occupancy</code> 的定义，是活动周期内平均活跃 warp 数与该 SM 支持的最大 warp 数之比。它描述“有多少 warp 驻留并处于活跃统计范围”，不是“峰值算力已经兑现了多少”。warp 可能正在等内存，也可能受到指令依赖、寄存器、共享内存或执行流水线限制。高 occupancy 有时能掩盖访存延迟，却既不是高性能的充分条件，也不是所有高效 kernel 的必要条件。</p>
+      <p>FLOPs 通常表示完成一项计算需要的浮点运算次数；FLOPS 表示每秒完成的浮点运算次数。假设一个任务需要 10<sup>12</sup> 次浮点运算，运行 0.1 秒，实际吞吐就是 10<sup>13</sup> FLOPS；这仍然不能推出它占用了多少 SM，或者 Tensor Core 是否高效。GPU 规格中的峰值还依赖 FP32、FP16、FP8、是否使用稀疏路径等条件。因此，“模型参数多”“FLOPs 多”“occupancy 高”和“计算资源需求高”有关联，却不能互换。</p>
+      <p>USHER 把计算需求写成 C<sub>req</sub>，希望表示模型执行期间计算空间需求的峰值比例；实现节又说使用 <code>achieved_occupancy</code> 测量 kernel 的 C<sub>req</sub>。读者应把它理解为论文采用的一种计算压力代理指标，而不是把 occupancy 直接当成可精确切割、可线性相加的 FLOPS 配额。MPS 的活跃线程比例设置也不是吞吐承诺。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=3">[P §2，第 948 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §4，第 956 页]</a><a href="https://docs.nvidia.com/cuda/profiler-users-guide/index.html#metrics-reference">[N1，指标定义]</a></p>
+      <h3 id="memory-capacity-bandwidth">1.2 HBM 容量、HBM 带宽与 L2 缓存</h3>
+      <p><strong>容量</strong>以字节衡量，回答“这一时刻能否装得下”。常驻权重、激活、中间结果、框架工作区、内存池以及生成模型的 KV cache 都需要容量。两个模型各有 12 GB 常驻数据，在 16 GB 显存上通常不能同时完整驻留；它们运行时算得快不快，不会改变这个容量事实。实际检查还需留出分配器碎片和运行时开销，不能只把参数个数乘上数据类型大小。</p>
+      <p><strong>带宽</strong>以 GB/s 或 TB/s 衡量，回答“每秒能传多少数据”。一个只分配 2 GB、却反复扫描这些数据的任务可以接近带宽瓶颈；一个分配 30 GB、只偶尔访问其中少量数据的任务则可能没有多少带宽压力。因而，显存分配量占 80%，不代表带宽使用了 80%；带宽压力很高，也不说明显存容量已经耗尽。</p>
+      <p><strong>L2 缓存</strong>比 HBM 小得多，也更靠近计算单元。命中 L2 可以减少昂贵的 HBM 访问，但缓存内容会被替换。两个模型即使都能装进 HBM，也可能互相挤掉反复使用的权重块，造成更多 cache miss，继而增大 HBM 流量。L2 容量、命中率和缓存带宽仍然是不同指标。“我给两个模型分配了不同的张量地址”并不等于“它们拥有互不干扰的 L2”。</p>
+      <div class="box warn">
+        <p><strong>原论文有一个必须保留的口径疑点。</strong>§2、§3.2 把 M<sub>req</sub> 描述为显存空间需求，并用权重大小加中间数据峰值解释它；§4 却写用 <code>dram_utilization</code> 测量 kernel 的 M<sub>req</sub>。NVIDIA 的该指标是相对峰值的设备内存活动/吞吐利用等级，历史工具中以 0–10 分级呈现，<strong>不是 allocated bytes 或 reserved bytes</strong>。不能因为名字里有 memory，就把它当成显存容量百分比，更不能把这一等级直接与权重字节数相加。</p>
+        <p>因此，本文不会替论文消除这个未充分说明的映射：M<sub>req</sub> 的概念模型、实际回归标签和实验中的 M<sub>uti</sub>，需要复现者进一步核对。真正部署时，应分别记录显存峰值字节数、HBM 读写吞吐、L2 行为和计算压力，统一量纲后再作决策。“USHER 已独立且严格约束了所有带宽和容量”不是现有描述足以支持的结论。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=7">[P §3.2，第 952–953 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §4，第 956 页]</a><a href="https://docs.nvidia.com/cuda/profiler-users-guide/index.html#metrics-reference">[N1]</a></p>
+      </div>
+    </section>
 
-  <h2>3. GK-Estimator 如何得到调度输入</h2>
-  <p>模型的 ONNX operator graph 被转换为 kernel graph。开始时间差不超过 \(\tau=0.001\)ms 的 kernel 被视为可能并发。系统用两个 stacked regressors 分别预测计算与显存需求，基学习器包括 Lasso、Kernel Ridge、Gradient Boosting 和 XGBoost。</p>
-  <p>特征包括 batch size、kernel 参数张量大小、输入/中间张量大小、FLOPs 和 GPU 类型。论文 20 个模型上，计算与显存需求估计准确率均为 99.98%；单次估计约 31.6ms，而逐模型真实 profiling 需 4.8 小时并产生约 42.7 美元成本。</p>
+    <section id="batch-replica-goodput">
+      <h2>2. 批处理、副本、排队与 goodput</h2>
+      <p>服务系统首先收到的是请求，不是已经整理好的 GPU 工作。批处理 batching 把同一模型的多个输入合成一个 batch，共用一次调用、权重读取和较大的矩阵计算。例如单请求运行 4 毫秒，四个请求一起运行 7 毫秒，服务能力从每秒 250 个请求提高到约 571 个请求；但批内每个请求的执行时间从 4 毫秒变成了 7 毫秒，早到的请求还可能等待后来者。这组数字只是解释批处理，不是 USHER 的实验数据。</p>
+      <p>批越大并非越好。它通常增加激活空间和单批执行时间，虽然每个请求分摊的成本可能下降；遇到内存上限或延迟要求，就不能继续增大。实际库还可能换用另一个 kernel 算法，所以性能曲线并不必然光滑。USHER 的关键观察是：批大小只有一个旋钮，却同时影响至少两个资源维度，很难仅靠它同时填满计算与显存空间。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=2">[P §1，第 947 页]</a></p>
+      <p>副本 replication 则是启动同一模型的多个服务实例，把请求流分给它们。复制不是把一张大模型自动拆成几块：模型并行才是拆分一次推理的模型状态或计算。论文对小模型把一个“模型”视为完整实例；对 Llama-2 这类大模型，底层 DeepSpeed 先进行模型并行，后文的调度对象可以指其中的分区。把一个分区算作放置对象，并不意味着它独立就能回答完整请求。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=4">[P §2，第 949 页]</a></p>
+      <p>增加副本能分担排队压力，却也复制常驻权重，增加部署和加载成本。更微妙的是，每个副本收到的请求更少，凑出大 batch 可能更慢。因此，增加副本与减小 batch 往往要一起考虑。USHER 把这种 workload division 与放置联合优化：有时一个模型本来一张卡就能服务，拆成两个小 batch 的副本后，反而更容易填入其他模型留下的空隙，最终整组模型需要的 GPU 更少。这不是免费复制，而是用额外权重副本交换更好的资源组合。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=4">[P §2.2，第 949–950 页]</a></p>
+      <h3 id="slo-definition">2.1 为什么要优化 goodput，而不是总吞吐</h3>
+      <p>SLO 是服务级别目标。若要求请求在到达后 40 毫秒内完成，那么延迟应从到达开始计时，而不是从 GPU kernel 启动开始计时。教学上可分成：总延迟 = 凑批等待 + 已就绪队列等待 + 执行时间 + 传输及其他开销。前两项并不相同：系统可能尚未忙到排队，却已经因为等待凑批而错过期限。真实产品还常规定 p95 或 p99 延迟，而论文使用给定的逐请求时限来统计是否达标。</p>
+      <p>吞吐统计完成了多少请求；goodput 只统计其中在 SLO 内完成的请求，单位仍然是 requests/s。一个系统每秒完成 1,000 个请求，其中 300 个超时，goodput 就是每秒 700 个，而不是 1,000，也不是一个没有单位的“70%”。另一系统只完成 900 个但全部按时，其 goodput 更高。比较两者必须统一请求到达率、模型集合和 SLO，否则数字没有可比性。</p>
+      <p>论文的放置算法用“batch size 除以包含排队等待的预期完成时间”近似估计服务能力，并把模型 goodput 截断到实际 workload，避免给没有到达的请求计分。这里不能把 B / (t<sub>batch</sub> + t<sub>queue</sub>) 当成任何队列系统的精确通用定律：流水线、持续凑批、多副本聚合及超时筛选都可能改变统计口径。尤其不能只看平均延迟来推断每个请求均满足 SLO。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=4">[P §2.1，第 949 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=9">[P §3.3.2、算法 2，第 954–955 页]</a></p>
+    </section>
 
-  <h2>4. IR-Scheduler 的优化问题</h2>
-  <h3>固定集群</h3>
-  <pre><code>maximize   total_goodput
-subject to replicas placed ≤ available GPUs
-           per-GPU compute and memory constraints
-           each model's latency SLO</code></pre>
-  <h3>弹性集群</h3>
-  <pre><code>minimize   total GPU cost
-subject to total_goodput = total_workload
-           per-GPU compute and memory constraints
-           each model's latency SLO</code></pre>
-  <p>单模型 goodput 近似为 <code>batch_size / (batch_execution_time + queueing_time)</code>。搜索空间包含 batch size {4,8,16,32,64,128}、replication degree、GPU 类型和共置关系。</p>
+    <section id="interference">
+      <h2>3. 共置为什么产生非加性延迟</h2>
+      <p>假设模型 A 独占时需要 10 毫秒，模型 B 独占时需要 12 毫秒。把它们并发放在一张 GPU 上，并不能推断 A 仍是 10 毫秒，也不能说 A 的新延迟一定是 10 + 12 毫秒。完全串行执行时，后到者可能等到前者结束；并发执行时，它们则共享不同层级的资源。实际结果可能接近独占时间，也可能两个都显著变慢，要看资源竞争发生在什么阶段。</p>
+      <p>最直观的是计算竞争：线程块可能因 SM、寄存器或共享内存资源不足而等待。另一个来源是带宽竞争：两个 kernel 同时读取大张量，各自的有效吞吐会降低。第三个来源是缓存替换：A 使 B 的热数据离开 L2，B 下一次访问必须从 HBM 重新搬运；增加的访存又延长了 kernel，令它与 A 的下一阶段重叠。这是反馈过程，所以共置的资源曲线和时序会改变，而不是两条独占曲线永远按原样相加。</p>
+      <p>例如两个模型独占时都因为高 L2 命中而只消耗中等 HBM 带宽，共置后却同时变成带宽密集型。以独占平均带宽相加作预测会过于乐观。反过来，若 A 的计算密集阶段恰好覆盖 B 的低计算访存阶段，二者又可能形成互补。两两共置数据也未必足够：第三个模型加入后可能使缓存工作集跨过容量阈值，出现此前不存在的严重退化。</p>
+      <p>论文用 goodput 比值说明这个风险：在其 §2 的工作负载和基线设置下，GPUlet 中 87% 的模型、AlpaServe 中 100% 的模型，共置 goodput 与独占 goodput 的比值不高于 0.55。这个数字是模型分布的统计，不是“所有 GPU 的性能都下降 45%”，也不是对这些系统所有配置的永久判决。USHER 的启发是优先选资源互补组合，再专门减少缓存竞争；“避免干扰”是设计目标，不是物理隔离的证明。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=4">[P §2.1、图 2，第 949 页]</a></p>
+    </section>
 
-  <h2>5. 具体放置流程</h2>
-  <ol class="flow">
-    <li><strong>枚举可行 batch/replica 配置。</strong>先找到满足 SLO 的最小 replica 数 \(cl_M\)，再测试 \(RD=m\cdot cl_M,\ m\in\{1,\ldots,6\}\)。</li>
-    <li><strong>计算资源向量。</strong>对每个候选配置得到 \(C_{req}\)、\(M_{req}\)、执行时间和 goodput。</li>
-    <li><strong>标记资源类型。</strong>\(C/M\ge1.2\) 为 C-heavy，\(M/C\ge1.2\) 为 M-heavy，其余为 balanced。</li>
-    <li><strong>互补分组。</strong>使用 k-means 变体最小化组内 \(\left|\sum C_{req}-\sum M_{req}\right|\)，让计算型与内存型模型互补。</li>
-    <li><strong>降序放置。</strong>按 \(C_{req}+M_{req}\) 从大到小处理，并交替放置 C-heavy 与 M-heavy。</li>
-    <li><strong>best-fit 选 GPU。</strong>优先使用已承载同组模型的 GPU，并选择放置后剩余 C-space + M-space 最少的设备；若需新设备，选可承载且成本最低的 GPU 类型。</li>
-    <li><strong>融合可共享 operator。</strong>对同 GPU 的相似模型执行 OG-Merger，进一步降低 cache interference。</li>
-  </ol>
+    <section id="algorithm-flow">
+      <h2>4. 沿原算法走完一次调度</h2>
+      <p>现在把自己放在系统控制器的位置。输入是一组模型、每个模型当前的请求率和 SLO，以及可用 GPU 类型。控制器首先需要回答“模型以某个 batch 在某类 GPU 上运行，预计需要多少资源、多久完成”；这由 GK-Estimator 提供。它不是先把所有可能共置组合都跑一遍，而是重用离线学习到的 kernel 级知识。</p>
+      <p>接下来，IR-Scheduler 不直接枚举整个集群的所有模型组合，因为搜索空间会爆炸。它先把具有互补潜力的模型划成适中大小的组，再在组内枚举批大小和副本数组合。对每个候选组合执行放置启发式，计算新增 GPU 成本及预期 goodput；最后按固定集群或弹性集群的不同目标选取候选。这里的“最好”是该分组、候选集合和启发式之下的最好，不是数学意义上求得全局最优解。</p>
+      <p>位置确定以后，OG-Merger 才去检查同 GPU 的模型是否可以合并部分算子图，以便同一份缓存中的权重块服务多个输入。资源互补与权重相似是两种不同的“分组理由”：前者帮助决定谁住在一起，后者帮助已经住在一起的模型共享什么。不能把 IR-Scheduler 的组直接等同于模型架构相似组。</p>
+      <p>部署后，系统根据变化重新调度。原文把某模型请求率显著变化设为 0.5k requests/s，并展示了相隔约 45–300 秒发生变化的轨迹窗口。这是一套有一定时间尺度的控制回路，不是每个请求或每个 token 都重新搜索。图合并尚未完成时，论文先使用独立模型图处理请求，再切到合并后的图；因此融合准备时间与服务停顿不能简单画等号。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=7">[P §3.1、图 9，第 952 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=13">[P §5.2，开销讨论，第 958 页]</a></p>
+    </section>
 
-  <h2>6. OG-Merger 为什么重要</h2>
-  <p>系统先用 DBSCAN 按 graph edit distance 聚类模型，再为模型对构造二部图。仅当 operator 类型相同、开始时间相同、权重相似度至少 40% 时连边；随后用 Hungarian algorithm 求最大权匹配，从权重矩阵提取最大公共子矩阵，为公共计算生成 GEMM，其余部分独立执行。</p>
-  <p>论文在随机模型上发现，52% 的 CNN 模型对权重相似度处于 45%–65%，70% 的 Transformer 模型对处于 55%–70%。去掉 OG-Merger 后 goodput 下降 55.7%，说明 cache 层干扰不是次要细节。</p>
+    <section id="gk-estimator">
+      <h2>5. GK-Estimator：从算子图到内核图</h2>
+      <p>神经网络通常以算子图呈现：节点可能是卷积、矩阵乘法或注意力算子，边表示输入和中间张量依赖。但一个算子在运行时未必只调用一个 GPU kernel；框架和库可能把它实现为一串 kernel。只看“网络有多少层”，会漏掉真正的并发关系和资源峰值。USHER 先离线观察 ONNX 算子对应的 kernel 序列，再将新模型的算子图展开为更细的 kernel graph。</p>
+      <p>在这个图中，父节点完成后子节点才能取得所需数据，并行分支则可能同时执行。论文先预测各 kernel 的执行时长，据此估计开始时间；开始时间差不超过 τ 的 kernel，被视作可能并发的一组。默认 τ = 0.001 毫秒，即 1 微秒。对每组求资源需求和，再取各组中的最大值，用于近似整次执行的峰值。</p>
+      <p>这个阈值是一个时序近似，而不是严格的区间相交算法。假设 kernel A 从 0 到 10 微秒，B 从 5 到 7 微秒，它们实际重叠，但起点相差 5 微秒，已大于 1 微秒。严格重建并发还需要完整区间、所有前驱依赖、stream 调度与设备限制。论文 §5.6 在其测试设置中选择了表现最好的 τ，不能因此推断该阈值适用于所有新 GPU、编译器和异步执行框架。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=8">[P §3.2、图 10，第 953 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=15">[P §5.6、图 26，第 960 页]</a></p>
+      <h3 id="regressors">5.1 回归器到底预测什么</h3>
+      <p>原文以显存需求解释方法，明确命名了 <strong>Mreq-Regressor</strong> 和 <strong>Time-Regressor</strong>：前者估计 kernel 中间数据需求，后者估计执行时长。二者使用 stacked regression，即组合多个回归模型来减少单一模型偏差；文中列出的组成是 Lasso、Kernel Ridge、Gradient Boosting 和 XGBoost。输入包括 batch size、kernel 参数权重张量大小、输入中间张量大小、浮点运算量和 GPU 类型。</p>
+      <p>不要把它缩写为“两个 stacked regressors 分别预测计算和显存”，因为这样会漏掉决定并发关系的时间预测器。系统也估计计算需求，公开的 <code>sm_requirement.py</code> 以 <code>regression_sm</code> 求并发组需求之和，<code>memory_requirement.py</code> 中有类似的 <code>regression_mem</code> 调用；但论文对计算预测细节的展开不如显存示例完整。公开文件也依赖外部图变量和回归函数，不能把这些片段误认为已经提供了一键可运行的完整训练、校准和服务流水线。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=8">[P §3.2，第 953 页]</a><a href="https://github.com/ss7krd/Usher/blob/main/sm_requirement.py">[A，计算需求代码]</a><a href="https://github.com/ss7krd/Usher/blob/main/memory_requirement.py">[A，显存需求代码]</a></p>
+      <p>按照论文的容量概念模型，可把 M<sub>req</sub> 的字节形式写成：“参数常驻大小 + 最大并发 kernel 组的中间数据需求之和”，再除以对应 GPU 的总容量得到归一化比例。串行链对应逐算子中间峰值，并行分支对应并发求和。这解释了为什么必须知道图结构。不过，真实框架的中间张量可能活得比生产它的 kernel 更久，workspace、分配器保留区和输出缓冲也会占空间；这个近似不自动等于完整的内存存活期分析。前面指出的 <code>dram_utilization</code> 标签口径问题仍然存在，不能靠写出一个容量公式就视为解决。</p>
+      <p>这种方法节约的是<strong>新模型到来后</strong>反复实测的成本，而不是免除所有测量。论文说回归训练离线使用已知 ONNX 算子的 kernel，在 V100 上训练约 1.3 小时。换一个后端、算子融合方式、输入形状分布、精度或 GPU 时，kernel 映射与回归分布都可能改变。此外，其特征不包含将来共置的其他模型，因此 GK-Estimator 本身不是“任意共置组合的精确延迟预测器”。它给调度器提供独立需求估计，再由调度策略与融合降低干扰。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=7">[P §3.2，第 952–953 页]</a></p>
+    </section>
 
-  <h2>7. 评估结果</h2>
-  <p>真实环境包含 24 张 V100，工作负载覆盖 20 个模型并使用 Azure Functions trace；模拟扩展到 6,000 张 GPU 和 1,500 万 req/s，并覆盖 K80、V100、A100、H100。</p>
-  <div class="grid">
-    <div class="card"><div class="metric">最高 2.6×</div><p>固定集群相对 Shepherd 的 goodput。</p></div>
-    <div class="card"><div class="metric">2.5×–3× 更少 GPU</div><p>同构真实弹性集群。</p></div>
-    <div class="card"><div class="metric">2.8×–3.5× 更低成本</div><p>异构真实集群。</p></div>
-    <div class="card"><div class="metric">0.51 秒</div><p>调度决策开销；典型 workload 变化间隔为 45–300 秒。</p></div>
-  </div>
+    <section id="ir-scheduler">
+      <h2>6. IR-Scheduler：目标、分组与 best-fit</h2>
+      <h3 id="objectives">6.1 固定资源与弹性资源，目标不是同一句话</h3>
+      <p>固定集群中 GPU 数量和类型已经给定，USHER 要最大化总 goodput；超出集群能力的请求不可能凭算法变成免费资源。弹性集群中允许增加 GPU，目标则是在满足全部模型 workload 与 SLO 的前提下，最小化租用成本。后者不是单纯追求 GPU 数最少：两张便宜卡可能比一张昂贵卡省钱，也可能因复制和通信更慢，必须比较具体配置。</p>
+      <p>用普通数学表达，固定集群目标为 maximize Σ<sub>m</sub> goodput<sub>m</sub>，受已有 GPU 与资源可行性约束；弹性集群目标为 minimize Σ<sub>g</sub> price(type<sub>g</sub>)，并要求 total_goodput = total_workload。每个 GPU 的候选放置要通过论文定义的计算、显存空间检查，配置也要满足模型延迟条件。<strong>副本总数不必小于 GPU 总数</strong>，因为一张 GPU 可以容纳多个模型副本；将“replicas placed ≤ available GPUs”写成通用约束，恰好抹掉了空间复用。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=7">[P §3.1，第 952 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=9">[P §3.3.2，第 954–955 页]</a></p>
+      <h3 id="grouping">6.2 先分组，是为了缩小联合搜索</h3>
+      <p>调度器先在可考虑的 batch 与 GPU 类型上估计模型需求，形成平均资源画像。随后用论文所称的 k-means 变体构造近似等大的组，其互补性准则是 D = |Σ C<sub>req</sub> − Σ M<sub>req</sub>|。这不是普通的“把最相似模型聚在一起”：一个计算需求大、显存需求小的模型，恰好可能应和方向相反的模型成为一组。它关心的是组的需求和是否平衡，而不是两个向量的欧氏距离是否最小。</p>
+      <p>过程从单模型组开始，两两合并，再把已有组作为元素继续合并；经过 p 轮，组的规模上限按 2<sup>p</sup> 增长，文中用四模型组举例。分组降低组内搜索的规模，但也限制跨组联合优化，故它是质量与调度开销的折中。此外，平均画像可能掩盖某个具体 batch 或 GPU 类型上的反转，后续放置仍需对具体候选重新估计资源。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=8">[P §3.3.1，第 953 页]</a></p>
+      <h3 id="configuration-search">6.3 枚举配置，再按互补顺序做放置</h3>
+      <p>组内配置是每个模型的 (BS, RD)，也就是 batch size 与 replication degree。原算法取 BS ∈ {4, 8, 16, 32, 64, 128}，RD = m × cl<sub>M</sub>，其中 m ∈ {1, …, 6}。cl<sub>M</sub> 按最高能力 GPU 类型、受显存与 128 上限限制的最大 batch，以及 workload/SLO，估计满足该模型服务要求的最小副本数。它是论文搜索范围的构造依据，不是对任意异构设备、动态队列和共置环境都成立的解析最小值。</p>
+      <p>为什么允许副本数超过 cl<sub>M</sub>？因为局部最少副本不一定产生全局最好装箱。候选中增加副本、降低 batch 后，一个模型的需求块可能变小，能够与别的模型互补，降低最终 GPU 成本。固定集群版本还限制单模型候选 RD 不超过集群 GPU 数，并改为选择总 goodput 最大的配置；这仍不等于限制所有模型副本的总和。</p>
+      <p>对每个配置，算法先用 GK-Estimator 得到各 GPU 类型上的需求，拒绝最高容量设备都无法承载的候选。然后按平均资源比例标记模型：C<sub>req</sub>/M<sub>req</sub> ≥ 1.2 为 C-heavy，反向比例 ≥ 1.2 为 M-heavy，其余相对平衡。这一标签属于“模型 + batch + GPU 等执行条件”，不是模型名字的永久属性。更不能把 M-heavy 未加区分地翻译为“必然是 HBM 带宽瓶颈”；这里沿用论文的资源需求口径。</p>
+      <p>接着把 C-heavy 和 M-heavy 两列分别按 C<sub>req</sub> + M<sub>req</sub> 从大到小排列，交替配对形成待放置列表，再插入平衡型模型。先处理大块，是为了避免最后只剩零碎空隙；交替处理两种资源方向，是为了避免先把所有计算型模型堆到一起。</p>
+      <p>best-fit 的含义也很具体：先找当前模型组已经使用的 GPU；若多张都能承载，就选放入后剩余 C-space + M-space 最少的那一张。若组内放不下，再尝试其他组已有的 GPU；最后才启动能够承载该模型或候选模型对、且费用最低的新 GPU，并把它加入本组 GPU 集合。算法返回本配置的新增费用和总 goodput，外层比较候选，选定计划。它不是“每来一个请求就贪心挑最便宜 GPU”，也不是只检查显存余量。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=9">[P §3.3.2、算法 1–2，第 954–955 页]</a></p>
+    </section>
 
-  <h2>8. 对现代 LLM/Agentic AI 的迁移方式</h2>
-  <p>USHER 的多资源 admission control 思想非常重要，但现代 LLM 需要扩展资源向量：</p>
-  <pre><code>r = (
-  SM / Tensor Core demand,
-  HBM static weights,
-  dynamic KV-cache and growth rate,
-  memory bandwidth,
-  L2/cache footprint,
-  PCIe/NVLink/NVSwitch traffic,
-  prefix/adapter locality,
-  power and thermal headroom
-)</code></pre>
-  <p>prefill 通常更 compute-heavy，decode 更 memory/KV-heavy，因此不仅可以在“模型之间”做资源互补，也可以在“阶段之间”做互补组批。但必须用真实共置 profile 校准，因为 MPS 配额无法隔离 memory bandwidth、L2 cache 与互联竞争。</p>
+    <section id="numeric-examples">
+      <h2>7. 两个可手算的教学示例</h2>
+      <div class="example" aria-labelledby="example-placement">
+      <h3 id="example-placement">教学示例一：归一化计算/显存装箱，不等于带宽安全</h3>
+      <p><strong>假设：</strong>两张同型 GPU，每张有 16 GB 可用于本例的显存，计算预算归一化为 1。这里 C 是我们假定可加的调度需求，不是直接读出的 occupancy；M 严格表示已包含工作区的显存峰值除以 16 GB。先忽略带宽、L2、动态分配与迁移，且假定每个模型独立满足 SLO。四个实例的需求如下。这个理想化模型只用于理解装箱，不是论文图 7 的复刻。</p>
+      <table>
+        <caption>教学示例一的资源需求</caption>
+        <thead><tr><th scope="col">实例</th><th scope="col">C</th><th scope="col">M</th><th scope="col">显存容量</th><th scope="col">方向</th></tr></thead>
+        <tbody>
+          <tr><td>A</td><td>0.65</td><td>0.25</td><td>4.0 GB</td><td>计算侧较重</td></tr>
+          <tr><td>B</td><td>0.60</td><td>0.25</td><td>4.0 GB</td><td>计算侧较重</td></tr>
+          <tr><td>C</td><td>0.25</td><td>0.65</td><td>10.4 GB</td><td>容量侧较重</td></tr>
+          <tr><td>D</td><td>0.30</td><td>0.60</td><td>9.6 GB</td><td>容量侧较重</td></tr>
+        </tbody>
+      </table>
+      <p>若把 A 与 B 配对，计算和为 1.25，越过预算，虽然显存只占 0.50 也不能接受。把 C 与 D 配对则显存和为 1.25，同样失败。改成 A + C，需求是 (0.90, 0.90)，显存 14.4 GB；B + D 是 (0.90, 0.85)，显存 13.6 GB。两张卡在这个模型中即可放下四个实例，平均计算预算使用 90%，平均显存容量使用 87.5%。这里“90%”是教学预算占比，不是实测 Tensor Core 利用率。</p>
+      <p>再看 best-fit。某模型需要 (0.20, 0.15)，GPU X 剩余 (0.30, 0.20)，GPU Y 剩余 (0.50, 0.50)。放入 X 后余量和为 0.10 + 0.05 = 0.15；放入 Y 后为 0.30 + 0.35 = 0.65，所以启发式偏好 X，把更大的完整空间留给后续模型。这是局部减少碎片，不保证后续所有模型都能最优放置。</p>
+      <p>最后撤掉一个简化假设：若 A 与 C 的独占 HBM 带宽需求分别是峰值的 70% 和 60%，它们即使容量检查通过，带宽需求之和也已经达到 130%。更不用说共置改变 L2 命中率后，独占带宽画像还可能失效。正确结论应是“通过了两维候选筛选，仍需带宽、缓存与时延验证”，而不是“已证明无干扰”。这正是区分容量与带宽的价值。</p>
+      </div>
+      <div class="example" aria-labelledby="example-queue">
+      <h3 id="example-queue">教学示例二：大 batch 提升执行能力，却降低按时完成量</h3>
+      <p><strong>假设：</strong>单副本每秒均匀到达 200 个请求，即每 5 毫秒一个；只发送满 batch；无旧队列、传输开销与抖动；batch 4 执行 6 毫秒，batch 8 执行 10 毫秒；每个请求的到达至完成 SLO 为 40 毫秒。持续到达与执行可并行，下面分别观察一个完整 batch，从第一个请求到达时刻 0 开始。</p>
+      <p>batch 4 的到达时刻是 0、5、10、15 毫秒，15 毫秒时开始执行，21 毫秒时一起完成。四个请求的延迟分别为 21、16、11、6 毫秒，全部达标。执行能力为 4/0.006 ≈ 667 requests/s，但实际只到达 200 requests/s，因此稳定期 goodput 是 200，不是 667。</p>
+      <p>batch 8 在 35 毫秒才能收齐，45 毫秒完成。请求延迟依次为 45、40、35、30、25、20、15、10 毫秒，最早的一个超时。尽管执行能力升到 8/0.010 = 800 requests/s，且平均延迟仅 27.5 毫秒，仍有八分之一的请求违反 SLO。在上述严格均匀且忽略边界的假设下，goodput 为 200 × 7/8 = 175 requests/s。平均达标，不能代替逐请求达标。</p>
+      <p>若把流量均匀拆给两个副本，每个副本只有 100 requests/s，间隔变为 10 毫秒；使用 batch 4 时最早请求需等 30 毫秒凑批，再执行 6 毫秒，总共 36 毫秒。原来的 21 毫秒反而变长了。副本扩展能在过载时缩短就绪队列，却可能在低负载时拉长凑批时间，所以需要 batch timeout、动态批大小以及副本联合选择。这个例子没有突发与已有队列；加入这些因素后，必须看延迟分布，不能直接照用这里的 175 或 200。</p>
+      </div>
+    </section>
 
-  <h2>9. 局限</h2>
-  <ul>
-    <li>论文主要覆盖传统 CNN/Transformer，最大 LLM 为 Llama-2 13B，未直接建模长上下文动态 KV-cache。</li>
-    <li>仅实现 FP16，未覆盖 FP8/FP32 与量化精度对干扰的影响。</li>
-    <li>parallelism 由底层框架决定，未联合搜索 TP/PP/EP 与 placement。</li>
-    <li>6,000 GPU 为模拟结果；公开代码明确是 preliminary artifact。</li>
-  </ul>
+    <section id="og-merger">
+      <h2>8. OG-Merger：复用相同权重，而非混合模型</h2>
+      <p>IR-Scheduler 试图把计算与显存空间分配好，但 L2 缓存不能简单给每个模型都保留完整工作集。论文指出其设置中模型对缓存的需求接近整个缓存，若机械要求各自缓存需求之和不超过一张卡，就几乎不能共置。OG-Merger 换了一个方向：如果两个模型本来就在用相同或极接近的权重块，能否让这些块在 L2 中时连续服务多个输入，而不是反复换入换出？<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=7">[P §3.1，第 952 页]</a></p>
+      <h3 id="weight-similarity">8.1 架构相似只是候选条件，权重相似才决定可共享部分</h3>
+      <p>同 GPU 的模型先用 DBSCAN 按算子图的 graph edit distance 聚类。图编辑距离衡量把一个算子图改成另一个需要多少添加、删除或替换操作；DBSCAN 不要求预先指定组数。原文以很小的距离阈值举例，意图找非常接近的结构，不应解读成任意两个 Transformer 都能合并。</p>
+      <p>同一架构组内，算法取两个模型建立算子二部图。一侧是模型一的算子，另一侧是模型二的算子；只有算子类型相同、预计开始时间相同、权重相似度至少达到 ω 时才连接。默认 ω = 40%，边权为相似度。Hungarian algorithm 选择总边权最大的互不冲突匹配，避免同一算子同时被多次匹配；之后再逐步加入其他模型。这是受候选条件和合并顺序约束的过程，不是自动发现所有全局最优公共计算。</p>
+      <p>权重相似度也不是“语义接近”或“向量余弦相似”。论文用两倍最大公共权重子矩阵的元素数量，除以两个权重矩阵的元素数量之和；认为两个权重值相同的条件是绝对差不大于 10<sup>−7</sup>。对模型级统计，再对相关卷积层或注意力层对取平均。这里的 40% 是算子匹配门槛，并不意味着把两个模型 40% 的参数直接取平均。</p>
+      <p>论文在从 Hugging Face 选择的 1,000 个 CNN 与 1,000 个 Transformer 模型中分别测量：52% 的 CNN 模型对位于 (45%, 65%] 相似度区间，70% 的 Transformer 模型对位于 (55%, 70%]。这些比例依赖公共子矩阵定义、精度、检查点来源和采样集合，不能推广为“随便两个独立训练模型都共享大半权重”。同源基础模型和微调后保留的权重是合理的共享来源；网络结构相同，本身并不保证数值相同。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=6">[P §2.4，第 951–952 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=10">[P §3.4.1–3.4.2，第 955 页]</a></p>
+      <h3 id="super-operator">8.2 Super-Operator 怎样保存各自的输出</h3>
+      <p>以两个线性运算 y<sub>1</sub> = W<sub>1</sub>x<sub>1</sub>、y<sub>2</sub> = W<sub>2</sub>x<sub>2</sub> 为例。在共享子块已经对齐且完全相等的简化情况下，可把 W<sub>1</sub> = W<sub>s</sub> + R<sub>1</sub>、W<sub>2</sub> = W<sub>s</sub> + R<sub>2</sub>。把不同输入拼成 [x<sub>1</sub>, x<sub>2</sub>]，一次 GEMM 计算 W<sub>s</sub>[x<sub>1</sub>, x<sub>2</sub>]，再分别加回 R<sub>1</sub>x<sub>1</sub> 与 R<sub>2</sub>x<sub>2</sub>。它共享的是权重读取和执行组织，各模型仍保留自己的输入、剩余权重及输出。</p>
+      <p>原算法更具体：用 template matching 提取最大公共子矩阵，构造其余位置为零的共享矩阵；原矩阵中对应区域置零，得到残余矩阵。必要时先对输入、权重做零填充，再拼接输入，创建共享 GEMM 和独立剩余运算，最后进行输出重定位与求和。第一个模型与第二个模型的公共块可能位于不同位置，论文专门讨论了重定位。实现者仍须检查索引、布局与输入维度语义；不能因为有“共享矩阵”这个名字就省略这些操作。</p>
+      <p>收益主要来自让共同权重在 cache 中被多次利用，而不是把不同输入的矩阵乘法结果直接复用，也不是保证浮点运算数减半。零填充、拼接、拆分、残余运算、重定位和额外 kernel 都有成本。ω 太高会错过共享机会，太低则接纳共享很少的算子，使这些开销压过收益。论文在其设置中选 40%，是性能权衡的结果，不是普遍适用的常数。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=10">[P §3.4.3、图 11–12，第 955–956 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=15">[P §5.6，第 960 页]</a></p>
+      <h3 id="precision-tradeoff">8.3 数值精度不是可以省略的附注</h3>
+      <p>如果公共值完全相同，代数分解在实数运算下成立，但浮点加法的顺序改变仍可能影响末位；若只是差值不超过 10<sup>−7</sup> 就视作相同，复用公共值还引入近似。这个绝对阈值与数值尺度、数据类型有关：FP16、FP32、FP8 在不同量级上的可表示间距不同，不能把同一个阈值当成通用误差保证。局部很小的权重扰动经过多层传播后，任务级影响也需要测量。</p>
+      <p>论文当前实现使用 FP16，并把其他精度及自适应选择留作未来工作；表 2 报告图合并的平均模型准确率变化为 −0.0003%，表 3 给出逐模型结果。这是作者在其数据与任务上的报告，不是逐输出误差上界，更不是对生成模型任意长回答的语义等价证明。不同任务的“accuracy”也未必天然可合并为同一种统计量。量化还会同时改变权重大小、带宽、Tensor Core 路径和相似性，所以不能先在 FP16 下做好资源计划，再认为换 FP8 一定只会更省。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=13">[P 表 2–3，第 958–959 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=15">[P §6，第 960 页]</a></p>
+    </section>
 
-  <h2>资料来源</h2>
-  <ul>
-    <li><a href="https://www.usenix.org/conference/osdi24/presentation/shubha">USENIX 官方页面</a></li>
-    <li><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf">论文 PDF</a></li>
-    <li><a href="https://github.com/ss7krd/Usher">公开代码仓库</a></li>
-  </ul>
-  <footer>报告基于公开论文与公开 artifact；检索日期：2026-09-14。</footer>
-</article>
-</main></body></html>
+    <section id="experimental-setup">
+      <h2>9. 实验到底运行了什么</h2>
+      <p>原论文有两套容易混淆的实机规模。§2 用于动机分析的集群是 12 台 AWS EC2 p3.2xlarge，每台一张 16 GB V100。§5 主评估的实机集群则是 6 台 p3.8xlarge，每台四张 V100，共 24 张，使用 NVLink 互连。不能看到“24 GPU”就把此前所有图都归为同一实验设置。</p>
+      <p>基础模型集合在表 1，共 20 个，覆盖目标检测、图像识别、翻译、文本分类和文本生成，包括 ResNet、MobileNet、BERT、GPT-2，以及 13B 的 Llama-2。默认 SLO 取单请求在 V100 上平均推理延迟的两倍，具体值列在表中；这不是统一的 100 毫秒，也不是某家生产服务给出的 p99 契约。主评估还加入视频监控和社交媒体两个多模型应用，分别采用 500 毫秒和 750 毫秒 SLO。</p>
+      <p>请求率来自 Azure Functions 轨迹。MAF1 是 2019 年轨迹，论文形容其到达较稳定、密集；MAF2 是 2021 年轨迹，具有突发性。§2 把 46,000 条函数流按轮转分配给 20 个模型；相关平均结果按两周轨迹时长统计。它利用真实生产<strong>到达形状</strong>驱动模型请求，但不是在报告 Azure 本身的 LLM 服务流量，更不包含现代 Agent 的 token 长度、工具调用与 KV 生命周期的原始分布。</p>
+      <p>主实现使用 Python、TensorFlow 与 ONNX，借助 MPS 分配计算资源；合并图作为单一 CUDA context 执行，并使用对应模型的活跃线程比例之和。模型并行交给底层框架，论文没有联合搜索张量并行、流水线并行与网络拓扑。作者仓库 README 明确称其为 preliminary codes，能帮助理解调度与资源估计思路，但不能等同于论文全部实验已可一键重现。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=3">[P 表 1、§2，第 948–949 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §4–5.1，第 956 页]</a><a href="https://github.com/ss7krd/Usher">[A]</a></p>
+      <p>大规模评估把 GPU 数扩到 6,000、请求率扩到每秒 1,500 万，但这是<strong>模拟</strong>。原文明确说由于成本过高，没有在这些 GPU 上真正运行模型，而是直接从调度决策报告结果。因此它支持“大规模下调度方案的估计收益”，不等于证明 6,000 卡真实运行时的尾延迟、网络拥塞、故障恢复和缓存干扰均已被验证。</p>
+      <p>异构实验考虑 K80、V100、A100、H100，并按文中引用的 AWS 按需价格比较。论文把图 19–20 标为异构实机结果，但 §5.1 的基础 testbed 描述主要给出 V100，异构部分没有同等细致列出每种卡数量、服务器配置与部署过程。本教程保留“作者标为实机”的来源属性，不把这处说明空白补写成已知的完整硬件清单；价格比较也不能直接当作今天的采购报价。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §5.1，第 956 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=12">[P §5.2.2、图 19–21，第 957–958 页]</a></p>
+    </section>
+
+    <section id="results-and-evidence">
+      <h2>10. 数字怎么读，证据到哪里为止</h2>
+      <p>基线是 Shepherd、GPUlet 与 AlpaServe。论文将 Shepherd 作为不进行空间复用的代表，将另外两者作为允许复用的代表。比较同时包含调度、资源共享和图融合等系统选择，所以整体收益不能全部归因于某一个模块。下表把结果与分母绑定，避免将摘要中的最大倍数扩写成所有场景的保证。</p>
+      <table>
+        <caption>论文主要结果及其正确解释</caption>
+        <thead><tr><th scope="col">实验或指标</th><th scope="col">论文报告</th><th scope="col">如何解释</th></tr></thead>
+        <tbody>
+          <tr><td>固定集群实机，图 13</td><td>相对 Shepherd 为 1–2.6 倍 goodput；相对 GPUlet/AlpaServe 为 1–2.2 倍</td><td>同一到达负载、SLO 下的有效吞吐之比；上限不是平均提升，也不是 GPU 算力变成 2.6 倍。</td></tr>
+          <tr><td>同构弹性实机，图 16</td><td>基线 GPU 数约为 USHER 的 2.5–3 倍</td><td>统计满足工作负载所需、按秒观察的平均 GPU 数；换算为 USHER 使用基线的约 33.3%–40%，即少约 60%–66.7%。</td></tr>
+          <tr><td>异构弹性，图 19</td><td>基线成本约为 USHER 的 2.8–3.5 倍</td><td>USHER 成本约为基线的 28.6%–35.7%，即降低约 64.3%–71.4%；不是“减少 350%”。须结合异构设置说明的局限。</td></tr>
+          <tr><td>模拟结果，图 15、18、21</td><td>goodput 为 1.5–1.9 倍；GPU 数比为 1.7–2.1 倍；成本比为 1.9–2.2 倍</td><td>三种指标来自各自固定/弹性场景，不能串成一次实机试验的统一收益；依据调度输出而非大规模模型执行。</td></tr>
+          <tr><td>去掉 OG-Merger 的消融，图 25</td><td>完整系统比 USHER/M 的 goodput 高 55.7%</td><td>完整/删减 = 1.557；删减相对完整的下降是 1 − 1/1.557 ≈ 35.8%，不是 55.7%。</td></tr>
+        </tbody>
+      </table>
+      <p><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §5.2、图 13–21，第 956–958 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=14">[P §5.5、图 25，第 959 页]</a></p>
+      <h3 id="estimation-evidence">10.1 “99.98% 准确率”没有那么简单</h3>
+      <p>§3.2 报告在表 1 的模型、BS = 2 的实验中，计算与显存需求估计准确率为 99.98%；表 4 又给出跨表 1 模型平均的同名准确率，以及 GK-Estimator 耗时 31.6 毫秒、对比 profiling 4.8 小时和 42.7 美元。两处结果应按各自上下文阅读，不能说所有 batch、所有 GPU 和所有未见模型都达到了相同准确率，也不能把 31.6 毫秒理解为系统端到端调度时长。</p>
+      <p>原文没有充分给出“准确率”的统一数学定义、误差分布、置信区间以及未见算子或未见 GPU 的独立泛化检验。因此不能将其自动解释为每个预测误差都不超过 0.02%，更不能理解成 SLO 违约率仅为 0.02%。profiling 被视为对照真值也不意味着它无测量扰动。复现至少需要明确相对误差如何计算、是否有容量低估的高风险尾部，以及资源标签的量纲。</p>
+      <p>表 4 将估计阶段的 GPU profiling 成本记为 0，但离线训练已经花费约 1.3 GPU 小时，CPU 推断、图分析和模型维护也不是不存在。准确说法是“摊销既有 kernel 知识后，显著减少新模型逐配置 profiling”，不是“训练与运行完全免费”，也不是将 31.6 毫秒舍入为零后宣称时间减少 100%。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=8">[P §3.2，第 953 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=14">[P §5.5、表 4，第 959 页]</a></p>
+      <h3 id="overhead-evidence">10.2 0.51 秒只是决策开销，不是整个切换过程</h3>
+      <p>表 2 分别列出分组 0.1 秒、调度决策 0.51 秒、模型加载 0.63 秒、图合并 2.3 秒。分组主要在模型增删时更新；图合并可在独立模型图先服务时继续准备，所以这些数既不能都忽略，也不应不看是否重叠就直接相加成统一停机时间。正文另给模型迁移加载约 0.69–0.72 秒，与表中口径并不完全一致，表 3 又列出逐模型加载值；使用时应指定引用哪一项。</p>
+      <p>45–300 秒的变化间隔来自论文展示的工作负载窗口，能说明该控制开销在该窗口内有摊销空间，不是所有生产突发都至少隔 45 秒。短到几十毫秒的 burst、突增的长上下文、模型换入与回滚，都可能需要更快的准入、排队或降级机制。原文也承认突发非常频繁时收益可能降低。</p>
+      <p>最后，利用率提升只是解释性证据。C<sub>uti</sub>、M<sub>uti</sub> 的测量代理与量纲已在第一节区分，原文某些“提高若干百分比”的叙述也不宜擅自改成百分点。最应优先复核的是统一 SLO 下的真实 goodput、成本分母、输入质量，以及是否真正完成了模型执行。消融说明模块在特定设置中有价值，却不能证明在所有模型组合下都同样有效。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=12">[P §5.2，第 957–958 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=14">[P §5.4–5.5，第 959 页]</a></p>
+    </section>
+
+    <section id="llm-applicability">
+      <h2>11. 现代 LLM、动态 KV 与 MIG/MPS 边界</h2>
+      <p>USHER 不是完全没有语言模型：它测试了 BERT、GPT-2 和 Llama-2 13B。但“包含一个生成模型”与“已经解决现代 LLM serving”是两回事。今天的自回归服务通常有 prefill 与 decode 两个阶段；prefill 处理一段输入，decode 逐步产生 token，并持续读写 KV cache。它们的计算/访存比例受序列长度、并发数、注意力实现、GQA、精度和硬件影响。prefill 常更偏计算、低 batch decode 常更偏访存，是可用于提出假设的经验，不是所有条件下的固定分类。</p>
+      <h3 id="dynamic-kv">11.1 KV cache 让“显存需求向量”随时间改变</h3>
+      <p>普通 Transformer 的一条序列，若有 L 层、每层 H<sub>KV</sub> 个 KV head、head 维度为 d、已缓存 token 数为 T、每个元素 b 字节，则未考虑分片和块管理开销的 KV 大小可近似写为：</p>
+      <p class="formula">KV 字节数 ≈ 2 × L × H<sub>KV</sub> × d × T × b</p>
+      <p>前面的 2 表示 key 和 value 两份。GQA 会改变 KV head 数，多副本、多序列、分页块、量化和并行分片都会进一步改变实际占用。这是工程容量模型，不是原论文公式。</p>
+      <p>教学上假设 L = 32、H<sub>KV</sub> = 8、d = 128、b = 2，则每个 token 需要 131,072 字节，也就是 128 KiB KV；4,096 token 的一条序列约需 512 MiB，十条就是约 5 GiB，尚未包含权重、workspace 与碎片。请求继续生成时，这部分还在增长。因此入场时“刚好放得下”不能保证十秒后仍放得下，调度器需要预测增长、限制并发、保留容量余量，或能够抢占/换出状态。</p>
+      <p>这意味着现代扩展应把容量、容量增长率、HBM 带宽、L2 压力和互联分别作为维度，再把资源估计与阶段、活跃序列长度分布绑定。continuous batching 每一步都可能换入或移除序列，与论文以有限 BS/RD 候选为中心的模型不同。动态形状、FlashAttention 等融合 kernel 也会改变原有算子到 kernel 的映射，需要重新校准，而不能沿用旧图上的回归值。</p>
+      <h3 id="mps-mig">11.2 不能把 MIG 与 MPS 的隔离能力混为一谈</h3>
+      <p><strong>论文所用的 MPS 活跃线程比例控制，没有给每个模型独立的 HBM 带宽与 L2 配额。</strong>客户端仍可能竞争共享缓存和显存接口；显存分配上限即使存在，也只是容量限制，不是带宽保底。因此，按比例配置 MPS 后仍需真实共置 profile、违约监控和回退。把多个模型融合进一个 CUDA context，也不会自动创造硬件级租户隔离。</p>
+      <p><strong>但“MIG/MPS 都没有硬带宽隔离”也是不准确的概括。</strong>NVIDIA 的 MIG 文档明确区分 GPU Instance（GI）与 Compute Instance（CI）：不同 GI 分配专属的 L2 分区、内存控制器等内存路径，提供对应的容量与带宽资源隔离及 memory QoS；同一 GI 内的多个 CI 则共享该 GI 的内存和部分引擎。在一个 GI 内再通过 MPS 共置，也不能把 GI 层面的隔离误当成各模型间的带宽隔离。</p>
+      <p>所以，应准确地说：<em>USHER 的 MPS 共置没有硬带宽隔离；MIG 的 GI 边界有更强的硬件内存隔离，但不保证同一 GI 内每个模型获得独立带宽，也不直接保证包含网络与排队的端到端 SLO。</em>MIG 的离散配置与切分限制还可能造成碎片，V100 主实验本身也没有验证 MIG 上的效果。这里对 GI/CI 的解释来自硬件厂商文档，是防止错误迁移的补充，不是原论文新增实验。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=3">[P §1，第 948 页]</a><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=11">[P §4，第 956 页]</a><a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/introduction.html">[N2，内存路径隔离]</a><a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/concepts.html">[N3，GI/CI 与 MPS]</a></p>
+      <h3 id="llm-design">11.3 可迁移的是方法，不是结果倍数</h3>
+      <p>比较稳妥的迁移路线，是先保留 USHER 的联合优化思想：在请求长度分桶、阶段估计和资源余量下，联合选择 batch、并发度、副本和设备；同时用真实共置执行检查容量、带宽与尾延迟。当 TTFT（首 token 延迟）、TPOT（后续每 token 时间）和整请求时限都重要时，应分别定义是否达标，不能沿用一个请求完成率就掩盖生成卡顿。</p>
+      <p>OG-Merger 的适用范围则需更谨慎。共享基础权重的多 LoRA 服务可能有明确的公共部分，但成熟框架也可能已经复用基础权重，再做图合并未必产生相同增益。任意两个不同大模型的注意力图、量化尺度和权重布局可能不兼容。即使有相同权重块，也应比较融合、简单权重共享、分时执行与隔离实例，测量准确性、额外算子成本与 cache 行为。</p>
+      <p>Agent 还会在工具调用时暂停生成，保留会话状态；后续工具返回可能集中触发新的 prefill。它的请求不是独立同分布的短任务。现实系统还要考虑 KV 迁移、TP/PP/EP 通信、前缀缓存命中、租户公平与失败恢复。这些都是 USHER 资源互补思想可以启发的问题，但论文的 2.6 倍或 3.5 倍结果不能直接作为这类部署的容量规划依据。<a href="https://www.usenix.org/system/files/osdi24-shubha.pdf#page=15">[P §6，第 960 页；现代服务部分为工程延伸]</a></p>
+    </section>
+
+    <section id="exercises">
+      <h2>12. 有推导的练习</h2>
+      <h3 id="exercise-metrics">练习一：哪个指标能证明不会 OOM？</h3>
+      <p><strong>题目：</strong>某 GPU 显示 occupancy 为 80%，<code>dram_utilization</code> 为 9，已分配显存为 12 GB，总容量为 16 GB。能否据此放入“权重大小 3 GB”的模型？</p>
+      <p><strong>解答：</strong>不能直接确定。只有已分配字节数与容量单位相同，但 12 + 3 = 15 GB 也只加了新模型的权重，尚未计入它的激活、KV、workspace、分配器碎片以及运行时峰值。<code>dram_utilization</code> 的 9 是内存活动等级，不是“占了 9 GB”或“还剩 10% 容量”；occupancy 80% 也不证明剩余 20% FLOPS 可以稳定交付。正确下一步是估计和测量峰值容量，再检查带宽、缓存及 SLO，而不是将三个不同口径相加。</p>
+      <h3 id="exercise-batching">练习二：给教学示例二加一个凑批约束</h3>
+      <p><strong>题目：</strong>保持每秒 200 个均匀请求、batch 8 执行 10 毫秒、40 毫秒 SLO。忽略其他开销，最早请求最多可以等多久凑批？原来的 8 个请求能否收齐？</p>
+      <p><strong>解答：</strong>凑批等待最多 40 − 10 = 30 毫秒。第八个请求要在 35 毫秒到达，所以不能保证按时收齐八个。实际可在 deadline 到来前发出不满的 batch，或选更小的 batch；但若改为 7 个或更少，执行时间也要重新测量，不能无证据照搬“batch 8 为 10 毫秒”。这说明超时策略与资源估计必须协同，也说明默认只枚举 2 的幂并不涵盖所有在线服务策略。</p>
+      <h3 id="exercise-ratio">练习三：消融百分比的分母在哪里？</h3>
+      <p><strong>题目：</strong>去掉 OG-Merger 的系统 goodput 假设为 10,000 requests/s，完整系统比它高 55.7%。完整系统是多少？从完整系统删除模块，下降百分比是多少？</p>
+      <p><strong>解答：</strong>完整系统为 10,000 × 1.557 = 15,570 requests/s。删除模块后少 5,570，但这次分母是原来的完整系统 15,570，所以下降 5,570/15,570 ≈ 35.8%。两个百分比描述同一对结果，却因分母不同而不同。若把“高 55.7%”改写成“移除后下降 55.7%”，就夸大了模块贡献。</p>
+      <h3 id="exercise-graph">练习四：预测了每个 kernel，还缺什么？</h3>
+      <p><strong>题目：</strong>两个并行分支分别产生 2 GB 和 3 GB 中间结果，随后一个合并算子同时读取两者。若产生两个结果的 kernel 没有同时运行，能否直接断言中间数据峰值最多 3 GB？</p>
+      <p><strong>解答：</strong>不能。即使两个生产 kernel 不重叠，第一个结果仍须存活到合并算子读取它；第二个结果生成后，两者可能同时驻留，至少需要考虑 5 GB，再加合并输出和工作区。kernel 时间重叠与张量生命周期重叠是两个概念。这个练习解释了为什么一个峰值估计器还需要内存存活期验证，也说明我们不能把论文的并发组近似当成通用精确容量分析。</p>
+    </section>
+
+    <section id="takeaways">
+      <h2>13. 带走什么，不应照搬什么</h2>
+      <p>USHER 最值得学习的，不是某一个阈值，而是一条完整的推理链：批处理改变资源形状；副本改变请求分配与常驻成本；多个模型一起考虑，可能找到单模型优化看不见的互补组合；放置后仍要处理缓存层竞争；最终用满足 SLO 的完成量与成本评价，而不是用“GPU 很忙”自我证明。</p>
+      <p>也要保留同样清晰的边界。kernel 图预测需要可靠的标签、时序和生命周期；两维预算不等于所有硬件资源均被隔离；权重近似共享需要数值和任务质量检验；大规模模拟不是实机测量；生成式服务需要动态 KV 与阶段化时限。将这两面一起读懂，才算真正理解了 USHER，而不是把它记成“互补模型放在一起，就一定能省三倍 GPU”。</p>
+      <p><a href="#top">返回页首</a></p>
+    </section>
+
+    <section id="sources-and-rights">
+      <h2>14. 来源、PDF 许可与转载状态</h2>
+      <p><strong>原 PDF 已核对，但本公开页面不提供仓库内副本。</strong>核验对象来自 USENIX 官方下载地址，文件未改写，共 19 页，含封面、正文与参考文献；获取日期为 2026-09-14。其 SHA-256 为 <code>8cd323521a1ba6fe36cf8b04f7e5b0ebbd0596677ad1c9c7efb60e145be674a9</code>。这可以用于确认字节级来源，不是转载许可证。</p>
+      <p>USENIX 展示页说明论文可免费公开访问，但免费访问本身没有授予第三方复制到公开 GitHub 仓库的权利。本次核验未在论文文本、封面说明或官方展示页中找到适用于该论文的 CC 许可或明确第三方公开再分发授权。官方作者资源链接的 <a href="https://www.usenix.org/sites/default/files/2021_sample_consent_conference.pdf">2021 年 <em>Authorization and License to Publish</em> 样本</a>第 1 条明确写着 <q lang="en">Copyrights are retained by the authors.</q>，并将授予 USENIX 的权利限定为 <q lang="en">non-sublicensable and non-transferable</q>，即不可转授权且不可转让；另一官方页面提供的 2019 年样本也采用同类条款。</p>
+      <p>这些是<strong>标准样本，不是本论文已签署的授权文件</strong>，因此既不能据此声称拿到了该论文的具体转载许可，也不能把作者本人的后续发表权当成第三方的权利。本次能确认的是官方可访问渠道，不能确认公开仓库镜像权限。未改动原件与许可核验材料只保存在非公开会话资料中；未添加 <code>papers/usher-osdi-2024.pdf</code>，页面也没有指向不存在本地文件的链接。若日后取得作者/权利人的明确再分发授权，或找到适用于本论文的开放许可，再决定是否加入原件，并保留原始发表归属与授权依据。</p>
+      <dl>
+        <dt id="reference-paper">[P] 原论文与出版记录</dt>
+        <dd><p><a href="https://www.usenix.org/system/files/osdi24-shubha.pdf">USENIX 原始 PDF</a>；<a href="https://www.usenix.org/conference/osdi24/presentation/shubha">OSDI 2024 展示页</a>。本教程的算法和实验论断以正文 §2–6 为主；文内页码链接直接指向官方 PDF。</p></dd>
+        <dt id="reference-artifact">[A] 作者公开实现</dt>
+        <dd><p><a href="https://github.com/ss7krd/Usher">ss7krd/Usher</a>，README 自称 preliminary codes；<a href="https://github.com/ss7krd/Usher/blob/main/sm_requirement.py">计算需求</a>、<a href="https://github.com/ss7krd/Usher/blob/main/memory_requirement.py">显存需求</a>、<a href="https://github.com/ss7krd/Usher/blob/main/time_duation.py">执行时间</a>。代码公开与论文 PDF 的转载许可是不同问题，不能互相替代。</p></dd>
+        <dt id="reference-metrics">[N1] NVIDIA 指标定义</dt>
+        <dd><p><a href="https://docs.nvidia.com/cuda/profiler-users-guide/index.html#metrics-reference">Profiler User's Guide，Metrics Reference</a>，用于区分 <code>achieved_occupancy</code> 与 <code>dram_utilization</code>，并明确后者不是分配容量。</p></dd>
+        <dt id="reference-isolation">[N2–N3] NVIDIA MIG 隔离边界</dt>
+        <dd><p><a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/introduction.html">MIG Introduction</a> 与 <a href="https://docs.nvidia.com/datacenter/tesla/mig-user-guide/concepts.html">MIG Concepts</a>，用于区分独立 GI 的内存路径隔离、同 GI 内 CI 的共享，以及 MPS 的共享资源。</p></dd>
+        <dt id="reference-license">[L] 出版方许可核验</dt>
+        <dd><p><a href="https://www.usenix.org/conference/osdi24/instructions-presenters">OSDI 2024 讲者说明</a>要求作者签署出版同意书；<a href="https://www.usenix.org/conferences/author-resources">USENIX 作者资源</a>链接至 <a href="https://www.usenix.org/sites/default/files/2021_sample_consent_conference.pdf">2021 年标准许可样本</a>；<a href="https://www.usenix.org/conferences/author-resources/sample-usenix-consent-form-refereed-papers">旧版样本页面</a>链接至 <a href="https://www.usenix.org/sites/default/files/2019_sample_consent_conference.pdf">2019 年样本</a>。两版均未构成面向本仓库的第三方转载授权。</p></dd>
+      </dl>
+      <footer><p>本页为基于公开论文、作者公开代码与硬件文档的原创中文讲解，不是原文翻译或性能复现实验；未使用任何保密演示材料。来源核验日期：2026-09-14。</p></footer>
+    </section>
+  </article>
+</main>
+</body>
+</html>

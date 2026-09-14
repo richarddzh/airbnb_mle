@@ -3,101 +3,266 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AdaGen 深度解读</title>
+  <meta name="description" content="从 prefill、decode、KV cache 与逐轮批处理开始，理解 AdaGen 的计算布局模拟、五个调度组件、实验口径与部署边界。">
+  <title>AdaGen 中文精读：从第一枚 token 到集群计算布局</title>
   <link rel="stylesheet" href="assets/style.css">
 </head>
 <body><main>
-<nav class="nav"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
+<nav class="nav" aria-label="站点导航"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
 <article>
-  <h1>AdaGen：工作负载自适应的 LLM 集群调度</h1>
-  <div class="box">
-    <strong>论文：</strong>Sudipta Saha Shubha 等，<em>AdaGen: Workload-Adaptive Cluster Scheduler for Latency-Optimal LLM Inference Serving</em>，EuroSys 2026。<br>
-    <strong>核心问题：</strong>为什么“各实例 token 数或 KV-cache 一样多”仍可能产生明显不同的 TTFT？<br>
-    <strong>一句话答案：</strong>决定延迟的不是负载总量本身，而是 prefill/decode token 在连续 batching iteration 中形成的 <em>compute layout</em>。
-  </div>
+  <header id="top">
+    <p class="eyebrow">论文精读 · 中文入门教程</p>
+    <h1>AdaGen：为什么“负载一样多”，用户仍然等得不一样久？</h1>
+    <p class="lead">假如两台 GPU 都分到了十二个 token，它们是否已经足够均衡？如果只看总量，答案似乎是肯定的；如果看用户什么时候收到第一枚 token、此后是否流畅输出，答案却未必如此。AdaGen 让我们把视角从“每台机器背了多少工作”，移动到“每一轮到底执行谁的哪一部分工作”。本文从推理服务的基本时间线讲起，再逐层拆开计算布局、模拟器、调度策略与实验，最后讨论哪些想法可以借用，哪些结论不能外推。</p>
+    <div class="box">
+      <p><strong>论文身份：</strong><cite>AdaGen: Workload-Adaptive Cluster Scheduler for Latency-Optimal LLM Inference Serving</cite>，Sudipta Saha Shubha、Ayush Goel、Diman Zad Tootaghaj、Khaled Diab、Hardik Soni、K. K. Ramakrishnan、Puneet Sharma、Haiying Shen；<cite>Proceedings of the 21st European Conference on Computer Systems</cite>（EuroSys ’26），2026，1111–1127。DOI：<a href="https://doi.org/10.1145/3767295.3769345">10.1145/3767295.3769345</a>。</p>
+      <p><strong>对照原文：</strong><a href="papers/adagen-eurosys-2026.pdf">本地原版 PDF（17 页，4,284,319 字节）</a>。此副本为非商业学习用途的未修改归档，适用 CC BY-NC-ND 4.0；完整作者、来源、许可原文与校验值见<a href="#sources">资料来源</a>。</p>
+      <p><strong>阅读约定：</strong>正文中的“论文机制”与“教学算例”不是同一层证据。绿色算例框中的请求长度、固定轮时和网络参数均由本教程设定，<strong>不是论文实测、不是论文图表复现</strong>；“工程延伸”是据此提出的设计建议，不代表作者已实现或验证。</p>
+    </div>
+  </header>
 
-  <h2>1. 论文解决了什么盲点</h2>
-  <p>典型 cluster scheduler 采用 round-robin、最少请求数、最少 token 数或最少 KV-cache 等规则。它们优化的是一个容易观测的代理量，但 LLM 实例真正执行的是逐 iteration 的动态 batch：长 prefill 会占据大量计算，decode 又以小步、长生命周期持续占槽。两台实例即便各自承担相同 token 总数，也可能因为阶段排列不同而产生不同排队时间。</p>
-  <p>论文示例中，两种分配都让两个实例各承担 12 个 token，但平均 TTFT 分别为 2.33 和 2.17 个 iteration。这直接说明：</p>
-  <pre><code>token balance ≠ compute-layout balance ≠ latency optimality</code></pre>
-  <div class="box good">对 Agentic AI 尤其重要：同一用户任务会多次返回 LLM。每一轮 prompt 长度、生成长度和紧迫度不同；把这些调用当成无关请求，只能做到局部公平，无法优化 root request 的端到端完成时间。</div>
+  <nav class="toc" aria-label="本页章节导航">
+    <a href="#basics">一、从 token 与两个阶段开始</a>
+    <a href="#latency">二、TTFT、TBT 与达标率</a>
+    <a href="#layout-example">三、亲手排一次计算布局</a>
+    <a href="#simulator">四、模拟器如何推进状态</a>
+    <a href="#five-components">五、五个组件与数据依赖</a>
+    <a href="#migration">六、拆分执行与迁移代价</a>
+    <a href="#heuristics">七、为什么仍是启发式</a>
+    <a href="#experiments">八、怎样读实验与倍数</a>
+    <a href="#deployment">九、部署与 Agentic AI 边界</a>
+    <a href="#self-test">十、自测与解释</a>
+    <a href="#sources">原文、代码与许可</a>
+  </nav>
 
-  <h2>2. 系统模型</h2>
-  <ul>
-    <li>集群包含多个 LLM 实例，每个实例可使用一张或多张 GPU。</li>
-    <li>cluster scheduler 负责请求到实例的映射；instance scheduler 负责 continuous batching。</li>
-    <li>主要实现基于 Sarathi-Serve 风格的 chunked prefill 与 decode prioritization，同时验证了 prefill/decode disaggregation。</li>
-    <li>请求到达时知道 prompt 长度，但真实 decode 长度未知。</li>
-    <li>模型权重等静态内存可离线 profile；KV-cache 随 active tokens 动态增长。</li>
-    <li>跨实例阶段执行依赖 KV-cache 迁移，收益必须覆盖通信成本。</li>
-  </ul>
+  <section id="basics">
+    <h2>一、从 token 与两个阶段开始：GPU 到底在忙什么？</h2>
+    <p>用户看到的是一段提问和一段回答，模型看到的则是 token 序列。token 可以对应一个字、一个词的一部分或某种符号，不能直接等同于汉字数。把用户输入、系统提示、历史对话和检索材料拼接后，经分词器得到的输入长度记作 P；模型随后生成的输出长度记作 D。请求到来时，P 通常已经能够数清楚，D 却不能：模型可能很快给出结束符，也可能继续生成很长的解释。调度器因此面对一个不对称问题：已知前半程长度，预测后半程长度。</p>
+    <p><strong>Prefill，通常译作预填充，是“先把已有上下文读进去”。</strong>模型对输入位置进行计算，在因果注意力的约束下得到表示，并建立后续生成所需的历史状态。由于输入 token 在开始时已经全部存在，许多位置的运算可以并行展开。输入很长时，这一阶段会形成比较密集的 GPU 计算。这里的“并行”不意味着每个位置毫无依赖，而是底层可以利用矩阵计算一次处理多个已知位置，不必像生成未来文字那样等待未知 token 一个个出现。</p>
+    <p><strong>Decode，通常译作解码，是“依据已有上下文继续写下一个 token”。</strong>在普通自回归生成中，下一枚 token 的选择依赖前面已经生成的结果，同一个请求通常每轮只前进一步。即使 GPU 能一次容纳许多 token，也不能随意把同一请求的十个未来 token 填进同一轮。这种依赖解释了为什么长输出会长期占据服务实例：每一步看起来不大，但必须连续经历许多轮。本文的逐轮讨论不覆盖一次提出并验证多个候选 token 的推测解码；那会改变这里的状态转移规则。</p>
+    <p><strong>KV cache 是避免重复读取历史计算结果的“工作记忆”，不是模型的答案缓存。</strong>注意力层会为已经处理的位置保留 key 与 value 张量，后续 decode 复用它们，而不是从头重算全部前缀。模型权重通常常驻显存；KV 却随在途请求的上下文增长，并在请求结束、状态不再保留时释放。因此，“本轮只执行两个 decode token”与“显存里只有两个 token 的 KV”完全不同：这两个请求可能各自已经积累了数千个位置的历史。</p>
+    <div class="example">
+      <h3>教学算例 A：一次小计算，为什么需要很大的历史状态？</h3>
+      <p><strong>以下尺寸只用于教学，不是 AdaGen 测试模型参数。</strong>假设某模型有 32 层，每层使用 8 个 KV 头，每个头的维度为 128，K 与 V 每个元素各占 2 字节，暂不计对齐、分页和并行分片。每个历史 token 对应的 KV 大小约为 2 × 32 × 8 × 128 × 2 = 131,072 字节，即 128 KiB。一个已经保留 4,096 个历史位置的请求就需要约 512 MiB KV；十个这样的请求约需 5 GiB。</p>
+      <p>这十个请求下一轮可能只各产生一枚 token，总共十枚新 token，但本轮开始前的历史状态仍约为 5 GiB。实际每张卡的占用还取决于 KV 分片、张量并行、数据类型、模型结构与缓存管理器，所以这个算式只帮助区分“本轮工作量”和“驻留状态量”，不能拿去直接为任意模型配显存。</p>
+    </div>
+    <p>当多个请求同时到来，实例调度器通常采用 continuous batching：每轮重新选择能执行的请求，完成的请求退出，新请求在条件允许时加入。这里的 <strong>iteration 是一次批处理执行轮次</strong>，不是完整请求，也不是单独某个用户的一次对话。chunked prefill 会把长输入切成数轮，让已有 decode 请求不必等整个长 prompt 处理完才能继续输出。论文重点讨论的调度环境采用这种逐轮组织方式；AdaGen 所说的 compute layout，就是哪些请求的 prefill 或 decode token 被放在了哪些轮里。<a class="small" href="#sources">［论文 §2.1，PDF 第 3 页／论文集 1113 页；布局动机见第 2 页图 1］</a></p>
+  </section>
 
-  <h2>3. AdaGen 的端到端决策流</h2>
-  <ol class="flow">
-    <li><strong>形成调度窗口。</strong>把短时间窗口内的请求集合记为 <code>S_t</code>，避免逐请求贪心丢失组合优化机会。</li>
-    <li><strong>预测 decode 长度。</strong>微调 DistilBERT 输出长度上下界并取平均；论文数据上的预测准确率约 76.4%。</li>
-    <li><strong>模拟候选 compute layout。</strong>复现实例调度器的 token 选择逻辑，得到每个 iteration 中的 prefill/decode token、开始结束位置、active-token 数和 KV-cache。</li>
-    <li><strong>length-aware 初始路由。</strong>以窗口内 prompt/decode 长度 P75 为阈值划分长短阶段，优先把“长 prefill + 短 decode”与“短 prefill + 长 decode”配对，以平滑不同阶段的计算压力。</li>
-    <li><strong>distribution-aware 再平衡。</strong>按模拟 iteration 数识别 overloaded/underloaded 实例；配对最重与最轻实例，优先移动总序列较长、能快速改善布局的请求。</li>
-    <li><strong>选择性分阶段执行。</strong>对阶段特征聚类，只评估代表请求；若把 prefill 或 decode 放到其他实例能提高 SLO attainment，且收益大于 KV 迁移代价，则执行拆分。</li>
-    <li><strong>运行时校正。</strong>实际 active-token 与模拟值偏差超过 5% 时重算；当实例 SLO attainment 失衡时，优先迁移短序列，减少已生成 KV-cache 的搬运量。</li>
-  </ol>
+  <section id="latency">
+    <h2>二、先把目标说清楚：用户究竟在等哪一段时间？</h2>
+    <p><strong>TTFT（time to first token）是从请求到达计时边界，到第一枚输出 token 可用之间的时间。</strong>它不仅是模型计算 prefill 的时间，还可能包含进入调度窗口的等待、请求路由、实例排队，以及第一枚 token 产生前的实际执行。生产系统还必须说清计时边界是客户端发出请求、网关接收，还是推理引擎接收；不同边界的数据不能直接并排比较。用户看到界面迟迟没有第一个字，通常就是在经历这段等待。</p>
+    <p><strong>TBT（time between tokens）是相邻输出 token 之间的时间间隔。</strong>记请求到达时刻为 a，输出 token 的时间戳为 t<sub>1</sub>、t<sub>2</sub>、…、t<sub>D</sub>，则 TTFT = t<sub>1</sub> − a，相邻间隔为 t<sub>j</sub> − t<sub>j−1</sub>。当 D &gt; 1 时，请求的平均间隔可以写成 (t<sub>D</sub> − t<sub>1</sub>) / (D − 1)。只有一枚输出时没有相邻间隔，不能把分母当作一。实际监控也应区分单请求平均 TBT、所有 token 间隔的分位数和最差停顿；平均流畅不等于没有明显卡顿。</p>
+    <p>有些引擎在最后一轮 prefill 的输出中就能够采样第一枚生成 token，另一些用于分析的布局会把首枚输出单独画成下一轮 decode。<strong>因此不能不看记账约定，就一概宣称“prefill 完成时间就是 TTFT”，或者“TTFT 必须再加一整轮”。</strong>下面的手算采用后者，明确把第一枚输出记在下一轮 decode 的结束位置；这是为了让格子图容易核算，不是对所有引擎的统一规定。</p>
+    <div class="example">
+      <h3>教学算例 B：早开口与说得快，不是同一个目标</h3>
+      <p><strong>假设请求从网关收到时开始计时，输出共有 11 枚 token。</strong>方案甲的第一枚在 200 ms 出现，之后每隔 40 ms 一枚，则最后一枚约在 200 + 10 × 40 = 600 ms 出现。方案乙第一枚在 300 ms 出现，之后每隔 20 ms 一枚，最后一枚约在 500 ms 出现。甲的 TTFT 更好，乙的 TBT 和总完成时间更好。若服务目标是 TTFT 不超过 250 ms、TBT 不超过 30 ms，两者都不能同时满足目标。</p>
+      <p>这说明“更低延迟”必须落实到具体指标。某个调度方案改善首 token 的等待，并不自动证明整个回答更快完成，更不自动证明多轮智能体任务完成得更快。</p>
+    </div>
+    <p>SLO 是服务希望满足的延迟目标。对 N 个请求，TTFT SLO attainment 可理解为满足各自 TTFT 门限的请求数除以 N；如果所有请求共用门限 τ，就逐个检查 TTFT ≤ τ。它衡量的是“多少请求合格”，并不是平均时间。由于合格与不合格之间存在一道门槛，一次很小的时间改善也可能让很多处在门槛附近的请求一起达标；另一次很大的时间改善则可能仍没有把严重超时的请求救回来。读 AdaGen 的实验时，应始终把“布局改善”“时间改善”和“达标率改善”分开。<a class="small" href="#sources">［论文 §2.1，PDF 第 3 页；SLO 设置与结果见 §6.1–6.2，第 11–12 页］</a></p>
+  </section>
 
-  <h2>4. Compute-layout simulator</h2>
-  <p>模拟器不是只估算一个请求的 standalone latency，而是模拟请求之间如何在 iteration 中相互阻塞。其关键状态包括：</p>
-  <table>
-    <thead><tr><th>状态</th><th>用途</th></tr></thead>
-    <tbody>
-      <tr><td>每个请求的 prompt、预测 decode 长度</td><td>估计请求生命周期和阶段组合。</td></tr>
-      <tr><td>每 iteration token budget</td><td>复现 chunked-prefill 与 decode admission。</td></tr>
-      <tr><td>active-token 数 \(C_A\)</td><td>由每 token KV 大小推导动态 KV-cache 占用。</td></tr>
-      <tr><td>prefill 完成 iteration \(i\)</td><td>计算 TTFT，并约束 decode 不能早于 \(i+1\)。</td></tr>
-      <tr><td>KV 迁移完成 iteration \(k\)</td><td>跨实例 decode 的起点为 \(j=\max(i+1,k)\)。</td></tr>
-      <tr><td>实例静态显存与硬件 profile</td><td>避免权重、workspace 与 KV-cache 总量溢出。</td></tr>
-    </tbody>
-  </table>
-  <p>论文报告模拟器 TTFT/TBT 估计准确率分别为 99.01% 和 98.83%，0.7 秒生成布局，而真实执行需 3.19 秒，约快 4.6 倍。</p>
+  <section id="layout-example">
+    <h2>三、亲手排一次计算布局：总 token 数为什么不够？</h2>
+    <p>单纯最少请求数的路由规则，把一条很短的查询与一条很长的文档总结看作同样的“一个请求”。最少 token 数规则向前迈了一步，却仍可能把不同阶段压成一个总量。最少 KV 占用又提供了显存视角，但不直接告诉我们未来多少轮会有 decode 持续占位，也不知道新来的 prefill 会被挤到哪里。这些指标都有价值，问题是它们不是完整的执行时间线。</p>
+    <div class="example">
+      <h3>教学算例 C：相同的十二个 token，不同的首 token 时间</h3>
+      <p><strong>以下为本教程自建的四请求离散模型，不是论文中的图例或实测。</strong>两个相同实例都从空闲开始，四个请求在时刻零同时到达。A、B 各有 P = 5、D = 1；C、D 各有 P = 1、D = 5。每个请求都是六个 token 的总工作量。每轮预算为四个 token，持续时间固定为 10 ms，decode 优先，每个已就绪请求一轮最多一个 decode token；剩余位置按请求顺序填 prefill。prefill 本轮完成的请求，下一轮才允许 decode。无显存不足、无通信开销、无新请求到达。</p>
+      <p>方案甲把 A、B 放在实例一，C、D 放在实例二；方案乙把 A、C 放在实例一，B、D 放在实例二。两种方案中，每台实例都是两个请求、十二个 token，任何只看这两个数字的路由器都难以区分它们。下表的“P<sub>A</sub> × 4”表示处理 A 的四枚输入 token，“D<sub>A</sub>”表示 A 前进一步生成一枚输出。</p>
+      <table>
+        <caption>教学布局；所有请求均在零时刻到达，轮末产生输出</caption>
+        <thead><tr><th scope="col">轮次</th><th scope="col">甲：实例一（A、B）</th><th scope="col">甲：实例二（C、D）</th><th scope="col">乙：实例一（A、C）</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">1</th><td>P<sub>A</sub> × 4</td><td>P<sub>C</sub>、P<sub>D</sub></td><td>P<sub>A</sub> × 4</td></tr>
+          <tr><th scope="row">2</th><td>P<sub>A</sub> × 1、P<sub>B</sub> × 3</td><td>D<sub>C</sub>、D<sub>D</sub>，两者首 token</td><td>P<sub>A</sub> × 1、P<sub>C</sub> × 1</td></tr>
+          <tr><th scope="row">3</th><td>D<sub>A</sub>，A 完成；P<sub>B</sub> × 2</td><td>D<sub>C</sub>、D<sub>D</sub></td><td>D<sub>A</sub>、D<sub>C</sub>，两者首 token</td></tr>
+          <tr><th scope="row">4</th><td>D<sub>B</sub>，B 完成</td><td>D<sub>C</sub>、D<sub>D</sub></td><td>D<sub>C</sub></td></tr>
+          <tr><th scope="row">5–6</th><td>空闲</td><td>每轮 D<sub>C</sub>、D<sub>D</sub>，第 6 轮完成</td><td>每轮 D<sub>C</sub></td></tr>
+          <tr><th scope="row">7</th><td>空闲</td><td>空闲</td><td>D<sub>C</sub>，C 完成</td></tr>
+        </tbody>
+      </table>
+      <p>乙的实例二与实例一对称，只需把 A、C 换成 B、D。甲的四个 TTFT 为 30、40、20、20 ms，平均 27.5 ms；乙的四个 TTFT 全为 30 ms，平均 30 ms。如果 TTFT 门限为 20 ms，甲有两个请求达标，attainment 为 50%；乙没有请求达标，为 0%。这里不能计算“甲是乙的多少倍”，因为分母是零；只能说提高了 50 个百分点。</p>
+      <p>不过，甲并不是对每个请求都更好：B 从乙的 30 ms 变成了 40 ms。这是一个刻意保留的提醒——群体指标改善可能伴随个体退步。算例也没有证明“相似请求永远应该同组”，更没有模拟真实 GPU 上不同轮次的耗时变化；它只严格证明，在所列假设下，相同请求数与相同总 token 数不能唯一确定 TTFT 或达标率。</p>
+    </div>
+    <p>计算布局因此需要两个维度：横向是某一轮还能容纳哪些 token，纵向是这些 token 出现在哪些轮。decode 看似只占一格，却可能连续许多轮都占着那一格；长 prefill 可以占一整排，也可以被分割后与 decode 交错。AdaGen 的出发点不是否定负载均衡，而是认为均衡必须建立在这种阶段和时间分布上。尤其不能把“GPU 利用率高”直接当作“所有用户等待都短”：一个一直满载、但把短请求挡在长请求后面的实例，同样可能表现很差。<a class="small" href="#sources">［论文图 1、§2.2 及后续动机实验，PDF 第 2–6 页／论文集 1112–1116 页］</a></p>
+  </section>
 
-  <h2>5. 为什么要做阶段拆分</h2>
-  <p>一个请求的 prefill 和 decode 对资源的压力完全不同。prefill 倾向于高并行、高算力密度；decode 单步计算小，但持续占用 KV-cache 并对 TBT 敏感。若源实例 prefill 拥塞而另一个实例 decode 压力较低，可以在源实例完成 prefill 后迁移 KV-cache，再在目标实例 decode。</p>
-  <p>AdaGen 用三类布局特征对实例评分：总 prefill tokens、总 decode tokens、最后一个 prefill iteration 的平均 prefill tokens。特征按跨实例最大值归一化后求和，高分实例作为 source，低分实例作为 destination。它再用 DBSCAN（论文参数 \(\epsilon=10^{-7}\)）压缩待评估阶段，只对每个 cluster 的代表请求做收益估计。</p>
-  <pre><code>执行迁移当且仅当：
-预测的 ΔSLO attainment
-  &gt; KV 迁移造成的排队、链路占用和执行停顿</code></pre>
+  <section id="simulator">
+    <h2>四、模拟器不是算一个时长，而是推进一组受约束的状态</h2>
+    <p>如果每尝试一种请求分配，都真正在 GPU 上执行一次，调度就比服务本身还慢。AdaGen 因而需要一个便宜的“假执行”：保留实例调度规则和状态依赖，但不运行模型的矩阵运算。模拟器接收候选路由、已有实例状态、请求长度，以及资源约束，输出逐轮布局和相应的延迟估计。重要的是，<strong>它模拟的是调度行为，不是再次生成一遍回答</strong>；不需要知道回答文字本身，却必须知道或预测工作会持续多久。</p>
+    <table>
+      <caption>理解模拟器所需的数据字典；符号为本教程统一记法</caption>
+      <thead><tr><th scope="col">状态或输入</th><th scope="col">含义</th><th scope="col">为什么下游需要它</th></tr></thead>
+      <tbody>
+        <tr><td>P<sub>r</sub><sup>rem</sup>、D̂<sub>r</sub><sup>rem</sup></td><td>请求 r 剩余输入量、预测剩余输出量</td><td>决定下轮可执行阶段，以及预计结束并释放资源的时间。</td></tr>
+        <tr><td>阶段与就绪时间</td><td>等待、prefill、等待 KV、decode、完成</td><td>防止尚未得到上下文的 decode 提前执行。</td></tr>
+        <tr><td>本轮 token 预算</td><td>实例这一轮最多接纳的计算 token 数</td><td>决定优先 decode 后，还能放入多少 prefill。</td></tr>
+        <tr><td>C<sub>A</sub> 与每 token KV 大小</td><td>仍驻留的历史 token 数及对应内存成本</td><td>检查显存容量，不能与本轮 token 数混淆。</td></tr>
+        <tr><td>prefill/输出时间记录</td><td>输入完成位置、首枚及后续输出位置</td><td>据此计算 TTFT、TBT，而不只是全部请求的完工轮次。</td></tr>
+        <tr><td>候选路由与 KV 所在实例</td><td>每个阶段在哪执行，状态是否已到达</td><td>串联跨实例执行，并把通信等待纳入布局。</td></tr>
+      </tbody>
+    </table>
+    <p>先看不发生迁移的一轮。模拟器检查哪些请求的 prefill 已经完成，哪些仍有预测的 decode 工作，然后依据实例的优先级规则为它们分配位置。对于普通逐 token decode，一个请求本轮至多推进一步。随后用剩余预算填充尚未完成的 prefill chunk。轮末更新剩余长度、完成位置和 KV 占用；若请求结束，则移除其不再需要的状态。进入下一轮时，刚完成 prefill 的请求才成为新的 decode 候选。这个“先判断就绪，再分配，再更新”的顺序很重要：如果分配过程中刚把 prefill 置为完成，就立即在同一轮追加该请求的 decode，会违反这里采用的时间模型。</p>
+    <p>把教学算例 C 中甲的实例一代入：第一轮后 A 剩余输入 1、B 剩余输入 5；第二轮后 A 输入完成、B 还剩 2。第三轮 A 先生成唯一输出，B 才利用剩余预算完成输入。若在第二轮刚处理完 A 的最后一枚输入时就让它立即 decode，A 的 TTFT 会被错误地提前。类似地，如果因为 A 已经生成首 token 就释放整个请求的 KV，也会低估还在继续生成的长输出请求的内存需求。</p>
+    <p>遇到显存约束时，还要检查“分得进本轮”是否等于“放得进显存”。前者受 token budget 限制，后者受权重、工作区、已驻留 KV 与新增 KV 共同限制。论文模拟的实例规则中，若轮内仍有位置、显存却不足以处理 decode token，就抢占最低优先级请求；通常最新到达者优先级最低。C<sub>A</sub> 随新增计算 token 增加，随请求完成或被抢占而扣除相应 token 数；跨实例重新分配时还要从源扣除、向目标增加。静态内存部分则按模型与硬件配置 profile。这些步骤使“等待、抢占、释放、迁移”成为显式状态变化，不能靠把未完成请求偷偷标成完成来解决容量冲突。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=7">［论文 §4.2，PDF 第 7–8 页］</a></p>
+    <p>状态快照也会随真实执行而过时。由于当前调度可能与上一批执行重叠，规划时不能假定上一批的真实结束状态已经可用，先要依据上一批最终布局估计 C<sub>A</sub>。等上一批执行完成后，论文检查真实值；若估计偏差超过 5%，再按实际值重算后续步骤。这里的 5% 针对<strong>状态估计偏差</strong>，不是“某请求的 TTFT 超标 5% 就迁移”，更不是预测器正确率门限。重新建立准确状态与随后选择是否迁移是两个决策，不应混写成一个自动触发规则。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=8">［论文 §4.2，PDF 第 8 页／论文集 1118 页］</a></p>
+    <p>最后，轮数本身不是毫秒。教学算例故意固定每轮 10 ms，但实际轮时会随 prefill/decode 组成、上下文、batch 大小、模型和硬件改变。一个可信的落地版本必须让布局估计与实际执行时间模型保持一致，并定期校准。不能只因候选方案减少了一轮，就断言节省了固定的时间。模拟误差还分为两类：其一是“长度给对了，是否复现了调度与时间”；其二是“未来输出长度本来就猜错了”。这两类误差影响不同，不该混成一个笼统的“预测准确率”。</p>
+  </section>
 
-  <h2>6. 实现与评估</h2>
-  <p>原型基于 vLLM，扩展约 3,407 行 Python，使用 Ray actors、FlashAttention 和 NCCL。真实测试床为 8 张 H100-80GB，覆盖 Llama3-8B、Mixtral-8×7B 和 Llama3-70B；数据集包括 BurstGPT、OpenChat 与 Azure LLM trace，每组随机抽取 8,000 个请求。</p>
-  <div class="grid">
-    <div class="card"><div class="metric">最高 2×</div><p>相对 Llumnix++ 的 TTFT SLO attainment。</p></div>
-    <div class="card"><div class="metric">最高 3.6×</div><p>相对 round-robin 的 TTFT SLO attainment。</p></div>
-    <div class="card"><div class="metric">1.7×–2×</div><p>基线达到相近 attainment 所需的额外实例量。</p></div>
-    <div class="card"><div class="metric">2.3 秒 vs 9 天</div><p>20 请求、2 实例时启发式与 exhaustive search 的决策时间。</p></div>
-  </div>
-  <p>在 disaggregated instance scheduler 上仍有最高 1.6× 改善；500 实例模拟中相对 Llumnix++ 和 round-robin 分别最高 1.9×、3.6×。decode predictor 约 50ms，正常 KV-cache 通信停顿约 22ms。</p>
+  <section id="five-components">
+    <h2>五、五个组件是一条反馈链，不是五条互不相关的优化建议</h2>
+    <p>为了看清数据流，我们把系统按五个主体组件展开：计算布局模拟器、长度感知初始调度、分布感知再平衡、选择性分布式执行、运行时校正。输出长度预测是这些组件共同依赖的上游输入，而不是一个能独立决定最佳 GPU 的神奇分类器。论文使用微调的 DistilBERT 型预测器，输出 decode 长度上下界，再取两者平均作为预测长度；这个区间不能未经校准就理解为具有特定覆盖率的统计置信区间。调度窗口收集一批待安排请求；预测器给出长度估计；初始路由产生候选方案；模拟器将方案变成布局；后两步继续修改布局；运行时观测再反过来修正下一次决策。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=7">［论文 §4.1–4.2，PDF 第 7 页／论文集 1117 页］</a></p>
+    <p>这里的窗口还要区分“请求集合大小”和“强制等待时间”。论文把 |S<sub>t</sub>| 设为平均一秒内到达的请求数，并让 S<sub>t</sub> 的调度与 S<sub>t−1</sub> 的执行重叠，以隐藏调度计算；这不等于可以宣称每个请求的收集等待都已消失。附录以 Llama3-8B、60 请求/s 为例选择集合大小 60：再小不易看见足够的请求多样性，再大会增加收集与调度时间，影响重叠效果。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=17">［论文 §4.1，第 7 页；附录 A.2，PDF 第 17 页］</a></p>
+    <div class="formula" aria-label="AdaGen 数据依赖概览">
+      请求与已有实例状态 → 长度估计 → 初始路由 → 模拟布局<br>
+      模拟布局 → 分布再平衡 → 更新布局 → 选择性阶段拆分<br>
+      实际执行与 KV 状态 → 误差检测 / 运行时迁移 → 下一轮状态快照
+    </div>
+    <h3>组件一：模拟器把“路由”翻译成可评价的结果</h3>
+    <p>它的输入不是孤立的一个请求，而是一种分配方案及与其相互影响的在途请求。输出也不止一个平均时长：哪些轮有空位、哪些轮的 prefill 被阻塞、各请求何时首发、什么时候完成、KV 会如何增长，都是后续优化需要的数据。于是“试着搬一个请求”变成了一个可检查的假设：修改候选分配，重新推进受影响的布局，再看指标是否变好。这解释了为什么模拟器是整个方法的公共基础设施，而不是完成一次初始分配后就可以丢掉的辅助模块。</p>
+    <h3>组件二：长度感知初始调度，先把阶段形状看见</h3>
+    <p>如果只按 P + D 排序，那么长输入短输出和短输入长输出可能被视作同样长，尽管它们在布局里完全不同。长度感知先分别看输入与输出，把“长 prefill / 短 decode”和“短 prefill / 长 decode”这样的阶段组合区分开。论文的理由是：在 decode 优先的实例内，长 prefill 如果与长 decode 共处，前者会持续等待可用位置。因此，AdaGen 让一半实例组合较长的 prefill 与较短的 decode，另一半实例组合较短的 prefill 与较长的 decode。<strong>这里组合的是阶段，不是把两类相反的完整请求一律混放。</strong></p>
+    <table>
+      <caption>论文 §4.3 的初始阶段安排；这是论文机制，不是前面的教学算例</caption>
+      <thead><tr><th scope="col">请求类型</th><th scope="col">prefill 所在实例组</th><th scope="col">decode 所在实例组</th><th scope="col">阶段关系</th></tr></thead>
+      <tbody>
+        <tr><td>长 P、短 D</td><td>第一半实例</td><td>第一半实例</td><td>两个阶段同实例执行。</td></tr>
+        <tr><td>短 P、长 D</td><td>第二半实例</td><td>第二半实例</td><td>两个阶段同实例执行。</td></tr>
+        <tr><td>长 P、长 D</td><td>第一半实例</td><td>第二半实例</td><td>两个阶段拆到不同实例。</td></tr>
+        <tr><td>短 P、短 D</td><td>第二半实例</td><td>第一半实例</td><td>两个阶段也拆到不同实例。</td></tr>
+      </tbody>
+    </table>
+    <p>最后一行容易被忽略：两个阶段都短，不意味着论文初始规则一定让它们留在同一实例。初始分类追求两类实例的阶段组合；阶段间仍要传 KV，所以论文结合 Llumnix 的多阶段迁移方式，并尽量选择通过 NVLink 等高带宽链路连接的实例。后续再平衡和选择性分布式执行会继续修改初始方案，不能把这张表当作最终路由不再变化的承诺。<a class="small" href="#sources">［论文 §4.3，PDF 第 8 页／论文集 1118 页］</a></p>
+    <p>“长”“短”也不是某个永远有效的绝对长度。论文分别计算当前窗口 S<sub>t</sub> 中 prefill 与 decode 长度的第 75 百分位数 P75：超过相应分界算长，否则算短。输入和输出使用各自的分界，不是对 P + D 使用一个共同门限；分布有大量相同长度时，也不能机械地认为一定恰好四分之一请求被判为长。如果流量从短问答转成大量长上下文总结，窗口分界会随之改变。输出长度由预测而来，一个被误判为短输出的请求可能长期驻留，破坏预期布局，这正是后续再平衡与反馈仍然必要的原因。<a class="small" href="#sources">［论文 §4.3，PDF 第 8 页；代码差异见资料来源说明］</a></p>
+    <h3>组件三：分布感知再平衡，修正“种类分对了、数量却失衡”</h3>
+    <p>即使长度分组完全正确，也可能因为某一类请求突然特别多，使一组实例需要执行很久，另一组很早就空闲。这里需要读取初始方案模拟出来的完成轮数、空位分布与每个请求的长度，而不是重新回到只看请求个数。论文以实例布局的 iteration 数是否高于或低于平均值形成过载组与欠载组，再将轮数最多的与最少的实例配对。在这一步，重新分配的是请求的<strong>两个阶段一起移动</strong>，优先考虑 prefill + decode 总序列较长的请求，以较少次改动消除更多不均衡。<a class="small" href="#sources">［论文 §4.3，PDF 第 8 页］</a></p>
+    <p>这一步主要修正工作量在实例间的分布，不能只从空位总数判断可行性。某个目标实例虽然累计有很多空格，但它们全部出现在请求 prefill 完成之前，就不能承接这个请求尚未就绪的 decode。必须保留“空位在哪一轮”的信息，并在改动后重新评价布局。长序列优先是降低搜索成本的经验选择，不是“所有情况下先移最长就最优”的数学定理。<a class="small" href="#sources">［论文 §4.3，PDF 第 8 页；代码入口 distribution_aware_scheduling］</a></p>
+    <h3>组件四：选择性分布式执行，进一步利用阶段差异</h3>
+    <p>完整请求的移动仍然把 prefill 与 decode 捆绑在一起。如果实例甲适合尽早完成输入、实例乙更适合持续输出，那么可能只移动其中一个阶段更合适。这个组件在现有布局上挑选值得评估的源与目标，再比较阶段拆分前后的延迟收益与通信影响，而不是宣布从此所有请求都必须走固定的 prefill 池和 decode 池。</p>
+    <p>但候选阶段、源实例、目标实例的组合很多。论文先为实例提取三类布局特征：prefill token 总数、decode token 总数，以及请求最后一轮 prefill 中的平均 prefill token 数。每项分别除以跨实例的该项最大值，再把归一化结果相加，以高分实例和低分实例配对作为候选源与目标。最后一项引入了 prefill 收尾轮的布局形状，使评分不再只剩两个总量；不过，这仍是候选筛选的代理评分，不是直接计算出来的 TTFT，也不能把分数单位理解成毫秒。<a class="small" href="#sources">［论文 §4.4.1，PDF 第 9 页／论文集 1119 页］</a></p>
+    <p>随后，对源实例中的 prefill 阶段和 decode 阶段分别聚类。prefill 的特征向量包含“该请求的 prefill 长度、会受影响请求的总 token 数、受影响请求最后一轮 prefill 的平均 prefill token 数”；decode 向量把第一项换成该请求的 decode 长度。于是相似性不只由被移动请求自身决定，也考虑它腾出位置后可能影响的其他请求。论文用欧氏距离的 DBSCAN，邻域参数 ε = 10<sup>−7</sup>，每个簇随机选一个代表。这个具体参数依赖特征定义与尺度，不能当成跨实现通用的调度常数。<a class="small" href="#sources">［论文 §4.4.2，PDF 第 9 页］</a></p>
+    <p>代表候选也不是选中后就直接迁移。先检查目标 KV 显存是否足够；可行时，仅对重新分配的那个阶段重模拟，再利用布局位置的启发式更新其他阶段以及受影响请求的开始、结束位置，同时施加 prefill 必须先结束、KV 必须先到达等约束。最后比较计入这些变化后的 SLO attainment，只选净改善为正的候选。这个“只重模拟一部分，其余用位置估计更新”的设计，是控制搜索成本的重要环节，也意味着不能把整个评估过程误称为对全部候选进行完全精确的全局模拟。<a class="small" href="#sources">［论文 §4.4、算法 1，PDF 第 9–10 页］</a></p>
+    <p>位置更新也必须区分阶段。源实例腾出位置后，prefill 的开始和结束位置可分别按其前方新增空位向左压紧，跨过行首就回到上一轮；decode 的首 token 也可相应前移，但不能把后续 token 当成任意独立格子全部塞进同一轮。论文让 decode 的结束位置随首 token 的移动量调整，再施加阶段依赖；目标实例则进行容纳新阶段后的向右调整。正是“一轮可处理多个 prefill、却只能处理同请求一个普通 decode”的差异，使两个阶段不能共用一个简单压缩公式。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=10">［论文 §4.4.2、图 10–11，PDF 第 10 页］</a></p>
+    <p>聚类降低的是决策开销：它希望避免反复评估非常相似的改动。但随机代表可能漏掉同组中实际上更合适的请求，局部位置估计也可能累积误差。把这些步骤视作有结构的搜索近似，比把 DBSCAN 当作直接保证延迟最优的算法更准确。这也是为什么上一步的长度分类、这一步的候选收益与运行后的误差反馈必须连起来理解。</p>
+    <h3>组件五：运行时校正，让预测错误进入下一次决策</h3>
+    <p>真实输出结束时刻不能被先验完全知道。实际生成比预测更长，会让 decode 继续占轮次和 KV；比预测更短，则留下原计划没预料到的空位。运行时除校正模拟状态外，还依据 SLO attainment 门限选出低达标率源实例与高达标率目标实例，将最差与最好者配对，考虑迁移在途请求。这里优先迁移短序列，以减少已生成 KV 的搬运量，与规划阶段关注长序列以尽快消除负载差异并不矛盾。论文开销评估中的这种 on-demand rescheduling 周期为每 100 秒；这属于其评估配置，不能直接当作所有服务合适的反馈周期。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=11">［论文 §4.5，第 11 页；周期见 §6.5，PDF 第 13 页］</a></p>
+    <p>把这条反馈链理解为控制系统更容易：长度估计是对未来的预测，模拟器是系统模型，路由与迁移是动作，实际 active tokens 与延迟是反馈。任何一环太慢、太旧或太乐观，都可能使好方案变成坏决策。实践中可以为噪声留出触发余量、限制迁移频率，避免请求在实例间来回搬运；这些属于本文的工程建议，不是这里已经验证过的论文配置。<a class="small" href="#sources">［运行时机制：论文 §4.5，PDF 第 10–11 页／论文集 1120–1121 页］</a></p>
+  </section>
 
-  <h2>7. 对 Agentic AI 调度的直接启示</h2>
-  <ol>
-    <li><strong>预测对象不能只有 output length。</strong>还要预测剩余轮数、下一轮 prompt 增量、工具等待时间和该轮是否为最终用户响应。</li>
-    <li><strong>布局模拟要升级为会话 DAG 模拟。</strong>当前 sub-request 结束后可能等待工具，也可能很快生成下一轮；这会影响保留 KV、队列位置与 GPU 选择。</li>
-    <li><strong>优化目标应从单次 TTFT 扩展到 root request。</strong>内部 reasoning 可以采用 relaxed TBT，最终 synthesis 的 TTFT/TBT 更严格。</li>
-    <li><strong>预测不必完美。</strong>论文表明 76.4% 的长度预测配合模拟与纠偏仍有效；关键是显式维护置信度和回退路径。</li>
-  </ol>
+  <section id="migration">
+    <h2>六、拆分执行不是“换一个 GPU 名字”：KV 何时到达？</h2>
+    <p>如果 prefill 在甲上完成、decode 在乙上继续，那么乙必须拥有对应请求的 KV 状态以及一致的请求进度。没有这份状态，乙不是“继续生成”，而是需要重新处理前缀或等待传输。请求看起来只是在路由表中换了目的地，数据平面实际上要完成显存分配、张量传输、完成确认与阶段切换。因此，论文的选择性执行需要同时维护阶段依赖和通信依赖。</p>
+    <div class="formula" aria-label="跨实例解码就绪条件">
+      在统一轮次记账下：j<sub>decode-start</sub> = max(i<sub>prefill-end</sub> + 1, k<sub>KV-ready</sub>)<br>
+      在实际时间轴上：可开始时刻 ≥ max(计算依赖就绪时刻, KV 到达时刻, 目标调度允许时刻)
+    </div>
+    <p>第一行中的 k 表示目标实例已经能够使用 KV 的轮次，而不是“发送调用开始”的轮次。如果两个实例的轮时不同，或者正在异步推进，就不能直接比较各自本地的轮次编号；需要换算到共同的时间轴。即使数据已经到达，目标实例也可能没有本轮 token 预算或显存余量。把等待网络、等待目标队列与实际 decode 都算进去，才能判断拆分是否真的更快。</p>
+    <div class="example">
+      <h3>教学算例 D：省下排队，却可能输给传输</h3>
+      <p><strong>假设某请求的 KV 需要传 256 MiB，链路有效吞吐为 32 GiB/s，没有共享拥塞。</strong>只计算数据搬运，下界约为 256 / 32,768 秒，即 7.8 ms。再假设同步、目标接纳和不可重叠的其他等待共 12 ms，则总新增等待约 19.8 ms。如果改变布局预计能节省 50 ms，简化净收益约为 30.2 ms；若只节省 10 ms，迁移就更差。这里的吞吐是应用得到的有效吞吐，不是网卡包装上的峰值带宽。</p>
+      <p>若同样数据只能获得 4 GiB/s，有效搬运时间就变成约 62.5 ms，再加 12 ms 的等待，原先预计节省 50 ms 的迁移也不划算了。这个算例没有考虑传输重叠、并发迁移和发送期间继续增长的 KV，因此只能说明判断方向，不能替代真实通信模型。</p>
+    </div>
+    <p><strong>还要注意量纲：</strong>不能写成“ΔSLO attainment 大于通信毫秒数”，因为一个是比例，一个是时间。正确思路是先把通信造成的等待纳入候选布局，得到每个请求的新 TTFT/TBT，再按同一 SLO 门限计算新旧达标率并比较。若使用某种统一收益函数，也必须明确如何把不同代价映射到同一目标中。旧式口号“收益覆盖代价”只有补上这一步，才算可实现的判断。<a class="small" href="#sources">［论文 §4.2、§4.4 中的依赖与通信处理，PDF 第 7–10 页；量纲解释为本教程分析］</a></p>
+  </section>
 
-  <h2>8. 局限与复用风险</h2>
-  <ul>
-    <li>真实测试床只有 8 张 H100；500 实例结果是调度模拟，未覆盖完整网络竞争。</li>
-    <li>收益依赖高速互联；低带宽环境会显著缩小可迁移候选集合。</li>
-    <li>尚未联合优化 prefix caching、adapter locality 和多租户优先级。</li>
-    <li>阈值与评分含经验参数；公开代码是研究原型，应以论文算法为规范重新审计。</li>
-  </ul>
+  <section id="heuristics">
+    <h2>七、名字里有 Latency-Optimal，为什么实现仍然是启发式？</h2>
+    <p>若有 N 个请求、M 个实例，仅为每个请求选择一个实例就有 M<sup>N</sup> 种映射；再允许两个阶段分别选择实例，朴素组合空间会更大。这个表达式只说明搜索空间的膨胀，不是对论文复杂度证明的替代。在线调度还必须在请求仍然愿意等待的时间里完成，所以算法先用长度特征得到起点，再用再平衡和选择性拆分逐步改进，而不是在任意规模上穷举所有路由、顺序、阶段与迁移时间。</p>
+    <p>分组、按长度挑请求、按布局特征评分、聚类选代表，都是在表达“哪些候选更值得花时间试”。其局限来自它们丢弃的信息。例如，按长度相近归一类，并不能保证两个请求有相同的剩余 SLO 余量；两台实例有相近总工作量，也不保证空闲轮次恰好对齐；只试某个聚类代表，则可能错过组内真正合适的 KV 大小或阶段完成位置。这里应把“找到较好方案”与“证明全局最优”严格区分，不能因为标题带有 optimal 就向读者承诺后者。</p>
+    <p>输出长度估计还会发生分布漂移。一个在普通问答上表现不错的估计器，面对代码生成、严格 JSON 输出或长链式推理时，误差分布可能变化。一个总体准确率无法告诉我们最危险的低估发生在哪里：平均误差不大，但若少数请求被严重低估，它们持续占用 KV 并拖长队列，尾延迟仍可能恶化。相反，高估也会让规划过于保守、错失本来能接纳的请求。工程上应分别统计低估、过估及其对 SLO 的影响；这是本文建议的分析方式，不是替论文补出来的实验结果。</p>
+    <p>还有一个容易忽略的成本是调度本身。扩大窗口有利于看到请求组合，却让先到的请求多等；更精细的模拟能提高判断质量，却消耗 CPU 时间；更多候选搜索可能找到更好布局，却可能使快请求在控制面就耗尽余量。因此部署时应该观察“计入调度和窗口等待后的端到端收益”，而不是只比较 GPU 执行阶段。即使论文在某个小规模案例中接近穷举解，也不能据此推断所有流量、任意窗口与所有实例规模都同样接近最优。</p>
+  </section>
 
-  <h2>资料来源</h2>
-  <ul>
-    <li><a href="https://2026.eurosys.org/papers.html">EuroSys 2026 accepted papers</a></li>
-    <li><a href="https://dl.acm.org/doi/10.1145/3767295.3769345">ACM DOI 页面</a></li>
-    <li><a href="https://dl.acm.org/doi/pdf/10.1145/3767295.3769345">论文 PDF</a></li>
-    <li><a href="https://github.com/ss7krd/workload-adaptive-llm-cluster-scheduler">公开代码仓库</a></li>
-  </ul>
-  <footer>报告基于公开论文与公开 artifact；检索日期：2026-09-14。</footer>
+  <section id="experiments">
+    <h2>八、怎样读实验：先看分母、门限与测试条件，再看倍数</h2>
+    <p>论文的实验不能被压缩成几个孤立的大数字。一次完整阅读应先回答：比较的是哪种模型、多少实例、每实例多少 GPU、什么到达流量、怎样设置 TTFT/TBT 门限，以及基线到底实现了什么。“实例数”不等于“GPU 数”：一个较大模型的单个服务实例可能跨多张卡。用同样八张 GPU 运行小模型的多副本与大模型的并行实例，不意味着拥有相同数量的调度目的地。</p>
+    <p>论文真实测试床由两台服务器组成，每台四张 H100-80GB，服务器内使用 NVLink，服务器间带宽约 70 Gbps。这里要区分机内互联与机间链路：它们不是同一种传输条件，也不能把 70 Gbps 当作每个请求随时独享的有效吞吐。原型基于 vLLM，扩展约 3,407 行 Python，使用 Ray、FlashAttention 与 NCCL；这些说明实现依托了什么软件栈，不意味着不同版本的现代引擎可以不经适配就直接运行。<a class="small" href="#sources">［论文 §5、§6.1，PDF 第 11 页／论文集 1121 页］</a></p>
+    <table>
+      <caption>论文 §6.1 表 1 及正文的默认配置；请求率与 SLO 缩放实验会改变对应变量</caption>
+      <thead><tr><th scope="col">模型</th><th scope="col">模型并行与实例数</th><th scope="col">TTFT 门限</th><th scope="col">TBT 门限</th><th scope="col">默认请求率</th><th scope="col">对应数据集</th></tr></thead>
+      <tbody>
+        <tr><td>Llama3-8B</td><td>8 个单卡实例</td><td>0.2 s</td><td>0.10 s</td><td>60 请求/s</td><td>BurstGPT</td></tr>
+        <tr><td>Mixtral-8×7B</td><td>TP = 2；4 个实例</td><td>2.0 s</td><td>0.15 s</td><td>20 请求/s</td><td>OpenChat</td></tr>
+        <tr><td>Llama3-70B</td><td>TP = 2、PP = 2；2 个实例</td><td>2.5 s</td><td>0.18 s</td><td>8 请求/s</td><td>Azure LLM conversation</td></tr>
+      </tbody>
+    </table>
+    <p>TP 是张量并行，把一次模型计算分布到多卡；PP 是流水线并行，把模型层分成多个阶段。上表因而仍然使用同样八张卡，但可选择的实例数分别为八、四、二。论文从每个数据集随机选取 8,000 个请求，把对话中每次交互作为独立请求；这不是保留完整依赖关系的多轮智能体任务实验。除 Azure LLM 外，另两个数据集不带时间戳，作者用泊松到达过程生成到达时间。SLO 也是按模型经验设置的，而不是这些数据集附带的统一行业标准。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=11">［论文 §6.1，PDF 第 11 页；TP/PP 的入门解释为本教程补充］</a></p>
+    <p>该论文将一个一秒窗口内满足 SLO 的请求数占该窗口请求总数的比例作为 attainment，TTFT 从请求到达系统时开始计时。复现时应同时固定模型配置、请求序列、到达过程、窗口与门限，而不是把“同一个数据集名称”当作“同一次实验”。不同窗口的请求量若不一样，简单平均窗口比例与把全部请求合并后求比例也可能不同，因此汇总口径需要一并说明。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=11">［论文 §6.1–6.2.1，PDF 第 11 页；汇总口径解释为本教程补充］</a></p>
+    <div class="example">
+      <h3>教学算例 E：“两倍达标率”为什么不等于“延迟减半”？</h3>
+      <p><strong>假设相同门限、相同请求集合与相同到达率下，基线 1,000 个请求中有 400 个达标，AdaGen 有 800 个达标。</strong>两者 attainment 分别为 40% 与 80%，比值是 80% / 40% = 2，即“达标率是两倍”；绝对改善为 40 个百分点，相对改善为 100%。我们仍然不知道平均 TTFT 是否减半，因为只知道合格人数，不知道每个请求的实际时间。</p>
+      <p>如果基线达标率已经是 80%，同一条件下理论上最多提高到 100%，其倍数至多为 1.25。所谓“最高 3.6 倍”因此不可能在每个高达标率实验点都成立。它必然需要查看对应工作负载、基线和门限；不能把整张曲线上的最好一点变成所有部署条件下的固定乘数。</p>
+    </div>
+    <p>端到端结果报告的 TTFT SLO attainment，相对 Llumnix++ 最高约为 2 倍，相对 round-robin 最高约为 3.6 倍。Llumnix++ 不是这里随便起的基线别名，而是作者让原 Llumnix 在初始调度时也考虑预测输出长度后的增强版本。这里必须保留基线名称和“最高”，不能改写成平均收益，也不能称为吞吐提高 3.6 倍或延迟降低 3.6 倍，更不能把比较对象泛化成“所有其他方法”。结果说明布局感知在所测条件下能有效改善达标情况，不提供跨业务的固定倍率保证。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=11">［论文 §6.1–6.2，PDF 第 11–12 页／论文集 1121–1122 页］</a></p>
+    <p>看曲线时，横轴若是请求率，重点是在提高压力后谁更早失去达标率；横轴若是 SLO scale，则是在同一工作负载下逐步放宽或收紧门限，不能把它误解成硬件变快。TBT 达标率则要单独读：一个调度器可能改善 TTFT，却因为 prefill 组织或迁移暂停改变输出间隔。真实系统通常需要两个指标共同合格；分别画出的两条达标率曲线，并不自动等于“同时满足两项”的请求比例。</p>
+    <p>成本效率也需要固定服务水平比较。论文成本实验中，AdaGen 使用四个实例达到约 64% 的达标率，基线达到相近水平需要约 1.7–2 倍的实例量。它支持的是该实验负载与门限下的容量效率比较，而不是“所有业务都能把总账单减半”。GPU 单价、利用时间、控制面 CPU、网络和迁移资源都会进入实际费用；采购与上线预算需要另行计算。<a class="small" href="#sources">［论文 §6.2.3，PDF 第 13 页／论文集 1123 页］</a></p>
+    <p>小规模穷举比较也应读全条件：在二十个请求、两个实例的案例中，AdaGen 的调度耗时为 2.3 秒，穷举约需九天。这说明穷举组合对在线决策不现实，却<strong>不证明 2.3 秒就是所有请求在线上额外等待的固定开销</strong>，也不证明任何规模下都能找到全局最优。要做在线容量规划，还要测量实际窗口规模下的调度频率、并发度及该计算能否与执行重叠。<a class="small" href="#sources">［论文 §6.2.2，PDF 第 12–13 页］</a></p>
+    <p>真实测试床实验、布局模拟器精度测试与大规模调度仿真是三种证据。论文的五百个 Llama3-8B 实例实验将 vLLM 中的真实 GPU 执行替换成 sleep，等待时长由不同序列长度、batch 大小和 KV 迁移量的离线 profile 决定。因此它属于<strong>模拟实验</strong>，不是五百个真实实例的集群部署；有助于判断扩展趋势，却不等于验证同等规模的网络争用、状态广播和失败恢复。另一项实验使用四个实例，每实例各有一张 prefill GPU 和一张 decode GPU，两者机内 NVLink 互联；这一特定分离式实例配置的改善，仍不等于对所有推理引擎和 batching 策略都已完成验证。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=13">［论文 §6.3–6.4，PDF 第 13 页］</a></p>
+    <p>模拟器实验中，表 3 为 Llama3-8B 给出的每组 S<sub>t</sub> 布局生成耗时是 0.7 秒，对应真实执行为 3.19 秒；约 4.6 倍的比值描述的是这一估计任务，不是模型推理本身加速 4.6 倍。开销评估中的 decode 长度预测约为 50 ms，而约 22 ms 的通信 downtime 是<strong>该实验全程累计的 KV 迁移停顿</strong>，不是每次迁移的平均值或最坏上界。附录 A.1 关闭预测器、改用输入长度估计输出长度时，迁移更频繁，报告通信停顿约为 74 ms。这些值不能相加后当作通用每请求开销，也不能转述成“每次搬 KV 只停 22 ms”。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=14">［论文 §6.5、图 21 与表 3，PDF 第 13–14 页；附录 A.1，第 17 页］</a></p>
+    <p>表 3 还把真实执行的 TTFT/TBT accuracy 标为 100%，模拟器对应为 99.01% 与 98.83%；它比较的是<strong>仅从模拟布局计算出的延迟与真实执行的吻合程度</strong>，不是输出长度预测。§4.1 另行报告微调长度预测器在所用数据集上约 76.4% 的 accuracy。这两类指标不能混为一谈；论文相关段落没有给出表 3 的独立数学定义，不能自行宣称它采用 MAPE、1 − 相对误差或精确匹配率，也不能把 99.01% 理解为“99.01% 的请求预测完全无误”。要判断可迁移性，还需要误差口径、数据分布与硬件条件；消融实验则应看各步骤的增量贡献，而不是把最终收益全部归于预测器。<a class="small" href="papers/adagen-eurosys-2026.pdf#page=14">［论文 §4.1，第 7 页；§6.5、表 3，PDF 第 14 页］</a></p>
+  </section>
+
+  <section id="deployment">
+    <h2>九、从论文走向部署：可以借用什么，还要补上什么？</h2>
+    <div class="box idea"><p><strong>本节全部属于工程延伸，不是 AdaGen 论文新增实验，也不表示公开 artifact 已具备这些能力。</strong>其依据是前面解释的状态依赖和调度目标；上线效果必须在目标业务中重新验证。</p></div>
+    <p>最保守的借用方式，不是一上来开启跨实例 KV 迁移，而是先在旁路建立布局预测。生产请求仍按现有策略路由，同时记录阶段长度、执行轮次、队列时刻和真实延迟，让模拟器只做“如果改成另一种路由，会怎样”的估计。先验证状态快照是否完整、预测误差是否在特定模型或流量上集中，再考虑对少量流量启用长度感知路由。这样可以把“模型不准”和“执行动作有问题”分开定位，而不是同时改变所有环节后只看到尾延迟恶化。</p>
+    <p>如果最终启用迁移，就需要一致的请求所有权。源实例继续生成到哪里、目标实例接收到哪一版 KV、何时切换输出通道，都要有明确协议；否则可能出现重复 token、漏 token、孤儿 KV 或两边同时执行。目标实例在接纳之前还要确认模型版本、并行分片、缓存格式和显存预算兼容。传输成功与用户看到连续输出不是同一件事，迁移阶段的停顿应进入 TBT 指标，而不能从观测里扣除。</p>
+    <p>缓存局部性会改变最佳动作。假设目标实例虽然排队短，却没有已有的共享前缀；源实例能够复用缓存，从而显著减少 prefill。此时只根据原始 prompt 长度模拟，就会高估留在原处的成本。类似地，多租户优先级、LoRA adapter 所在位置、不同 GPU 型号和请求截止时间都可能影响可选实例。把这些加入布局状态是一条合理工程路线，但不是一句“工作负载自适应”就已经覆盖了所有局部性和公平性问题。</p>
+    <p>进入 Agentic AI，目标还会再上移一层。一次用户任务可能先调用 LLM 制定计划，等待工具返回，再调用 LLM 解释结果。第二次调用的 prompt 增加了工具输出，输出长度也可能与第一轮完全不同。AdaGen 关注的是推理请求在实例上的执行布局；它并不因此自动知道工具依赖、剩余轮数或整个任务的关键路径。如果只改善不在关键路径上的一次内部调用，用户任务完成时间可能几乎不变。</p>
+    <div class="example">
+      <h3>工程教学算例 F：单次 TTFT 改善，不会自动变成任务级两倍收益</h3>
+      <p><strong>设某串行任务由 1 秒 LLM 调用、3 秒工具执行和 1 秒最终 LLM 调用组成，总计 5 秒，忽略其他开销。</strong>即使把两次 LLM 调用都缩短一半，总时间也只是 0.5 + 3 + 0.5 = 4 秒，减少 20%，不是任务速度翻倍。如果仅改善其中一次的首 token，而该轮必须等完整结构化输出才能调用工具，总完成时间的收益还需要另行计算。</p>
+      <p>因此，面向智能体的扩展应记录任务 DAG、每次模型调用的角色、工具等待和最终回复截止时间，再判断哪一段真正决定用户等待。内部步骤可否放宽 TBT、前缀应保留多久、下轮可能落在哪台实例，都需要新的目标与实验；不能当作 AdaGen 已经证明的多轮调度能力。</p>
+    </div>
+    <p>实际接入时还应准备简单回退：状态快照过旧、模拟超时或长度估计失效时，回到受显存约束的安全路由；当迁移收益不足以覆盖不确定性时，不迁移。评价面板应同时显示 TTFT、TBT、任务总时延、队列等待、调度开销、KV 占用与迁移字节数。只看平均 GPU 利用率，很容易错过控制面延迟或少数长请求的持续占用。</p>
+  </section>
+
+  <section id="self-test">
+    <h2>十、自测：能解释这些问题，才算真的读懂了</h2>
+    <p>建议先尝试自己作答，再展开解释。题目中的数字仍是本教程的教学设定，不是论文实验结果。</p>
+    <details>
+      <summary>1. 两台实例的 KV 占用相同，是否说明下一轮的 TBT 也相同？</summary>
+      <p>不说明。KV 占用主要描述仍驻留的历史状态，TBT 则受下一次何时轮到该请求输出、该轮实际耗时、是否有 prefill 干扰或迁移停顿影响。相同历史 token 数可以来自很多短上下文请求，也可以来自少量长上下文请求；两者的可执行 decode 数与未来布局可能不同。必须继续检查阶段、就绪状态和轮次安排。</p>
+    </details>
+    <details>
+      <summary>2. 在算例 C 中，甲的平均 TTFT 更低，为什么仍不能说“甲对所有用户都更好”？</summary>
+      <p>因为平均值隐藏了个体变化。甲中 B 的首 token 在 40 ms，乙中 B 在 30 ms，B 实际变慢了。甲的整体优势来自 C、D 更早输出。若 B 属于更严格的优先级或有 35 ms 截止时间，调度目标就需要体现这种差异，不能只比较简单平均。</p>
+    </details>
+    <details>
+      <summary>3. 已知 prefill 在第 4 轮结束，KV 第 7 轮才可用，decode 最早在哪一轮？</summary>
+      <p>在本文统一轮次、下一轮才允许 decode 的记账下，最早为 max(4 + 1, 7) = 7。还必须假设目标在第 7 轮有预算、显存和相应执行资格；否则会更晚。如果“第 7 轮到达”实际是指第 7 轮结束后才完成接收，则 k 应记录为第 8 轮可用。这说明事件发生在轮初还是轮末必须定义清楚。</p>
+    </details>
+    <details>
+      <summary>4. 达标率从 30% 提高到 60%，可以说延迟减半吗？</summary>
+      <p>不可以。只能直接推出达标率为原来的 2 倍、提高 30 个百分点、相对改善 100%。有可能只是许多请求从略超门限变为略低于门限，平均时间只小幅变化；也可能存在其他分布变化。必须取得实际延迟分布，才能谈平均值、分位数或“减半”。</p>
+    </details>
+    <details>
+      <summary>5. 已有布局表明目标总共有二十个空位，是否能直接搬来一个包含二十枚 decode token 的请求？</summary>
+      <p>不能。普通自回归请求每轮至多推进一枚，二十个空位如果集中在同一轮，并不等于有二十轮可用。还必须等 prefill 完成、KV 到达，检查未来各轮预算与显存，再估计对其他请求的影响。空位总量是必要信息之一，但时间分布和依赖决定了它能否被使用。</p>
+    </details>
+    <details>
+      <summary>6. 为什么离线路由再平衡倾向关注长序列，运行时却可能优先迁移短序列？</summary>
+      <p>两者优化的局部成本不同。调整尚在规划的长请求，可以一次改变较多未来工作；搬运已经执行的请求则要迁移真实 KV，短序列通常更便宜、停顿风险较低。这两种选择都是上下文相关的启发式，而不是互相矛盾的普遍规则。最终仍应在同一目标下计算迁移后的完整布局。</p>
+    </details>
+    <p>如果只记住一句话，应当是：<strong>AdaGen 把“工作量是否均衡”的问题，细化为“受阶段、轮次、历史状态和通信依赖约束的布局，能否让更多请求按时输出”。</strong>理解这些约束，比背下某个最高倍数或参数更能帮助你判断方法适用于什么服务。</p>
+  </section>
+
+  <section id="sources">
+    <h2>原文、公开代码与许可边界</h2>
+    <p><strong>正式出版信息：</strong>Sudipta Saha Shubha, Ayush Goel, Diman Zad Tootaghaj, Khaled Diab, Hardik Soni, K. K. Ramakrishnan, Puneet Sharma, and Haiying Shen. 2026. <cite>AdaGen: Workload-Adaptive Cluster Scheduler for Latency-Optimal LLM Inference Serving.</cite> In <cite>Proceedings of the 21st European Conference on Computer Systems</cite> (EuroSys ’26), 1111–1127. Association for Computing Machinery. DOI: <a href="https://doi.org/10.1145/3767295.3769345">10.1145/3767295.3769345</a>。</p>
+    <p><a href="papers/adagen-eurosys-2026.pdf">下载本地原版 PDF</a> · <a href="https://dl.acm.org/doi/10.1145/3767295.3769345">ACM 论文页面</a> · <a href="https://dl.acm.org/doi/pdf/10.1145/3767295.3769345">ACM 官方 PDF</a> · <a href="https://2026.eurosys.org/papers.html">EuroSys 2026 官方论文目录</a> · <a href="https://api.crossref.org/works/10.1145/3767295.3769345">出版社提交至 Crossref 的元数据与许可记录</a>。</p>
+    <p><strong>许可核验：</strong><a href="papers/adagen-eurosys-2026.pdf#page=1">原始 PDF 第 1 页</a>明确标注：“This work is licensed under a Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License.” 同页注明 © 2026 Copyright held by the owner/author(s)。Crossref 对正式出版版本（content-version: vor）的登记与之吻合，许可起始日期为 2026-04-26。完整许可为 <a href="https://creativecommons.org/licenses/by-nc-nd/4.0/">Creative Commons Attribution–NonCommercial–NoDerivatives 4.0 International（CC BY-NC-ND 4.0）</a>。该许可允许遵守署名、非商业、禁止分发改编作品等条件的原样分享；不能由“网页可公开访问”推断任意再分发权，也不能把公开代码的许可证当作论文许可证。</p>
+    <p><strong>许可原文：</strong><a href="https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode.en#s2a1A">CC 法律文本 §2(a)(1)(A)</a> 授权 “reproduce and Share the Licensed Material, in whole or in part, for NonCommercial purposes only”; <a href="https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode.en#s2a1B">§2(a)(1)(B)</a> 对改编作品规定 “produce and reproduce, but not Share, Adapted Material for NonCommercial purposes only.” 署名等要求另见该许可 §3。因此，归档与再分发 PDF 时仍须保留完整原文、作者与出处、许可链接，并满足非商业用途条件；这个许可不是无条件的公开托管授权。</p>
+    <p><strong>原文定位说明：</strong>本文已对照所归档的正式 PDF，直接核对首页许可、§4 算法和 §6／附录的关键实验条件与数字。PDF 共 17 页，第 1 页对应论文集 1111 页，第 17 页对应 1127 页；§4 设计在第 7–11 页，§5 实现在第 11 页，§6 实验在第 11–14 页，附录在第 17 页。文中“第几页”默认指 PDF 内页序，不混同于论文集页码。</p>
+    <div class="box good">
+      <p><strong>未修改、非商业学习归档：</strong>原始文件于 2026-09-14 经 ACM DOI 页面 → 可见 eReader 链接 → 阅读器 Download PDF 菜单正常下载；先保存在会话资料中，确认上述许可后原样复制至本页的 <code>papers/adagen-eurosys-2026.pdf</code>。原文作者、出版信息与版权声明均完整保留，未增删页面、覆盖翻译或重编码。本地副本与下载原件的 SHA-256 一致。</p>
+      <p><strong>文件校验：</strong>4,284,319 字节，17 页。SHA-256：<code>7fe13614a18053858ed6cde7517656f32a7fb634f12d17468ee70612344554a1</code>。</p>
+      <p>本归档仅用于非商业学习，不表示作者或 ACM 对本教程的认可。后续再分发仍须遵守 CC BY-NC-ND 4.0 的全部条件；如需商业使用或分发改编版本，应另行取得许可。本文使用稳定 DOI 作为来源，不公开会过期的阅读器会话链接。</p>
+    </div>
+    <p><strong>公开 artifact：</strong><a href="https://github.com/ss7krd/workload-adaptive-llm-cluster-scheduler">ss7krd/workload-adaptive-llm-cluster-scheduler</a>。本次查看版本 <code>06ee1f5e2cc1cc4a1a7d7ebb51ae3db76f4b1b5c</code>；<a href="https://github.com/ss7krd/workload-adaptive-llm-cluster-scheduler/blob/06ee1f5e2cc1cc4a1a7d7ebb51ae3db76f4b1b5c/workload-adaptive-scheduler/adagen/benchmark/benchmark_runner.py">benchmark_runner.py</a> 展示路由、模拟、再平衡与选择性拆分的研究原型结构。阅读代码可以帮助理解数据流，却不能取代论文实验定义；仓库 README 也说明绘图代码中已嵌入数据，因此“运行出同样一张图”不等于重跑了 GPU 实验。</p>
+    <p><strong>原型与论文不可混同：</strong>上述版本的 <a href="https://github.com/ss7krd/workload-adaptive-llm-cluster-scheduler/blob/06ee1f5e2cc1cc4a1a7d7ebb51ae3db76f4b1b5c/workload-adaptive-scheduler/adagen/benchmark/benchmark_runner.py#L315-L333">dispatch_requests</a> 使用请求级的“prefill 长或 decode 短”二元判断，不能完整表达论文对长／长、短／短请求的阶段拆分。它还写成 <code>np.percentile(..., 0.75)</code>；NumPy 的 percentile 参数采用 0–100 刻度，这不等于论文规定的 P75。本文以正式论文 §4.3 为算法依据，将 GitHub 内容定位为待审计的初步研究 artifact，而不声称它是论文机制的逐项、可直接部署实现；本教程未修改该外部仓库。</p>
+    <p><strong>本教程的证据边界：</strong>中文解释、所有自建数字算例、状态字典和工程延伸均为独立教学文字，不是论文的逐句翻译，不是作者背书的实现规范。本文未访问或引用任何非公开演示材料，也未运行论文的 GPU 性能测试。</p>
+  </section>
+  <footer>最后核查：2026-09-14。<a href="#top">返回页首</a> · <a href="index.html">返回专题导航</a> · <a href="agentic-ai-gpu-scheduler-synthesis-zh.html">阅读综合设计</a></footer>
 </article>
 </main></body></html>
