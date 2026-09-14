@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdaGen 深度解读</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body><main>
+<nav class="nav"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
+<article>
+  <h1>AdaGen：工作负载自适应的 LLM 集群调度</h1>
+  <div class="box">
+    <strong>论文：</strong>Sudipta Saha Shubha 等，<em>AdaGen: Workload-Adaptive Cluster Scheduler for Latency-Optimal LLM Inference Serving</em>，EuroSys 2026。<br>
+    <strong>核心问题：</strong>为什么“各实例 token 数或 KV-cache 一样多”仍可能产生明显不同的 TTFT？<br>
+    <strong>一句话答案：</strong>决定延迟的不是负载总量本身，而是 prefill/decode token 在连续 batching iteration 中形成的 <em>compute layout</em>。
+  </div>
+
+  <h2>1. 论文解决了什么盲点</h2>
+  <p>典型 cluster scheduler 采用 round-robin、最少请求数、最少 token 数或最少 KV-cache 等规则。它们优化的是一个容易观测的代理量，但 LLM 实例真正执行的是逐 iteration 的动态 batch：长 prefill 会占据大量计算，decode 又以小步、长生命周期持续占槽。两台实例即便各自承担相同 token 总数，也可能因为阶段排列不同而产生不同排队时间。</p>
+  <p>论文示例中，两种分配都让两个实例各承担 12 个 token，但平均 TTFT 分别为 2.33 和 2.17 个 iteration。这直接说明：</p>
+  <pre><code>token balance ≠ compute-layout balance ≠ latency optimality</code></pre>
+  <div class="box good">对 Agentic AI 尤其重要：同一用户任务会多次返回 LLM。每一轮 prompt 长度、生成长度和紧迫度不同；把这些调用当成无关请求，只能做到局部公平，无法优化 root request 的端到端完成时间。</div>
+
+  <h2>2. 系统模型</h2>
+  <ul>
+    <li>集群包含多个 LLM 实例，每个实例可使用一张或多张 GPU。</li>
+    <li>cluster scheduler 负责请求到实例的映射；instance scheduler 负责 continuous batching。</li>
+    <li>主要实现基于 Sarathi-Serve 风格的 chunked prefill 与 decode prioritization，同时验证了 prefill/decode disaggregation。</li>
+    <li>请求到达时知道 prompt 长度，但真实 decode 长度未知。</li>
+    <li>模型权重等静态内存可离线 profile；KV-cache 随 active tokens 动态增长。</li>
+    <li>跨实例阶段执行依赖 KV-cache 迁移，收益必须覆盖通信成本。</li>
+  </ul>
+
+  <h2>3. AdaGen 的端到端决策流</h2>
+  <ol class="flow">
+    <li><strong>形成调度窗口。</strong>把短时间窗口内的请求集合记为 <code>S_t</code>，避免逐请求贪心丢失组合优化机会。</li>
+    <li><strong>预测 decode 长度。</strong>微调 DistilBERT 输出长度上下界并取平均；论文数据上的预测准确率约 76.4%。</li>
+    <li><strong>模拟候选 compute layout。</strong>复现实例调度器的 token 选择逻辑，得到每个 iteration 中的 prefill/decode token、开始结束位置、active-token 数和 KV-cache。</li>
+    <li><strong>length-aware 初始路由。</strong>以窗口内 prompt/decode 长度 P75 为阈值划分长短阶段，优先把“长 prefill + 短 decode”与“短 prefill + 长 decode”配对，以平滑不同阶段的计算压力。</li>
+    <li><strong>distribution-aware 再平衡。</strong>按模拟 iteration 数识别 overloaded/underloaded 实例；配对最重与最轻实例，优先移动总序列较长、能快速改善布局的请求。</li>
+    <li><strong>选择性分阶段执行。</strong>对阶段特征聚类，只评估代表请求；若把 prefill 或 decode 放到其他实例能提高 SLO attainment，且收益大于 KV 迁移代价，则执行拆分。</li>
+    <li><strong>运行时校正。</strong>实际 active-token 与模拟值偏差超过 5% 时重算；当实例 SLO attainment 失衡时，优先迁移短序列，减少已生成 KV-cache 的搬运量。</li>
+  </ol>
+
+  <h2>4. Compute-layout simulator</h2>
+  <p>模拟器不是只估算一个请求的 standalone latency，而是模拟请求之间如何在 iteration 中相互阻塞。其关键状态包括：</p>
+  <table>
+    <thead><tr><th>状态</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>每个请求的 prompt、预测 decode 长度</td><td>估计请求生命周期和阶段组合。</td></tr>
+      <tr><td>每 iteration token budget</td><td>复现 chunked-prefill 与 decode admission。</td></tr>
+      <tr><td>active-token 数 \(C_A\)</td><td>由每 token KV 大小推导动态 KV-cache 占用。</td></tr>
+      <tr><td>prefill 完成 iteration \(i\)</td><td>计算 TTFT，并约束 decode 不能早于 \(i+1\)。</td></tr>
+      <tr><td>KV 迁移完成 iteration \(k\)</td><td>跨实例 decode 的起点为 \(j=\max(i+1,k)\)。</td></tr>
+      <tr><td>实例静态显存与硬件 profile</td><td>避免权重、workspace 与 KV-cache 总量溢出。</td></tr>
+    </tbody>
+  </table>
+  <p>论文报告模拟器 TTFT/TBT 估计准确率分别为 99.01% 和 98.83%，0.7 秒生成布局，而真实执行需 3.19 秒，约快 4.6 倍。</p>
+
+  <h2>5. 为什么要做阶段拆分</h2>
+  <p>一个请求的 prefill 和 decode 对资源的压力完全不同。prefill 倾向于高并行、高算力密度；decode 单步计算小，但持续占用 KV-cache 并对 TBT 敏感。若源实例 prefill 拥塞而另一个实例 decode 压力较低，可以在源实例完成 prefill 后迁移 KV-cache，再在目标实例 decode。</p>
+  <p>AdaGen 用三类布局特征对实例评分：总 prefill tokens、总 decode tokens、最后一个 prefill iteration 的平均 prefill tokens。特征按跨实例最大值归一化后求和，高分实例作为 source，低分实例作为 destination。它再用 DBSCAN（论文参数 \(\epsilon=10^{-7}\)）压缩待评估阶段，只对每个 cluster 的代表请求做收益估计。</p>
+  <pre><code>执行迁移当且仅当：
+预测的 ΔSLO attainment
+  &gt; KV 迁移造成的排队、链路占用和执行停顿</code></pre>
+
+  <h2>6. 实现与评估</h2>
+  <p>原型基于 vLLM，扩展约 3,407 行 Python，使用 Ray actors、FlashAttention 和 NCCL。真实测试床为 8 张 H100-80GB，覆盖 Llama3-8B、Mixtral-8×7B 和 Llama3-70B；数据集包括 BurstGPT、OpenChat 与 Azure LLM trace，每组随机抽取 8,000 个请求。</p>
+  <div class="grid">
+    <div class="card"><div class="metric">最高 2×</div><p>相对 Llumnix++ 的 TTFT SLO attainment。</p></div>
+    <div class="card"><div class="metric">最高 3.6×</div><p>相对 round-robin 的 TTFT SLO attainment。</p></div>
+    <div class="card"><div class="metric">1.7×–2×</div><p>基线达到相近 attainment 所需的额外实例量。</p></div>
+    <div class="card"><div class="metric">2.3 秒 vs 9 天</div><p>20 请求、2 实例时启发式与 exhaustive search 的决策时间。</p></div>
+  </div>
+  <p>在 disaggregated instance scheduler 上仍有最高 1.6× 改善；500 实例模拟中相对 Llumnix++ 和 round-robin 分别最高 1.9×、3.6×。decode predictor 约 50ms，正常 KV-cache 通信停顿约 22ms。</p>
+
+  <h2>7. 对 Agentic AI 调度的直接启示</h2>
+  <ol>
+    <li><strong>预测对象不能只有 output length。</strong>还要预测剩余轮数、下一轮 prompt 增量、工具等待时间和该轮是否为最终用户响应。</li>
+    <li><strong>布局模拟要升级为会话 DAG 模拟。</strong>当前 sub-request 结束后可能等待工具，也可能很快生成下一轮；这会影响保留 KV、队列位置与 GPU 选择。</li>
+    <li><strong>优化目标应从单次 TTFT 扩展到 root request。</strong>内部 reasoning 可以采用 relaxed TBT，最终 synthesis 的 TTFT/TBT 更严格。</li>
+    <li><strong>预测不必完美。</strong>论文表明 76.4% 的长度预测配合模拟与纠偏仍有效；关键是显式维护置信度和回退路径。</li>
+  </ol>
+
+  <h2>8. 局限与复用风险</h2>
+  <ul>
+    <li>真实测试床只有 8 张 H100；500 实例结果是调度模拟，未覆盖完整网络竞争。</li>
+    <li>收益依赖高速互联；低带宽环境会显著缩小可迁移候选集合。</li>
+    <li>尚未联合优化 prefix caching、adapter locality 和多租户优先级。</li>
+    <li>阈值与评分含经验参数；公开代码是研究原型，应以论文算法为规范重新审计。</li>
+  </ul>
+
+  <h2>资料来源</h2>
+  <ul>
+    <li><a href="https://2026.eurosys.org/papers.html">EuroSys 2026 accepted papers</a></li>
+    <li><a href="https://dl.acm.org/doi/10.1145/3767295.3769345">ACM DOI 页面</a></li>
+    <li><a href="https://dl.acm.org/doi/pdf/10.1145/3767295.3769345">论文 PDF</a></li>
+    <li><a href="https://github.com/ss7krd/workload-adaptive-llm-cluster-scheduler">公开代码仓库</a></li>
+  </ul>
+  <footer>报告基于公开论文与公开 artifact；检索日期：2026-09-14。</footer>
+</article>
+</main></body></html>

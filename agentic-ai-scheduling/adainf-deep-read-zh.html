@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AdaInf 深度解读</title><link rel="stylesheet" href="assets/style.css">
+</head>
+<body><main>
+<nav class="nav"><a href="index.html">返回导航</a><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">综合设计</a></nav>
+<article>
+  <h1>AdaInf：数据漂移下准确率与 SLO 联合调度</h1>
+  <div class="box"><strong>论文：</strong>Sudipta Saha Shubha 等，<em>AdaInf: Data-Drift Adaptive Scheduling for Accurate and SLO-guaranteed Multiple-Model Inference Serving at Edge Servers</em>，SIGCOMM 2023。<br><strong>核心思想：</strong>推理系统不能只优化延迟和吞吐；当数据分布变化时，还必须把“保持模型质量所需的重训练工作”纳入同一 GPU 预算。</div>
+
+  <h2>1. 问题背景</h2>
+  <p>边缘应用常由多个 DNN 组成 DAG，例如目标检测后再做人、车分类。压缩模型适合边缘部署，却更容易因光照、天气、视角和对象分布变化而掉准确率。持续重训练可以恢复质量，但与在线推理竞争有限 GPU；若先训练后推理，会违约，若永远推理优先，模型又持续过时。</p>
+  <p>论文观察显示，无重训练时准确率差距最高可达 27%；但已有方案每周期只有 53%–60% 的请求能用到最新模型。更重要的是，不同 DAG 节点受漂移影响差异很大，平均分配训练资源会浪费 GPU。</p>
+
+  <h2>2. 系统假设与双时间尺度</h2>
+  <ul>
+    <li>应用是多模型 DAG，推理和增量重训练共用边缘 GPU。</li>
+    <li>每 50 秒形成一次新训练窗口，并重新评估漂移与训练需要。</li>
+    <li>每 5ms 把新请求组成 job；默认 job SLO 为 400–600ms。</li>
+    <li>GPU 通过 NVIDIA MPS 空间切分。</li>
+    <li>云端 golden model 为新样本提供标签。</li>
+  </ul>
+  <div class="box good">AdaInf 最值得复用的不是具体 50s/5ms 参数，而是“慢速质量控制 + 快速执行控制”的分层结构。</div>
+
+  <h2>3. 数据漂移如何量化</h2>
+  <ol class="flow">
+    <li><strong>压缩特征。</strong>对新训练样本的特征执行 PCA。</li>
+    <li><strong>估计新颖度。</strong>计算新样本与旧样本平均特征的 cosine distance。</li>
+    <li><strong>抽取代表性样本。</strong>选择距离最大的 \(S\) 个样本。</li>
+    <li><strong>测量质量。</strong>用当前完整模型推理，得到新数据准确率 \(I'_m\)。</li>
+    <li><strong>判定与定量。</strong>若 \(I'_m&lt;I_m\)，需要重训练；漂移影响度 \(d_m=I_m-I'_m\)。</li>
+    <li><strong>自适应采样。</strong>\(S\) 从全部样本的 3% 开始，每次增加 3%；连续 4 次判断不变后停止。实验中 18% 即与全量判断一致。</li>
+  </ol>
+
+  <h2>4. 分层调度算法</h2>
+  <h3>4.1 应用间 GPU 空间</h3>
+  <p>系统离线 profile 各应用在不同 batch size 和完整 GPU 下的 per-batch latency，选取最低 worst-case latency \(L_i^w\)，再用非线性回归估计满足 SLO \(L_i^s\) 所需的 GPU 空间 \(G_i\)。相对份额为：</p>
+  <pre><code>G_i^a = G_i / Σ G_i</code></pre>
+  <p>分配空间后，再结合 early-exit 结构重新选 batch size，避免把 full-GPU 最优 batch 机械搬到切分后的 GPU。</p>
+
+  <h3>4.2 推理与重训练时间</h3>
+  <p>在线推理先获得满足 SLO 所需的执行时间，剩余预算用于训练：</p>
+  <pre><code>T_i^r = L_i^s - Σ(k∈I_i) l_ik</code></pre>
+  <p>应用内部按漂移影响度分配训练时间：</p>
+  <pre><code>T_ij^r = T_i^r × d_ij / Σ_j d_ij</code></pre>
+  <p>随后从离线 profile 中选择在预算内预计准确率最高的样本数、training batch size 和 epoch 数。</p>
+
+  <h3>4.3 Early exit 与 batch</h3>
+  <p>每个模型预先生成多个 early-exit 结构。未漂移模型使用完整结构；需要训练的模型只考虑准确率不低于应用阈值 \(A_m\) 的结构，并选择推理延迟最低者。论文显示 GPU 份额和 early-exit 结构变化都会改变最优 batch，因此三者不能彼此独立配置。</p>
+
+  <h3>4.4 CPU–GPU 内容管理</h3>
+  <p>同一 layer 会先完成一个 batch 的全部请求再允许参数换出，以最大化当前内容复用。job 完成时丢弃 intermediate outputs，但保留更新参数。换出优先级为：</p>
+  <pre><code>S_c = (1 - α) R_c + α L_i^s,   α = 0.4</code></pre>
+  <p>\(R_c\) 表示预计再次使用时间；高分内容优先换出，预计很快复用的内容若被换出则保留在 CPU pinned memory。</p>
+
+  <h2>5. 完整在线流程</h2>
+  <ol class="flow">
+    <li>慢速控制器收集新数据并计算每个 DAG 节点的漂移影响度。</li>
+    <li>重建本周期的 inference–retraining DAG，过滤不需要训练的节点。</li>
+    <li>基于 SLO 与性能模型，为应用分配 MPS GPU 空间。</li>
+    <li>为每个模型选择 early-exit 和 batch size。</li>
+    <li>每 5ms 快速控制器收集 job，并在约 2ms 内排定未来时间片。</li>
+    <li>先保证关键路径推理，再把剩余时间按漂移影响度分给增量重训练。</li>
+    <li>根据 DAG 依赖和内容复用时间决定执行顺序、参数驻留与 eviction。</li>
+    <li>周期末更新质量收益和性能回归，进入下一轮。</li>
+  </ol>
+
+  <h2>6. 评估结果</h2>
+  <p>默认测试床是 AWS p3.8xlarge 的 4 张 V100，运行 8 个并发多模型应用；基线为 Ekya、Scrooge 与受限 GPU 版本 Scrooge*。</p>
+  <div class="grid">
+    <div class="card"><div class="metric">+11%–14%</div><p>相对 Ekya 的准确率。</p></div>
+    <div class="card"><div class="metric">+19%–21%</div><p>相对 Scrooge 的准确率。</p></div>
+    <div class="card"><div class="metric">最高 -54%</div><p>SLO violation。</p></div>
+    <div class="card"><div class="metric">约 4×</div><p>达到相近准确率时的 GPU 资源效率。</p></div>
+  </div>
+  <p>调度开销约 2ms；DAG 周期更新约 4.2s，但在 CPU 异步执行。所有方法 GPU utilization 都接近 100%，再次证明利用率不是质量与 SLO 的充分指标。</p>
+
+  <h2>7. 对 Agentic AI 的启示</h2>
+  <p>Agentic 服务也存在“质量维护工作”：检索索引更新、reranker/calibrator 刷新、安全策略模型更新、adapter 热加载、工具结果缓存更新等。它们类似 AdaInf 的增量重训练，应与在线 LLM 调用共享资源预算，而不是作为不可见后台任务。</p>
+  <table>
+    <thead><tr><th>AdaInf 概念</th><th>Agentic AI 对应项</th></tr></thead>
+    <tbody>
+      <tr><td>模型 DAG</td><td>planner → retrieval/tool → reasoning → synthesis → safety/rerank。</td></tr>
+      <tr><td>data drift impact</td><td>工具分布、用户意图、检索语料或安全分布变化导致的质量风险。</td></tr>
+      <tr><td>early exit</td><td>缩短 reasoning budget、减少候选、使用小模型/低精度或跳过非关键步骤。</td></tr>
+      <tr><td>训练时间预算</td><td>索引构建、adapter 更新、cache warming 等后台维护预算。</td></tr>
+      <tr><td>应用准确率</td><td>端到端任务成功率、groundedness、tool success 与 policy compliance。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>8. 局限</h2>
+  <ul>
+    <li>仅支持单边缘服务器和同类型 GPU。</li>
+    <li>更换模型后需要重新 profiling；early-exit 点生成不在范围内。</li>
+    <li>依赖云端 golden model 标签，带来成本、网络与隐私前提。</li>
+    <li>batch、空间和 early-exit 仍是分阶段启发式选择，而非联合全局最优。</li>
+  </ul>
+
+  <h2>资料来源</h2>
+  <ul>
+    <li><a href="https://dl.acm.org/doi/10.1145/3603269.3604830">ACM DOI 页面</a></li>
+    <li><a href="https://dl.acm.org/doi/pdf/10.1145/3603269.3604830">论文 PDF</a></li>
+    <li><a href="https://conferences.sigcomm.org/sigcomm/2023/list-accepted.html">SIGCOMM 2023 accepted papers</a></li>
+    <li><a href="https://github.com/ss7krd/AdaInf">公开代码仓库</a></li>
+  </ul>
+  <footer>报告基于公开论文与公开 artifact；检索日期：2026-09-14。</footer>
+</article>
+</main></body></html>

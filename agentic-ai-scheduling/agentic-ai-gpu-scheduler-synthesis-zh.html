@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agentic AI GPU 调度综合设计</title><link rel="stylesheet" href="assets/style.css">
+</head>
+<body><main>
+<nav class="nav"><a href="index.html">返回导航</a><a href="adagen-deep-read-zh.html">AdaGen</a><a href="usher-deep-read-zh.html">USHER</a><a href="adainf-deep-read-zh.html">AdaInf</a></nav>
+<article>
+  <h1>Agentic AI workload 的 GPU 调度优化空间与完整算法</h1>
+  <div class="box good"><strong>核心答案：</strong>Agentic AI 的优化空间来自“结构信息尚未进入调度器”：多个 LLM sub-request 属于同一 root request，阶段目标不同，工具等待产生空洞，未来轮次与 token 长度可预测但不确定，prefill/decode 的资源形态互补，GPU 间又存在 cache、KV 与拓扑差异。若调度器仍只看当前队列和 token 数，就会同时损失吞吐、尾延迟和成本。</div>
+
+  <h2>1. 为什么 Agentic workload 比普通聊天更可优化</h2>
+  <h3>1.1 请求是动态 DAG，而不是独立序列</h3>
+  <p>普通服务将一次 API 调用视为调度单位；Agentic 请求则由 planner、LLM reasoning、retrieval、工具执行、验证、最终 synthesis 等节点组成。节点动态展开，但它们共享 root deadline、上下文、prefix、adapter 和任务价值。知道 lineage 后，调度器可以识别关键路径、接近完成的任务和可以延后的后台 reasoning。</p>
+
+  <h3>1.2 工具等待制造可回收的 GPU 空洞</h3>
+  <p>Agent 调用外部工具时，GPU 上暂时无 token 可执行。若系统继续为该会话保留过多显存或排队优先级，会降低复用；若全部回收，又会在工具返回时产生 KV/prefix 重建成本。优化空间在于预测等待时间，并在“保留、压缩、迁移、换出、丢弃重算”之间选择。</p>
+
+  <h3>1.3 各阶段的 SLO 与价值不同</h3>
+  <table>
+    <thead><tr><th>阶段</th><th>典型目标</th><th>可接受策略</th></tr></thead>
+    <tbody>
+      <tr><td>内部 reasoning prefill</td><td>尽快解锁工具或下一轮；TTFT 可能严格。</td><td>critical-path priority、chunked prefill。</td></tr>
+      <tr><td>内部 reasoning decode</td><td>整体吞吐与 root completion；TBT 常可较松。</td><td>可被 strict token 穿插，但需 aging 防饥饿。</td></tr>
+      <tr><td>最终 synthesis prefill</td><td>用户开始等待最终答案；TTFT 严格。</td><td>deadline/slack priority。</td></tr>
+      <tr><td>最终 response decode</td><td>流式体验；TBT/TPOT 严格。</td><td>保留 decode quota，避免长 gap。</td></tr>
+      <tr><td>工具/检索等待</td><td>不消耗 GPU，但影响后续到达。</td><td>预测返回时间，管理 KV/prefix 驻留。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>1.4 prefill/decode 与不同模型阶段可资源互补</h3>
+  <p>AdaGen 说明 compute layout 决定 TTFT；USHER 说明计算、显存与 cache 必须联合考虑。Agentic 工作流进一步包含 embedding、reranker、小模型 planner、大模型 reasoning 等异构阶段。正确组合 compute-heavy 与 memory-heavy 阶段，可填满 GPU 的不同资源维度，而不是只让某一个 utilization 指标达到 100%。</p>
+
+  <h3>1.5 未来工作虽未知，却具有条件可预测性</h3>
+  <p>输出长度、剩余轮数、工具类型、prompt 增量和工具等待时间无法精确获知，但可由 workflow type、历史轮次和当前上下文估计。AdaGen 证明预测准确率不完美时，仍可通过模拟与在线纠偏获益。因此关键不是“预测完全正确”，而是：</p>
+  <pre><code>预测分布 + 置信度 + 风险预算 + 运行时纠偏</code></pre>
+
+  <h2>2. Scheduler 必须掌握哪些关键信息</h2>
+  <h3>2.1 Root request / DAG 信息</h3>
+  <table>
+    <thead><tr><th>字段</th><th>为什么需要</th></tr></thead>
+    <tbody>
+      <tr><td>root_request_id、parent_id、turn/iteration</td><td>恢复 sub-request 之间的亲缘关系，计算端到端 age。</td></tr>
+      <tr><td>phase_type</td><td>区分 planner、reasoning、tool、synthesis、safety 等目标。</td></tr>
+      <tr><td>DAG dependencies / critical path</td><td>识别执行后能解锁哪些节点，计算关键路径优先级。</td></tr>
+      <tr><td>root deadline、stage deadline、SLO class</td><td>计算 slack，并区分内部与用户可见阶段。</td></tr>
+      <tr><td>tenant、priority、value、fairness class</td><td>提供隔离、公平、配额和商业优先级。</td></tr>
+      <tr><td>completed rounds 与 failure/retry history</td><td>估计剩余工作和异常循环风险。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>2.2 请求与模型信息</h3>
+  <ul>
+    <li>prompt tokens、已生成 tokens、max tokens、预测 decode 长度分布。</li>
+    <li>预测剩余轮数、下一轮 prompt 增量、工具类型与预计等待时间。</li>
+    <li>模型、版本、量化、LoRA/adapter、上下文长度、KV 每 token 大小。</li>
+    <li>prefix/cache key、可共享比例、KV 是否可重算或迁移。</li>
+    <li>阶段 TTFT/TBT/TTLT 目标、质量下限和可降级选项。</li>
+  </ul>
+
+  <h3>2.3 实例与 GPU 实时状态</h3>
+  <ul>
+    <li>waiting/running/swapped queues 与每请求状态。</li>
+    <li>未来若干 iteration 的 token layout、chunk budget、batch occupancy。</li>
+    <li>SM/Tensor Core、HBM 容量与带宽、L2/cache、power/thermal 状态。</li>
+    <li>模型权重、adapter、prefix 和 KV-cache 的驻留位置。</li>
+    <li>GPU 类型、TP/PP/EP 拓扑、NVLink/NVSwitch/PCIe/RDMA 带宽与拥塞。</li>
+    <li>近期 TTFT/TBT 分位数、SLO attainment、预测残差和故障状态。</li>
+  </ul>
+
+  <h3>2.4 离线 profile 与在线学习</h3>
+  <ul>
+    <li><code>latency(model, phase, input_bucket, output_bucket, batch, gpu, colocators)</code></li>
+    <li><code>resource_vector = (SM, HBM, BW, cache, interconnect, power)</code></li>
+    <li><code>migration_cost(KV_bytes, source, destination, topology, congestion)</code></li>
+    <li><code>quality(model_variant, reasoning_budget, early_exit, workload_class)</code></li>
+    <li>预测区间、校准误差和 OOD 标记，而非只有平均值。</li>
+  </ul>
+
+  <h2>3. 优化目标：不要只最大化 GPU utilization</h2>
+  <p>一个实用效用函数可写为：</p>
+  <pre><code>maximize Σ_r [
+    w1 · P(root request meets deadline)
+  + w2 · task_value_r
+  + w3 · quality_r
+  - w4 · GPU_cost_r
+  - w5 · migration_cost_r
+  - w6 · starvation_penalty_r
+  - w7 · prediction_risk_r
+]</code></pre>
+  <p>硬约束至少包括：</p>
+  <ul>
+    <li>GPU HBM、MPS/compute share、batch token budget 与最大 sequence 数。</li>
+    <li>模型并行拓扑和所需 GPU 数。</li>
+    <li>strict 阶段的 TTFT/TBT deadline。</li>
+    <li>租户配额、优先级隔离与最大饥饿时间。</li>
+    <li>KV/prefix 迁移只能在链路与目标显存容量允许时执行。</li>
+    <li>质量不能低于业务阈值；降级必须显式授权。</li>
+  </ul>
+
+  <h2>4. 推荐调度架构：三个时间尺度</h2>
+  <table>
+    <thead><tr><th>控制环</th><th>频率</th><th>主要动作</th></tr></thead>
+    <tbody>
+      <tr><td>Fast path</td><td>每个 engine step / 毫秒级</td><td>token admission、排序、chunk 大小、strict/relaxed interleaving、抢占。</td></tr>
+      <tr><td>Medium path</td><td>数百毫秒到秒级</td><td>请求重路由、KV 迁移、prefill/decode 拆分、replica 与 cache 调整。</td></tr>
+      <tr><td>Slow path</td><td>几十秒到分钟级</td><td>模型放置、GPU 类型、并行度、MPS 配额、adapter/prefix warming、性能模型更新。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>5. 具体在线算法：从到达到 GPU step</h2>
+  <ol class="flow">
+    <li><strong>解析并关联 root request。</strong>新 sub-request 进入时恢复 lineage、阶段类型、依赖、root age、deadline 与租户策略；工具等待返回的请求恢复旧会话状态，而非当作完全新请求。</li>
+    <li><strong>预测未来工作分布。</strong>输出 <code>decode_len</code>、<code>remaining_rounds</code>、<code>next_prompt_growth</code>、<code>tool_wait</code> 的 P50/P90 和置信度。低置信度请求以 P90 做显存 admission，P50 做期望效用排序。</li>
+    <li><strong>生成候选 GPU/实例集合。</strong>过滤模型未加载、HBM 不足、拓扑不兼容、预计 strict SLO 必然违约的实例；优先 prefix/KV/adapter 已驻留位置。</li>
+    <li><strong>模拟候选 compute layouts。</strong>对每个候选插入点模拟未来 \(H\) 个 engine steps，预测 TTFT、TBT、KV 增长、SM/HBM/BW 冲突和其他请求受到的延迟影响。</li>
+    <li><strong>计算边际效用。</strong>对每个“请求→实例/阶段拆分”动作计算 <code>Δdeadline attainment + Δroot completion + locality benefit - interference - migration - fairness debt - risk</code>。</li>
+    <li><strong>窗口内匹配。</strong>先按硬 deadline admission，再用受约束的 greedy/best-fit 匹配。优先放置高风险和大资源请求，尝试把 compute-heavy prefill 与 memory-heavy decode 互补组合。</li>
+    <li><strong>建立 step-level priority。</strong>每个 runnable token group 计算动态分数，而不是使用永久固定 policy。</li>
+    <li><strong>按预算组 batch。</strong>先放即将违反 TBT 的 strict decode，再放关键路径 prefill，再放高 completion-value reasoning，最后用 relaxed decode 填满剩余 token/SM/HBM 预算。</li>
+    <li><strong>执行与遥测。</strong>记录实际 kernel 时间、queueing、KV 增长、cache hit、链路耗时和 SLO slack。</li>
+    <li><strong>局部纠偏。</strong>若布局误差、deadline 风险或资源干扰超过阈值，调整 chunk、抢占 relaxed work、迁移短序列，或把新阶段路由到其他实例。</li>
+    <li><strong>周期性全局重优化。</strong>聚合 workload mix 和误差，在 medium/slow path 更新 replica、placement、并行度、policy 参数与性能模型。</li>
+  </ol>
+
+  <h2>6. Step-level 优先级公式</h2>
+  <p>可为每个 runnable stage \(s\) 计算：</p>
+  <pre><code>priority(s) =
+    a · deadline_urgency(s)
+  + b · critical_path_gain(s)
+  + c · completion_gain(root(s))
+  + d · locality_gain(s)
+  + e · fairness_debt(root(s))
+  - f · predicted_resource_cost(s)
+  - g · interference_externality(s)
+  - h · uncertainty_risk(s)</code></pre>
+  <p>其中：</p>
+  <ul>
+    <li><code>deadline_urgency = 1 / max(slack, ε)</code>，strict TBT 可设置更高权重。</li>
+    <li><code>critical_path_gain</code> 衡量该阶段完成后可解锁的 DAG 工作。</li>
+    <li><code>completion_gain</code> 偏向接近 root completion 的请求，但设置上限防止短任务垄断。</li>
+    <li><code>locality_gain</code> 奖励 prefix/KV/adapter 命中。</li>
+    <li><code>fairness_debt</code> 随等待与被抢占次数增长。</li>
+    <li><code>interference_externality</code> 来自 USHER 风格的多资源预测，表示对当前 batch 其他任务的损害。</li>
+  </ul>
+  <div class="box idea"><strong>策略切换的更稳健实现：</strong>不是机械地每 N step 切换 FCFS/remaining-work，而是将 policy 视为 priority 公式的权重组合；当 P95 risk 上升时提高 deadline 权重，当 starvation debt 上升时提高 age 权重，当 batch 空闲时提高 throughput/locality 权重。</div>
+
+  <h2>7. Batch 构造伪代码</h2>
+  <pre><code>function schedule_step(runnable, gpu_state, token_budget):
+    update_slack_and_fairness_debt(runnable)
+    predict_resource_vector(runnable)
+
+    strict_decode = sort_by_deadline(runnable.strict_decode)
+    critical_prefill = sort_by_critical_path(runnable.prefill)
+    relaxed = sort_by_dynamic_priority(runnable.relaxed_decode)
+
+    batch = []
+    admit(batch, strict_decode,
+          until=tbt_reservation,
+          constraints=[tokens, HBM, SM, BW])
+
+    admit(batch, critical_prefill,
+          chunks=adaptive_chunk_size,
+          constraints=[tokens, HBM, SM, BW, no_strict_deadline_miss])
+
+    admit_best_complement(batch, relaxed,
+          objective=max_marginal_utility,
+          constraints=[tokens, HBM, SM, BW, cache_interference])
+
+    admit_aging_quota(batch, starved_requests)
+    return batch</code></pre>
+
+  <h2>8. 跨 GPU 路由与迁移算法</h2>
+  <ol>
+    <li>对每个实例维护 AdaGen 风格的未来布局摘要，而不是仅维护 queue length。</li>
+    <li>为请求计算可行 destination，排除 HBM、模型、拓扑和 deadline 不满足者。</li>
+    <li>估计迁移字节：已生成 KV + prefix/adapter 缺失量。</li>
+    <li>按实时拓扑带宽估计迁移结束时间 \(k\)，跨实例 decode 起点为 \(j=\max(i+1,k)\)。</li>
+    <li>计算迁移对源、目标及链路上其他任务的外部性。</li>
+    <li>只执行正净收益动作，并限制每周期迁移预算，防止震荡。</li>
+  </ol>
+  <pre><code>ΔU_move =
+  Δroot_deadline_attainment
+  + Δcluster_goodput
+  + locality_after_move
+  - KV_transfer_time
+  - destination_interference
+  - network_externality
+  - oscillation_penalty</code></pre>
+
+  <h2>9. Admission、降级与过载控制</h2>
+  <p>当预计容量不足时，调度器必须在进入 GPU 前做显式选择：</p>
+  <ol>
+    <li>保护已承诺的 strict final-response TBT。</li>
+    <li>限制新 root request，避免排队后才失败。</li>
+    <li>若产品允许，降低内部 reasoning budget、候选数或模型规格。</li>
+    <li>延后非关键后台更新、cache warming 与质量维护任务。</li>
+    <li>将可迁移请求送往成本更高但有 slack 的 GPU 池。</li>
+    <li>所有降级写入响应元数据和质量监控，禁止静默成功。</li>
+  </ol>
+
+  <h2>10. 如何验证调度器真正有效</h2>
+  <table>
+    <thead><tr><th>维度</th><th>必须报告的指标</th></tr></thead>
+    <tbody>
+      <tr><td>用户体验</td><td>root E2E P50/P95/P99、final TTFT、final TBT/TPOT、deadline attainment。</td></tr>
+      <tr><td>内部阶段</td><td>reasoning TTFT/TBT、tool-return resume delay、每轮 queueing。</td></tr>
+      <tr><td>效率</td><td>root requests/s、useful tokens/s、每成功任务 GPU-seconds、每百万 token 成本。</td></tr>
+      <tr><td>资源</td><td>SM、HBM、bandwidth、cache、NVLink/RDMA、KV occupancy，而非单一 GPU utilization。</td></tr>
+      <tr><td>质量</td><td>任务成功率、groundedness、tool success、安全合规、降级率。</td></tr>
+      <tr><td>稳健性</td><td>预测误差桶、burst、长上下文、工具长尾、节点故障、链路拥塞。</td></tr>
+      <tr><td>公平性</td><td>tenant attainment、最大等待、starvation、Jain fairness 或 service deficit。</td></tr>
+    </tbody>
+  </table>
+  <p>对照组至少应包括：FCFS、decode-first continuous batching、root-age priority、shortest-remaining-work、token/KV least-loaded routing，以及关闭各组件的 ablation。</p>
+
+  <h2>11. 推荐实施顺序</h2>
+  <ol class="flow">
+    <li><strong>先补 telemetry 与 lineage。</strong>没有 root DAG 和 per-stage SLO，任何高级算法都无法验证。</li>
+    <li><strong>实现可回放模拟器。</strong>用 production-like trace 对现有调度器做 deterministic replay。</li>
+    <li><strong>上线动态 priority 与 interleaving。</strong>只改 instance scheduler，先获得低风险收益。</li>
+    <li><strong>加入预测—校正闭环。</strong>从长度与轮数开始，记录置信度和残差。</li>
+    <li><strong>升级多资源 admission。</strong>引入 SM/HBM/BW/cache profile 与共置惩罚。</li>
+    <li><strong>最后启用跨实例迁移。</strong>先 shadow estimate，再小比例开启，并设置迁移预算与回滚阈值。</li>
+  </ol>
+
+  <h2>12. 三篇论文如何拼成一个系统</h2>
+  <table>
+    <thead><tr><th>问题</th><th>采用的论文思想</th><th>Agentic 扩展</th></tr></thead>
+    <tbody>
+      <tr><td>请求到哪个实例</td><td>AdaGen compute-layout routing</td><td>加入 root DAG、剩余轮数和工具返回预测。</td></tr>
+      <tr><td>同 GPU 如何共置</td><td>USHER 多资源互补与干扰模型</td><td>加入动态 KV、prefix/adapter locality 和阶段差异。</td></tr>
+      <tr><td>step 内先跑哪些 token</td><td>AdaGen 阶段布局与通用实时调度原则</td><td>deadline、critical path、completion gain 与 fairness 联合打分。</td></tr>
+      <tr><td>质量维护如何共享 GPU</td><td>AdaInf 的推理—重训练联合调度</td><td>覆盖索引、adapter、reranker、安全模型和 cache 更新。</td></tr>
+      <tr><td>预测错误怎么办</td><td>AdaGen 在线 rescheduling</td><td>置信区间 admission、局部纠偏、策略降级和模型校准。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>结论</h2>
+  <p>Agentic AI workload 的关键优化机会不是简单提高 batch size，而是利用“同一 root request 的跨轮结构”和“不同阶段的不同目标”。最合适的调度器是一个分层闭环系统：用 DAG/lineage 理解业务语义，用预测与 layout simulation 估计未来，用 USHER 式多资源模型控制共置，用 objective-oriented interleaving 决定每个 engine step 的 token，再通过遥测持续纠偏。最终指标必须是满足质量约束的 root-request goodput 与 GPU 成本，而不是孤立 token throughput 或平均 utilization。</p>
+
+  <h2>主要公开来源</h2>
+  <ul>
+    <li><a href="https://dl.acm.org/doi/10.1145/3767295.3769345">AdaGen, EuroSys 2026</a></li>
+    <li><a href="https://www.usenix.org/conference/osdi24/presentation/shubha">USHER, OSDI 2024</a></li>
+    <li><a href="https://dl.acm.org/doi/10.1145/3603269.3604830">AdaInf, SIGCOMM 2023</a></li>
+  </ul>
+  <div class="box warn"><strong>公开范围说明：</strong>本报告基于公开论文和通用系统设计原则独立推导，不包含项目演示文稿中的内部 trace、业务数字、未公开算法或实验结果。</div>
+  <footer>综合报告基于公开论文与通用系统设计原则；检索日期：2026-09-14。</footer>
+</article>
+</main></body></html>

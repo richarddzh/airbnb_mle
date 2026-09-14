@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agentic AI 与 GPU 调度论文研读</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<main>
+  <header class="hero card">
+    <p class="eyebrow">Research collection</p>
+    <h1>Agentic AI 与 GPU 调度论文研读</h1>
+    <p>从集群 compute layout、GPU 干扰规避、数据漂移适配三个层次，推导面向多轮 Agentic AI 的端到端 GPU 调度器。</p>
+  </header>
+
+  <section class="grid">
+    <article class="card">
+      <p class="kicker">综合报告</p>
+      <h2><a href="agentic-ai-gpu-scheduler-synthesis-zh.html">Agentic AI workload 为什么存在优化空间？</a></h2>
+      <p>重点回答调度器需要哪些信息、优化目标是什么，以及 admission、预测、排序、组批、放置、迁移、纠偏的完整在线流程。</p>
+    </article>
+    <article class="card">
+      <p class="kicker">信息边界</p>
+      <h2><a href="agentscheduler-presentation-public-analysis-zh.html">项目演示材料处理说明</a></h2>
+      <p>原始材料带有保密标识，因此公共仓库不发布逐页解读、内部数据、实验结果或未公开设计。</p>
+    </article>
+    <article class="card">
+      <p class="kicker">EuroSys 2026</p>
+      <h2><a href="adagen-deep-read-zh.html">AdaGen 深度解读</a></h2>
+      <p>为何 token/KV 负载均衡仍非延迟最优，以及如何通过 compute-layout simulation、阶段拆分和在线纠偏提升 SLO attainment。</p>
+    </article>
+    <article class="card">
+      <p class="kicker">OSDI 2024</p>
+      <h2><a href="usher-deep-read-zh.html">USHER 深度解读</a></h2>
+      <p>如何联合建模 SM、显存与 cache 干扰，并通过资源互补放置和 operator graph merging 提升 goodput、降低 GPU 成本。</p>
+    </article>
+    <article class="card">
+      <p class="kicker">SIGCOMM 2023</p>
+      <h2><a href="adainf-deep-read-zh.html">AdaInf 深度解读</a></h2>
+      <p>如何在数据漂移下联合调度推理与增量重训练，在满足延迟 SLO 的同时最大化应用准确率。</p>
+    </article>
+  </section>
+
+  <article>
+    <h2>统一阅读框架</h2>
+    <table>
+      <thead><tr><th>层次</th><th>论文</th><th>主要状态</th><th>主要动作</th><th>目标</th></tr></thead>
+      <tbody>
+        <tr><td>集群/请求</td><td>AdaGen</td><td>prompt/decode 长度、实例 token layout、KV-cache</td><td>路由、重分配、prefill/decode 拆分、KV 迁移</td><td>TTFT/TBT SLO attainment</td></tr>
+        <tr><td>GPU/模型</td><td>USHER</td><td>SM、HBM、cache、模型相似性、GPU 类型</td><td>batch、replica、空间切分、互补共置、图融合</td><td>goodput 或成本</td></tr>
+        <tr><td>应用/质量</td><td>AdaInf</td><td>漂移程度、DAG、准确率、重训练收益</td><td>推理/训练时间份额、early exit、batch、缓存换入换出</td><td>SLO 约束下准确率</td></tr>
+        <tr><td>Agentic 会话</td><td>综合设计</td><td>root request lineage、轮次、阶段 SLO、工具等待、预测置信度</td><td>策略切换、目标感知 interleaving、会话公平性、跨 GPU 放置</td><td>端到端任务 goodput / GPU 成本</td></tr>
+      </tbody>
+    </table>
+    <div class="box warn"><strong>公开范围说明：</strong>原演示文稿带有 Microsoft Confidential 标识。本站仅发布由公开论文支持的技术分析与去敏后的通用设计，不包含演示文稿中的内部数据、业务指标、人员信息或原始文件。</div>
+  </article>
+</main>
+</body>
+</html>
